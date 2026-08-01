@@ -95,12 +95,13 @@ jobs:
           target_dir="$root${sub:+/$sub}"
           # Deliberately no --delete: server-only files (1panel.env, deploy/backups,
           # deploy/bin/tunnel-server) must never be removed by CI.
-          ssh -p "$port" "$user@$host" "mkdir -p '$target_dir'"
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -p "$port" "$user@$host" "mkdir -p '$target_dir'"
           rsync -azcO \
             --exclude .git --exclude .env --exclude 'deploy/backups' \
             --exclude target --exclude .build --exclude release \
             --exclude node_modules --exclude dist \
-            -e "ssh -p $port" ./ "$user@$host:$target_dir/"
+            --timeout=60 \
+            -e "ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -p $port" ./ "$user@$host:$target_dir/"
 
       - name: Upload fresh tunnel-server binary
         if: ${{ env.RUN_NATIVE_BUILD == 'true' }}
@@ -112,8 +113,19 @@ jobs:
           root="${DEPLOY_DIR:-/opt/1panel/docker/compose/tunnel-control}"
           sub="${DEPLOY_SUBDIR:-source}"
           app_dir="$root${sub:+/$sub}"
-          ssh -p "$port" "$user@$host" "mkdir -p '$app_dir/deploy/bin'"
-          rsync -az -e "ssh -p $port" target/release/tunnel-server "$user@$host:$app_dir/deploy/bin/tunnel-server"
+          # Skip the 9 MB upload when the server already has this exact binary,
+          # so frontend-only deploys do not pay for a slow cross-border transfer.
+          local_sum=$(sha256sum target/release/tunnel-server | cut -d' ' -f1)
+          remote_sum=$(ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -p "$port" "$user@$host" \
+            "sha256sum '$app_dir/deploy/bin/tunnel-server' 2>/dev/null | cut -d' ' -f1" || true)
+          if [ "$remote_sum" = "$local_sum" ]; then
+            echo "tunnel-server binary unchanged, skipping upload."
+          else
+            echo "Uploading new tunnel-server binary ..."
+            ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -p "$port" "$user@$host" "mkdir -p '$app_dir/deploy/bin'"
+            rsync -az --timeout=60 -e "ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -p $port" \
+              target/release/tunnel-server "$user@$host:$app_dir/deploy/bin/tunnel-server"
+          fi
 
       - name: Run remote deploy
         run: |
