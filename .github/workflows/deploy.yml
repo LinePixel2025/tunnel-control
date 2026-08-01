@@ -9,12 +9,12 @@ on:
       deploy_subdir:
         description: 'Subdirectory under DEPLOY_DIR where the checkout lives (1Panel: source)'
         required: false
-        default: ''
+        default: source
         type: string
       compose_file:
-        description: 'Compose file relative to the checkout (1Panel: deploy/compose.1panel.yaml)'
+        description: 'Compose file relative to the checkout'
         required: false
-        default: deploy/compose.yaml
+        default: deploy/compose.1panel.yaml
         type: string
       run_db_backup:
         description: 'Take a PostgreSQL dump before deploying'
@@ -34,10 +34,13 @@ env:
   SSH_PORT: ${{ secrets.SSH_PORT }}
   SSH_USER: ${{ secrets.SSH_USER }}
   SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
-  DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
-  DEPLOY_SUBDIR: ${{ github.event.inputs.deploy_subdir || '' }}
-  COMPOSE_FILE: ${{ github.event.inputs.compose_file || 'deploy/compose.yaml' }}
+  DEPLOY_DIR: ${{ secrets.DEPLOY_DIR || '/opt/1panel/docker/compose/tunnel-control' }}
+  DEPLOY_SUBDIR: ${{ github.event.inputs.deploy_subdir || secrets.DEPLOY_SUBDIR || 'source' }}
+  COMPOSE_FILE: ${{ github.event.inputs.compose_file || secrets.COMPOSE_FILE || 'deploy/compose.1panel.yaml' }}
+  ENV_FILE: ${{ secrets.ENV_FILE || '1panel.env' }}
+  PROJECT_NAME: ${{ secrets.PROJECT_NAME || 'tunnel-control' }}
   RUN_DB_BACKUP: ${{ github.event.inputs.run_db_backup != 'false' }}
+  RUN_NATIVE_BUILD: ${{ contains(github.event.inputs.compose_file || secrets.COMPOSE_FILE || 'deploy/compose.1panel.yaml', '1panel') }}
 
 jobs:
   deploy:
@@ -57,6 +60,17 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
+      - name: Cache cargo build
+        if: ${{ env.RUN_NATIVE_BUILD == 'true' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build tunnel-server binary
+        if: ${{ env.RUN_NATIVE_BUILD == 'true' }}
+        run: |
+          # Same toolchain and glibc base as deploy/Dockerfile.server.prebuild.
+          docker run --rm -v "$PWD":/src -w /src rust:1.97-bookworm \
+            cargo build --release -j 4 -p tunnel-server
+
       - name: Trust server host key
         run: |
           set -euo pipefail
@@ -75,14 +89,27 @@ jobs:
           port="${SSH_PORT:-22}"
           host="${SSH_HOST:?SSH_HOST is empty}"
           user="${SSH_USER:?SSH_USER is empty}"
-          root="${DEPLOY_DIR:-/opt/tunnel-control}"
-          sub="${DEPLOY_SUBDIR:-}"
+          root="${DEPLOY_DIR:-/opt/1panel/docker/compose/tunnel-control}"
+          sub="${DEPLOY_SUBDIR:-source}"
           target_dir="$root${sub:+/$sub}"
-          # Deliberately no --delete: server-only files (deploy/.env, deploy/backups,
-          # deploy/bin/tunnel-server for 1Panel) must never be removed by CI.
+          # Deliberately no --delete: server-only files (1panel.env, deploy/backups,
+          # deploy/bin/tunnel-server) must never be removed by CI.
           ssh -p "$port" "$user@$host" "mkdir -p '$target_dir'"
           rsync -az --exclude .git --exclude .env --exclude 'deploy/backups' \
             -e "ssh -p $port" ./ "$user@$host:$target_dir/"
+
+      - name: Upload fresh tunnel-server binary
+        if: ${{ env.RUN_NATIVE_BUILD == 'true' }}
+        run: |
+          set -euo pipefail
+          port="${SSH_PORT:-22}"
+          host="${SSH_HOST:?SSH_HOST is empty}"
+          user="${SSH_USER:?SSH_USER is empty}"
+          root="${DEPLOY_DIR:-/opt/1panel/docker/compose/tunnel-control}"
+          sub="${DEPLOY_SUBDIR:-source}"
+          app_dir="$root${sub:+/$sub}"
+          ssh -p "$port" "$user@$host" "mkdir -p '$app_dir/deploy/bin'"
+          rsync -az -e "ssh -p $port" target/release/tunnel-server "$user@$host:$app_dir/deploy/bin/tunnel-server"
 
       - name: Run remote deploy
         run: |
@@ -90,10 +117,11 @@ jobs:
           port="${SSH_PORT:-22}"
           host="${SSH_HOST:?SSH_HOST is empty}"
           user="${SSH_USER:?SSH_USER is empty}"
-          root="${DEPLOY_DIR:-/opt/tunnel-control}"
-          sub="${DEPLOY_SUBDIR:-}"
-          app_dir="$root${sub:+/$sub}"
-          compose_file="${COMPOSE_FILE:-deploy/compose.yaml}"
+          root="${DEPLOY_DIR:-/opt/1panel/docker/compose/tunnel-control}"
+          sub="${DEPLOY_SUBDIR:-source}"
+          compose_file="${COMPOSE_FILE:-deploy/compose.1panel.yaml}"
+          env_file="${ENV_FILE:-1panel.env}"
+          project="${PROJECT_NAME:-tunnel-control}"
           if [ "$RUN_DB_BACKUP" = "true" ]; then backup=1; else backup=0; fi
           ssh -p "$port" "$user@$host" \
-            "DEPLOY_DIR='$root' DEPLOY_SUBDIR='$sub' COMPOSE_FILE='$compose_file' BACKUP_ENABLED='$backup' bash '$app_dir/deploy/scripts/deploy-remote.sh'"
+            "DEPLOY_DIR='$root' DEPLOY_SUBDIR='$sub' COMPOSE_FILE='$compose_file' ENV_FILE='$env_file' PROJECT_NAME='$project' BACKUP_ENABLED='$backup' bash '$root/$sub/deploy/scripts/deploy-remote.sh'"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Remote deploy script for Tunnel Control. Runs on the Linux server inside
-# the repo checkout (usually /opt/tunnel-control).
+# the deployment directory (1Panel: /opt/1panel/docker/compose/tunnel-control).
 #
 # Safe by design:
 #   - Never runs `docker compose down -v` or removes volumes: the named
@@ -9,24 +9,47 @@
 #   - Optionally takes a PostgreSQL dump before touching the stack.
 #   - Only uses `up -d --build`, which recreates changed containers without
 #     deleting data.
+#   - Never deletes server-only files (CI rsync has no --delete).
 #
 set -euo pipefail
 
-APP_DIR="${DEPLOY_DIR:-/opt/tunnel-control}${DEPLOY_SUBDIR:+/$DEPLOY_SUBDIR}"
-COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose.yaml}"
-ENV_FILE="deploy/.env"
+DEPLOY_DIR="${DEPLOY_DIR:-/opt/tunnel-control}"
+DEPLOY_SUBDIR="${DEPLOY_SUBDIR:-}"
+ENV_FILE="${ENV_FILE:-1panel.env}"
+COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose.1panel.yaml}"
+PROJECT_NAME="${PROJECT_NAME:-tunnel-control}"
 BACKUP_ENABLED="${BACKUP_ENABLED:-1}"
 BACKUP_KEEP_DAYS="${BACKUP_KEEP_DAYS:-14}"
+
+APP_DIR="$DEPLOY_DIR${DEPLOY_SUBDIR:+/$DEPLOY_SUBDIR}"
 BACKUP_DIR="${BACKUP_DIR:-$APP_DIR/deploy/backups}"
 
-cd "$APP_DIR"
+# ENV_FILE is resolved against DEPLOY_DIR (1Panel keeps 1panel.env next to source/).
+case "$ENV_FILE" in
+  /*) ENV_PATH="$ENV_FILE" ;;
+  *)  ENV_PATH="$DEPLOY_DIR/$ENV_FILE" ;;
+esac
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "ERROR: $APP_DIR/$ENV_FILE is missing. Copy deploy/.env.example to deploy/.env and fill in the secrets before deploying." >&2
-  exit 1
-fi
+# COMPOSE_FILE is repo-relative. Copy it next to the deployment directory so the
+# `./source` build context in the file resolves correctly, without touching the
+# compose file that 1Panel manages.
+case "$COMPOSE_FILE" in
+  /*) SRC_COMPOSE="$COMPOSE_FILE" ;;
+  *)  SRC_COMPOSE="$APP_DIR/$COMPOSE_FILE" ;;
+esac
+COMPOSE_PATH="$DEPLOY_DIR/docker-compose.ci.yml"
 
-COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE")
+for f in "$ENV_PATH" "$SRC_COMPOSE"; do
+  if [[ ! -f "$f" ]]; then
+    echo "ERROR: required file missing: $f" >&2
+    exit 1
+  fi
+done
+
+cp "$SRC_COMPOSE" "$COMPOSE_PATH"
+cd "$DEPLOY_DIR"
+
+COMPOSE=(docker compose -p "$PROJECT_NAME" --env-file "$ENV_PATH" -f "$COMPOSE_PATH")
 
 echo "Validating compose configuration..."
 "${COMPOSE[@]}" config -q
@@ -46,8 +69,8 @@ fi
 echo "Running: ${COMPOSE[*]} up -d --build"
 "${COMPOSE[@]}" up -d --build
 
-# 3. Health check against the management port from deploy/.env.
-control_port=$(grep -E '^CONTROL_PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2)
+# 3. Health check against the management port from the env file.
+control_port=$(grep -E '^CONTROL_PORT=' "$ENV_PATH" | tail -n1 | cut -d= -f2)
 control_port="${control_port:-18080}"
 url="http://127.0.0.1:${control_port}/healthz"
 for i in $(seq 1 30); do
