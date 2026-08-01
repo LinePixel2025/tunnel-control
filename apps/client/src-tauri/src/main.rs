@@ -62,7 +62,16 @@ fn load_config() -> AgentConfig {
 #[tauri::command(rename_all = "snake_case")]
 fn save_config(server_url: String, token: String) -> Result<(), String> {
     let path = config_path();
-    let content = format!("TUNNEL_SERVER_URL={server_url}\nTUNNEL_TOKEN={token}\n");
+    let token = if token.trim().is_empty() {
+        read_config_value(&path, "TUNNEL_TOKEN").unwrap_or_default()
+    } else {
+        token.trim().to_owned()
+    };
+    let content = format!(
+        "TUNNEL_SERVER_URL={}\nTUNNEL_TOKEN={}\n",
+        server_url.trim(),
+        token
+    );
     fs::write(&path, content).map_err(|error| error.to_string())
 }
 
