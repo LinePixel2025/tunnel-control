@@ -1,12 +1,14 @@
-FROM rust:1.97-alpine AS build
-RUN apk add --no-cache musl-dev
+FROM rust:1.97-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
-RUN cargo build --release -p tunnel-server
+COPY deploy ./deploy
+RUN cargo build --release -j 2 -p tunnel-server
 
-FROM alpine:3.21
-RUN addgroup -S tunnel && adduser -S tunnel -G tunnel
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --shell /usr/sbin/nologin tunnel
 COPY --from=build /src/target/release/tunnel-server /usr/local/bin/tunnel-server
 USER tunnel
 EXPOSE 18080

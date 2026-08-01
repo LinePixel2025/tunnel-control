@@ -1,0 +1,6 @@
+FROM debian:bookworm-slim
+RUN useradd --system --create-home --shell /usr/sbin/nologin tunnel
+COPY deploy/bin/tunnel-server /usr/local/bin/tunnel-server
+USER tunnel
+EXPOSE 18080
+ENTRYPOINT ["tunnel-server"]

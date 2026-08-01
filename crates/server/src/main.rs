@@ -35,9 +35,12 @@ struct AppState {
     db: PgPool,
     redis: redis::Client,
     jwt_secret: Arc<String>,
+    bootstrap_agent_token_hash: Option<String>,
     sessions: Arc<RwLock<HashMap<Uuid, mpsc::Sender<Message>>>>,
     streams: Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>,
     listeners: Arc<RwLock<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
+    tunnel_port_start: u16,
+    tunnel_port_end: u16,
 }
 #[derive(Serialize, FromRow)]
 struct Device {
@@ -100,13 +103,24 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     sqlx::migrate!("../../deploy/migrations").run(&db).await?;
     bootstrap_admin(&db).await?;
+    let tunnel_port_start = read_port("TUNNEL_PORT_START", 10000)?;
+    let tunnel_port_end = read_port("TUNNEL_PORT_END", 10100)?;
+    if tunnel_port_start > tunnel_port_end {
+        anyhow::bail!("TUNNEL_PORT_START must not be greater than TUNNEL_PORT_END");
+    }
     let state = AppState {
         db,
         redis: redis::Client::open(redis_url)?,
         jwt_secret: Arc::new(env::var("JWT_SECRET").expect("JWT_SECRET is required")),
+        bootstrap_agent_token_hash: env::var("BOOTSTRAP_AGENT_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| format!("{:x}", sha2::Sha256::digest(token.as_bytes()))),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         streams: Arc::new(RwLock::new(HashMap::new())),
         listeners: Arc::new(RwLock::new(HashMap::new())),
+        tunnel_port_start,
+        tunnel_port_end,
     };
     for id in sqlx::query_scalar::<_, Uuid>("SELECT id FROM tunnels WHERE enabled")
         .fetch_all(&state.db)
@@ -136,6 +150,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_port(name: &str, default: u16) -> anyhow::Result<u16> {
+    Ok(env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<u16>()?)
+}
+
 async fn bootstrap_admin(db: &PgPool) -> anyhow::Result<()> {
     let (Ok(email), Ok(password)) = (
         env::var("BOOTSTRAP_ADMIN_EMAIL"),
@@ -143,6 +163,9 @@ async fn bootstrap_admin(db: &PgPool) -> anyhow::Result<()> {
     ) else {
         return Ok(());
     };
+    if email.trim().is_empty() || password.is_empty() {
+        return Ok(());
+    }
     if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE role = 'admin'")
         .fetch_one(db)
         .await?
@@ -272,10 +295,13 @@ async fn create_tunnel(
     let actor = admin(&headers, &state)
         .await
         .map_err(|s| (s, "Unauthorized".into()))?;
-    if !(10000..=60000).contains(&input.public_port) {
+    if input.public_port < state.tunnel_port_start || input.public_port > state.tunnel_port_end {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Public port must be between 10000 and 60000".into(),
+            format!(
+                "Public port must be between {} and {}",
+                state.tunnel_port_start, state.tunnel_port_end
+            ),
         ));
     }
     let kind = match input.kind {
@@ -300,6 +326,7 @@ async fn create_tunnel(
     start_listener(state.clone(), tunnel.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    sync_device_tunnels(&state, tunnel.device_id).await;
     Ok((StatusCode::CREATED, Json(tunnel)))
 }
 async fn toggle_tunnel(
@@ -324,7 +351,24 @@ async fn toggle_tunnel(
     } else if let Some(task) = state.listeners.write().await.remove(&id) {
         task.abort();
     }
+    sync_device_tunnels(&state, tunnel.device_id).await;
     Ok(Json(tunnel))
+}
+
+async fn sync_device_tunnels(state: &AppState, device_id: Uuid) {
+    let Some(session) = state.sessions.read().await.get(&device_id).cloned() else {
+        return;
+    };
+    let message = ControlMessage::SyncTunnels {
+        tunnels: load_specs(&state.db, device_id).await,
+    };
+    if let Ok(payload) = encode(&message) {
+        let _ = session
+            .send(Message::Text(
+                String::from_utf8_lossy(&payload).into_owned().into(),
+            ))
+            .await;
+    }
 }
 async fn get_tunnel(db: &PgPool, id: Uuid) -> Result<TunnelRecord, sqlx::Error> {
     sqlx::query_as::<_,TunnelRecord>("SELECT t.id,t.name,t.kind,t.public_port,t.local_host,t.local_port,t.enabled,t.max_connections,t.device_id,CASE WHEN d.status='online' THEN 'ready' ELSE 'offline' END status,0::bigint connections FROM tunnels t JOIN devices d ON d.id=t.device_id WHERE t.id=$1").bind(id).fetch_one(db).await
@@ -354,23 +398,39 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         return;
     };
     let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
-    let device:Option<Uuid>=sqlx::query_scalar("SELECT device_id FROM access_tokens WHERE token_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())").bind(token_hash).fetch_optional(&state.db).await.ok().flatten();
-    let Some(device_id) = device else {
-        let _ = sink
-            .send(Message::Text(
-                String::from_utf8(
-                    encode(&ControlMessage::Error {
-                        code: "invalid_token".into(),
-                        message: "Token rejected".into(),
-                    })
-                    .unwrap(),
-                )
-                .unwrap()
-                .into(),
-            ))
-            .await;
-        return;
+    let device:Option<Uuid>=sqlx::query_scalar("SELECT device_id FROM access_tokens WHERE token_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())").bind(&token_hash).fetch_optional(&state.db).await.ok().flatten();
+    let device_id = match device {
+        Some(id) => id,
+        None if state.bootstrap_agent_token_hash.as_deref() == Some(token_hash.as_str()) => {
+            match bootstrap_device(&state.db, &device_name, &token_hash).await {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(%error, "bootstrap device registration failed");
+                    return;
+                }
+            }
+        }
+        None => {
+            let _ = sink
+                .send(Message::Text(
+                    String::from_utf8(
+                        encode(&ControlMessage::Error {
+                            code: "invalid_token".into(),
+                            message: "Token rejected".into(),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap()
+                    .into(),
+                ))
+                .await;
+            return;
+        }
     };
+    let _ = sqlx::query("UPDATE access_tokens SET last_used_at=now() WHERE token_hash=$1")
+        .bind(&token_hash)
+        .execute(&state.db)
+        .await;
     let _ =
         sqlx::query("UPDATE devices SET name=$1,status='online',last_seen_at=now() WHERE id=$2")
             .bind(device_name)
@@ -412,6 +472,12 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             Message::Text(text) => {
                 if let Ok(ControlMessage::Heartbeat { latency_ms, .. }) = decode(text.as_bytes()) {
                     let _=sqlx::query("UPDATE devices SET latency_ms=$1,last_seen_at=now(),status='online' WHERE id=$2").bind(latency_ms as i32).bind(device_id).execute(&state.db).await;
+                } else if let Ok(ControlMessage::StreamClose { stream_id, .. }) =
+                    decode(text.as_bytes())
+                {
+                    if let Ok(id) = stream_id.parse::<u128>() {
+                        state.streams.write().await.remove(&id);
+                    }
                 }
             }
             Message::Binary(bytes) => {
@@ -430,6 +496,32 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         .bind(device_id)
         .execute(&state.db)
         .await;
+}
+
+async fn bootstrap_device(
+    db: &PgPool,
+    device_name: &str,
+    token_hash: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let workspace =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM workspaces ORDER BY created_at LIMIT 1")
+            .fetch_one(db)
+            .await?;
+    let device_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO devices(id,workspace_id,name) VALUES($1,$2,$3)")
+        .bind(device_id)
+        .bind(workspace)
+        .bind(device_name)
+        .execute(db)
+        .await?;
+    sqlx::query("INSERT INTO access_tokens(id,device_id,label,token_hash,last_used_at) VALUES($1,$2,'bootstrap',$3,now())")
+        .bind(Uuid::new_v4())
+        .bind(device_id)
+        .bind(token_hash)
+        .execute(db)
+        .await?;
+    tracing::info!(%device_id, "bootstrap device registered");
+    Ok(device_id)
 }
 async fn load_specs(db: &PgPool, device_id: Uuid) -> Vec<TunnelSpec> {
     sqlx::query_as::<_,(Uuid,String,String,i32,String,i32,bool,i32)>("SELECT id,name,kind,public_port,local_host,local_port,enabled,max_connections FROM tunnels WHERE device_id=$1 AND enabled").bind(device_id).fetch_all(db).await.unwrap_or_default().into_iter().map(|r|TunnelSpec{id:r.0.to_string(),name:r.1,kind:if r.2=="http"{TunnelKind::Http}else{TunnelKind::Tcp},public_port:r.3 as u16,local_host:r.4,local_port:r.5 as u16,enabled:r.6,max_connections:r.7 as u16}).collect()
