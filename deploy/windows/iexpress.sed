@@ -1,0 +1,30 @@
+[Version]
+Class=IEXPRESS
+SEDVersion=3
+[Options]
+PackagePurpose=InstallApp
+ShowInstallProgramWindow=1
+HideExtractAnimation=0
+UseLongFileName=1
+InsideCompressed=1
+CAB_FixedSize=0
+CAB_ResvCodeSigning=0
+RebootMode=N
+InstallPrompt=
+DisplayLicense=
+FinishMessage=Tunnel Agent has been installed as a Windows service.
+TargetName=release\Tunnel-Agent-Setup.exe
+FriendlyName=Tunnel Agent Setup
+AppLaunched=install-agent.cmd
+PostInstallCmd=<None>
+AdminQuietInstCmd=
+UserQuietInstCmd=
+SourceFiles=0
+[Strings]
+FILE0="target\release\tunnel-agent.exe"
+FILE1="deploy\windows\install-agent.cmd"
+[SourceFiles]
+SourceFiles0=.
+[SourceFiles0]
+%FILE0%=
+%FILE1%=

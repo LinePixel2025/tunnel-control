@@ -1,0 +1,42 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    environment:
+      MANAGEMENT_PORT: "8080"
+      BOOTSTRAP_AGENT_TOKEN: ${BOOTSTRAP_AGENT_TOKEN:?Set a long random agent token}
+      DATABASE_URL: postgres://tunnel:${POSTGRES_PASSWORD}@postgres:5432/tunnel
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?Set a long random JWT signing secret}
+    ports: ["${CONTROL_PORT:-8080}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: tunnel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a long database password}
+      POSTGRES_DB: tunnel
+    volumes: [postgres-data:/var/lib/postgresql/data, ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tunnel -d tunnel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  redis-data:

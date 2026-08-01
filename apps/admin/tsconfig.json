@@ -1,0 +1,2 @@
+{ "compilerOptions": { "target": "ES2022", "useDefineForClassFields": true, "lib": ["ES2022", "DOM"], "module": "ESNext", "skipLibCheck": true, "moduleResolution": "bundler", "allowImportingTsExtensions": false, "jsx": "react-jsx", "strict": true, "noEmit": true }, "include": ["src"] }
+
