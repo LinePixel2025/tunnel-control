@@ -1,5 +1,13 @@
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, env, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env, fs,
+    io::{self, Write},
+    path::PathBuf,
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -16,9 +24,22 @@ type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
-    let server =
-        env::var("TUNNEL_SERVER_URL").unwrap_or_else(|_| "ws://127.0.0.1:18080/control".into());
-    let token = env::var("TUNNEL_TOKEN").unwrap_or_else(|_| "change-me-agent-token".into());
+    if !env::args().any(|argument| argument == "--agent") {
+        if let Err(error) = install_service() {
+            eprintln!("Installation failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let file_config = load_file_config();
+    let server = env::var("TUNNEL_SERVER_URL")
+        .ok()
+        .or_else(|| file_config.get("TUNNEL_SERVER_URL").cloned())
+        .unwrap_or_else(|| "ws://127.0.0.1:18080/control".into());
+    let token = env::var("TUNNEL_TOKEN")
+        .ok()
+        .or_else(|| file_config.get("TUNNEL_TOKEN").cloned())
+        .unwrap_or_else(|| "change-me-agent-token".into());
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows agent".into());
     loop {
         if let Err(error) = run(&server, &token, &name).await {
@@ -26,6 +47,88 @@ async fn main() {
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+fn install_service() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(windows))]
+    return Err("The installer is only supported on Windows".into());
+
+    #[cfg(windows)]
+    {
+        let mut server_url = String::new();
+        let mut token = String::new();
+        print!("Server WebSocket URL (example: ws://203.0.113.10:18080/control): ");
+        io::stdout().flush()?;
+        io::stdin().read_line(&mut server_url)?;
+        print!("Device token: ");
+        io::stdout().flush()?;
+        io::stdin().read_line(&mut token)?;
+        let server_url = server_url.trim();
+        let token = token.trim();
+        if server_url.is_empty() || token.is_empty() {
+            return Err("Server URL and device token are required".into());
+        }
+        let install_root = PathBuf::from(env::var("ProgramFiles")?).join("TunnelControl");
+        fs::create_dir_all(&install_root)?;
+        let agent_path = install_root.join("tunnel-agent.exe");
+        fs::copy(env::current_exe()?, &agent_path)?;
+        fs::write(
+            install_root.join("agent.env"),
+            format!("TUNNEL_SERVER_URL={server_url}\nTUNNEL_TOKEN={token}\n"),
+        )?;
+        let service = "TunnelAgent";
+        let _ = Command::new("sc.exe").args(["stop", service]).status();
+        let _ = Command::new("sc.exe").args(["delete", service]).status();
+        let binary_path = format!("\"{}\" --agent", agent_path.display());
+        let status = Command::new("sc.exe")
+            .args([
+                "create",
+                service,
+                "binPath=",
+                &binary_path,
+                "start=",
+                "auto",
+                "DisplayName=",
+                "Tunnel Control Agent",
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(
+                "Could not create the Windows service. Run this installer as Administrator.".into(),
+            );
+        }
+        let _ = Command::new("sc.exe")
+            .args([
+                "failure",
+                service,
+                "reset=",
+                "86400",
+                "actions=",
+                "restart/5000/restart/10000/restart/30000",
+            ])
+            .status();
+        let status = Command::new("sc.exe").args(["start", service]).status()?;
+        if !status.success() {
+            return Err(
+                "Service was installed but did not start. Check Windows Event Viewer.".into(),
+            );
+        }
+        println!("TunnelAgent service installed and started.");
+        Ok(())
+    }
+}
+
+fn load_file_config() -> HashMap<String, String> {
+    let path = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("agent.env")))
+        .unwrap_or_else(|| PathBuf::from("agent.env"));
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect()
 }
 
 async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
