@@ -1,0 +1,99 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md']
+  workflow_dispatch:
+    inputs:
+      deploy_subdir:
+        description: 'Subdirectory under DEPLOY_DIR where the checkout lives (1Panel: source)'
+        required: false
+        default: ''
+        type: string
+      compose_file:
+        description: 'Compose file relative to the checkout (1Panel: deploy/compose.1panel.yaml)'
+        required: false
+        default: deploy/compose.yaml
+        type: string
+      run_db_backup:
+        description: 'Take a PostgreSQL dump before deploying'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SSH_HOST: ${{ secrets.SSH_HOST }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+  SSH_USER: ${{ secrets.SSH_USER }}
+  SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+  DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+  DEPLOY_SUBDIR: ${{ github.event.inputs.deploy_subdir || '' }}
+  COMPOSE_FILE: ${{ github.event.inputs.compose_file || 'deploy/compose.yaml' }}
+  RUN_DB_BACKUP: ${{ github.event.inputs.run_db_backup != 'false' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fail if deployment secrets are not configured
+        if: ${{ secrets.SSH_HOST == '' || secrets.SSH_USER == '' || secrets.SSH_PRIVATE_KEY == '' }}
+        run: |
+          echo "::error::SSH_HOST / SSH_USER / SSH_PRIVATE_KEY secrets are not set. See deploy/ci-deploy.md."
+          exit 1
+
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Trust server host key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "WARNING: SSH_KNOWN_HOSTS not set; trusting host key on first connection (TOFU)."
+            ssh-keyscan -p "${SSH_PORT:-22}" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Sync repository to server
+        run: |
+          set -euo pipefail
+          port="${SSH_PORT:-22}"
+          host="${SSH_HOST:?SSH_HOST is empty}"
+          user="${SSH_USER:?SSH_USER is empty}"
+          root="${DEPLOY_DIR:-/opt/tunnel-control}"
+          sub="${DEPLOY_SUBDIR:-}"
+          target_dir="$root${sub:+/$sub}"
+          # Deliberately no --delete: server-only files (deploy/.env, deploy/backups,
+          # deploy/bin/tunnel-server for 1Panel) must never be removed by CI.
+          ssh -p "$port" "$user@$host" "mkdir -p '$target_dir'"
+          rsync -az --exclude .git --exclude .env --exclude 'deploy/backups' \
+            -e "ssh -p $port" ./ "$user@$host:$target_dir/"
+
+      - name: Run remote deploy
+        run: |
+          set -euo pipefail
+          port="${SSH_PORT:-22}"
+          host="${SSH_HOST:?SSH_HOST is empty}"
+          user="${SSH_USER:?SSH_USER is empty}"
+          root="${DEPLOY_DIR:-/opt/tunnel-control}"
+          sub="${DEPLOY_SUBDIR:-}"
+          app_dir="$root${sub:+/$sub}"
+          compose_file="${COMPOSE_FILE:-deploy/compose.yaml}"
+          if [ "$RUN_DB_BACKUP" = "true" ]; then backup=1; else backup=0; fi
+          ssh -p "$port" "$user@$host" \
+            "DEPLOY_DIR='$root' DEPLOY_SUBDIR='$sub' COMPOSE_FILE='$compose_file' BACKUP_ENABLED='$backup' bash '$app_dir/deploy/scripts/deploy-remote.sh'"
