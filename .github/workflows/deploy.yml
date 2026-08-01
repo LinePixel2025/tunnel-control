@@ -96,7 +96,7 @@ jobs:
           # Deliberately no --delete: server-only files (1panel.env, deploy/backups,
           # deploy/bin/tunnel-server) must never be removed by CI.
           ssh -p "$port" "$user@$host" "mkdir -p '$target_dir'"
-          rsync -azO --exclude .git --exclude .env --exclude 'deploy/backups' \
+          rsync -azcO --exclude .git --exclude .env --exclude 'deploy/backups' \
             -e "ssh -p $port" ./ "$user@$host:$target_dir/"
 
       - name: Upload fresh tunnel-server binary
