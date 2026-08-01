@@ -17,7 +17,7 @@ type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 async fn main() {
     tracing_subscriber::fmt().init();
     let server =
-        env::var("TUNNEL_SERVER_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080/control".into());
+        env::var("TUNNEL_SERVER_URL").unwrap_or_else(|_| "ws://127.0.0.1:18080/control".into());
     let token = env::var("TUNNEL_TOKEN").unwrap_or_else(|_| "change-me-agent-token".into());
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows agent".into());
     loop {

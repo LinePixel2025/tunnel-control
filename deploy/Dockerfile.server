@@ -9,6 +9,5 @@ FROM alpine:3.21
 RUN addgroup -S tunnel && adduser -S tunnel -G tunnel
 COPY --from=build /src/target/release/tunnel-server /usr/local/bin/tunnel-server
 USER tunnel
-EXPOSE 8080
+EXPOSE 18080
 ENTRYPOINT ["tunnel-server"]
-

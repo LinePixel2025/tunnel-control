@@ -4,12 +4,12 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.server
     environment:
-      MANAGEMENT_PORT: "8080"
+      MANAGEMENT_PORT: ${CONTROL_PORT:-18080}
       BOOTSTRAP_AGENT_TOKEN: ${BOOTSTRAP_AGENT_TOKEN:?Set a long random agent token}
       DATABASE_URL: postgres://tunnel:${POSTGRES_PASSWORD}@postgres:5432/tunnel
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:?Set a long random JWT signing secret}
-    ports: ["${CONTROL_PORT:-8080}:8080"]
+    ports: ["${CONTROL_PORT:-18080}:${CONTROL_PORT:-18080}"]
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

@@ -3,7 +3,7 @@ setlocal EnableExtensions
 echo.
 echo Tunnel Control Agent setup
 echo.
-set /p SERVER_URL=Server WebSocket URL (example: ws://203.0.113.10:8080/control): 
+set /p SERVER_URL=Server WebSocket URL (example: ws://203.0.113.10:18080/control): 
 if "%SERVER_URL%"=="" exit /b 1
 set /p DEVICE_TOKEN=Device token: 
 if "%DEVICE_TOKEN%"=="" exit /b 1

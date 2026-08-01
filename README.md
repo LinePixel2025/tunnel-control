@@ -26,10 +26,10 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-管理 API 默认是 `http://127.0.0.1:8080`；演示代理使用默认令牌 `change-me-agent-token`：
+管理 API 默认是 `http://127.0.0.1:18080`；演示代理使用默认令牌 `change-me-agent-token`：
 
 ```powershell
-$env:TUNNEL_SERVER_URL = "ws://127.0.0.1:8080/control"
+$env:TUNNEL_SERVER_URL = "ws://127.0.0.1:18080/control"
 $env:TUNNEL_TOKEN = "change-me-agent-token"
 cargo run -p tunnel-agent
 ```

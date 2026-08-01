@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let port = env::var("MANAGEMENT_PORT")
-        .unwrap_or_else(|_| "8080".into())
+        .unwrap_or_else(|_| "18080".into())
         .parse()?;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "management and control listener ready");
