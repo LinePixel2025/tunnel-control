@@ -76,10 +76,16 @@ fn save_config(server_url: String, token: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn control_service(action: String) -> Result<String, String> {
+async fn control_service(action: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || control_service_blocking(&action))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn control_service_blocking(action: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
-        let verb = match action.as_str() {
+        let verb = match action {
             "start" => "start",
             "stop" => "stop",
             _ => return Err("unsupported action".into()),
@@ -103,7 +109,13 @@ fn control_service(action: String) -> Result<String, String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn install_service(server_url: String, token: String) -> Result<String, String> {
+async fn install_service(server_url: String, token: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || install_service_blocking(server_url, token))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn install_service_blocking(server_url: String, token: String) -> Result<String, String> {
     #[cfg(windows)]
     {
         let program_files = env::var("ProgramFiles").map_err(|error| error.to_string())?;
@@ -135,7 +147,7 @@ fn install_service(server_url: String, token: String) -> Result<String, String> 
 
         let _ = Command::new("sc").args(["stop", "TunnelAgent"]).status();
         let _ = Command::new("sc").args(["delete", "TunnelAgent"]).status();
-        let binary = format!("\"{}\" --agent", target.display());
+        let binary = format!("\"{}\" --service", target.display());
         let created = Command::new("sc")
             .args([
                 "create",

@@ -2,6 +2,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     env, fs,
+    ffi::OsString,
     io::{self, Write},
     path::PathBuf,
     process::Command,
@@ -21,16 +22,87 @@ use tunnel_protocol::{
 
 type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 
-#[tokio::main]
-async fn main() {
+#[cfg(windows)]
+use windows_service::{
+    define_windows_service,
+    service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType},
+    service_control_handler::{self, ServiceControlHandlerResult},
+};
+
+#[cfg(windows)]
+define_windows_service!(ffi_service_main, service_main);
+
+fn main() {
     tracing_subscriber::fmt().init();
-    if !env::args().any(|argument| argument == "--agent") {
+    let arguments: Vec<String> = env::args().collect();
+    if arguments.iter().any(|argument| argument == "--service") {
+        #[cfg(windows)]
+        {
+            if let Err(error) = windows_service::service_dispatcher::start("TunnelAgent", ffi_service_main) {
+                eprintln!("Service dispatcher failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = arguments;
+            eprintln!("Service mode is only supported on Windows");
+            std::process::exit(1);
+        }
+    }
+    if !arguments.iter().any(|argument| argument == "--agent") {
         if let Err(error) = install_service() {
             eprintln!("Installation failed: {error}");
             std::process::exit(1);
         }
         return;
     }
+    run_agent_forever();
+}
+
+#[cfg(windows)]
+fn service_main(_arguments: Vec<OsString>) {
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Stop => {
+                let _ = stop_tx.send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    let status_handle = match service_control_handler::register("TunnelAgent", event_handler) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("Failed to register service control handler: {error}");
+            return;
+        }
+    };
+    let running = ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    };
+    if status_handle.set_service_status(running.clone()).is_err() {
+        return;
+    }
+    std::thread::spawn(run_agent_forever);
+    let _ = stop_rx.recv();
+    let stopped = ServiceStatus {
+        current_state: ServiceState::Stopped,
+        ..running
+    };
+    let _ = status_handle.set_service_status(stopped);
+}
+
+fn run_agent_forever() {
     let file_config = load_file_config();
     let server = env::var("TUNNEL_SERVER_URL")
         .ok()
@@ -41,12 +113,18 @@ async fn main() {
         .or_else(|| file_config.get("TUNNEL_TOKEN").cloned())
         .unwrap_or_else(|| "change-me-agent-token".into());
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows agent".into());
-    loop {
-        if let Err(error) = run(&server, &token, &name).await {
-            tracing::warn!(%error, "agent disconnected; retrying");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async move {
+        loop {
+            if let Err(error) = run(&server, &token, &name).await {
+                tracing::warn!(%error, "agent disconnected; retrying");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
+    });
 }
 
 fn install_service() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,7 +157,7 @@ fn install_service() -> Result<(), Box<dyn std::error::Error>> {
         let service = "TunnelAgent";
         let _ = Command::new("sc.exe").args(["stop", service]).status();
         let _ = Command::new("sc.exe").args(["delete", service]).status();
-        let binary_path = format!("\"{}\" --agent", agent_path.display());
+        let binary_path = format!("\"{}\" --service", agent_path.display());
         let status = Command::new("sc.exe")
             .args([
                 "create",
