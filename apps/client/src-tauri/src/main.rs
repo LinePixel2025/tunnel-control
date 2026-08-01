@@ -102,9 +102,91 @@ fn control_service(action: String) -> Result<String, String> {
     }
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn install_service(server_url: String, token: String) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let program_files = env::var("ProgramFiles").map_err(|error| error.to_string())?;
+        let install_dir = PathBuf::from(&program_files).join("TunnelControl");
+        fs::create_dir_all(&install_dir).map_err(|error| error.to_string())?;
+
+        let exe_dir = env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+            .unwrap_or_else(|| install_dir.clone());
+        let source = [exe_dir.join("tunnel-agent.exe"), exe_dir.join("Tunnel-Agent-Setup.exe")]
+            .into_iter()
+            .find(|path| path.exists())
+            .ok_or_else(|| "tunnel-agent.exe not found next to the GUI".to_string())?;
+        let target = install_dir.join("tunnel-agent.exe");
+        fs::copy(&source, &target).map_err(|error| error.to_string())?;
+
+        let token = if token.trim().is_empty() {
+            read_config_value(&install_dir.join("agent.env"), "TUNNEL_TOKEN").unwrap_or_default()
+        } else {
+            token.trim().to_owned()
+        };
+        let content = format!(
+            "TUNNEL_SERVER_URL={}\nTUNNEL_TOKEN={}\n",
+            server_url.trim(),
+            token
+        );
+        fs::write(install_dir.join("agent.env"), content).map_err(|error| error.to_string())?;
+
+        let _ = Command::new("sc").args(["stop", "TunnelAgent"]).status();
+        let _ = Command::new("sc").args(["delete", "TunnelAgent"]).status();
+        let binary = format!("\"{}\" --agent", target.display());
+        let created = Command::new("sc")
+            .args([
+                "create",
+                "TunnelAgent",
+                "binPath=",
+                &binary,
+                "start=",
+                "auto",
+                "DisplayName=",
+                "Tunnel Control Agent",
+            ])
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !created.success() {
+            return Err("Failed to create TunnelAgent service. Run the GUI as Administrator.".into());
+        }
+        let _ = Command::new("sc")
+            .args([
+                "failure",
+                "TunnelAgent",
+                "reset=",
+                "86400",
+                "actions=",
+                "restart/5000/restart/10000/restart/30000",
+            ])
+            .status();
+        let started = Command::new("sc")
+            .args(["start", "TunnelAgent"])
+            .status()
+            .map_err(|error| error.to_string())?;
+        if started.success() {
+            Ok("TunnelAgent installed and started.".into())
+        } else {
+            Err("Service installed but failed to start. Check Windows Event Viewer.".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (server_url, token);
+        Err("Windows only".into())
+    }
+}
+
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![load_config, save_config, control_service])
+        .invoke_handler(tauri::generate_handler![
+            load_config,
+            save_config,
+            control_service,
+            install_service
+        ])
         .run(tauri::generate_context!())
         .expect("Tauri application error");
 }
