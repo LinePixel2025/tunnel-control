@@ -920,10 +920,39 @@ async fn data_channel_task(
                     continue;
                 };
                 let (tx, mut rx) = mpsc::channel::<Message>(512);
-                status.data_channels.write().await.insert(channel_id, tx);
+                status
+                    .data_channels
+                    .write()
+                    .await
+                    .insert(channel_id, tx.clone());
                 let writer = tokio::spawn(async move {
                     while let Some(message) = rx.recv().await {
                         if sink.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                // Data channels carry no game traffic while the tunnel is
+                // idle, so proxies (Nginx) and NAT tables would otherwise age
+                // the WebSocket out and drop every stream on it. A periodic
+                // heartbeat keeps the channel alive in both directions: the
+                // server echoes it back over the same socket.
+                let heartbeat_tx = tx.clone();
+                let heartbeat_secs = config.heartbeat_secs;
+                let keepalive = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+                    ticker.tick().await; // skip the immediate first tick
+                    loop {
+                        ticker.tick().await;
+                        let Ok(payload) = encode(&ControlMessage::Heartbeat {
+                            version: PROTOCOL_VERSION,
+                            latency_ms: 0,
+                        }) else {
+                            break;
+                        };
+                        let message =
+                            Message::Text(String::from_utf8_lossy(&payload).into_owned().into());
+                        if heartbeat_tx.try_send(message).is_err() && heartbeat_tx.is_closed() {
                             break;
                         }
                     }
@@ -948,6 +977,7 @@ async fn data_channel_task(
                     }
                 }
                 writer.abort();
+                keepalive.abort();
                 status.data_channels.write().await.remove(&channel_id);
                 tracing::warn!(channel_id, "data channel lost; reconnecting");
                 tokio::time::sleep(Duration::from_secs(1)).await;
