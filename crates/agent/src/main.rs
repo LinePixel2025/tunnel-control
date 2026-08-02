@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc,
@@ -19,6 +19,7 @@ use tokio::{
     sync::{Mutex, RwLock, mpsc},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing_subscriber::prelude::*;
 use tunnel_protocol::{
     ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode, decode_stream_data, encode,
     encode_stream_data,
@@ -307,9 +308,10 @@ use windows_service::{
 define_windows_service!(ffi_service_main, service_main);
 
 fn main() {
-    tracing_subscriber::fmt().init();
     let arguments: Vec<String> = env::args().collect();
-    if arguments.iter().any(|argument| argument == "--service") {
+    let service_mode = arguments.iter().any(|argument| argument == "--service");
+    setup_logging(!service_mode);
+    if service_mode {
         #[cfg(windows)]
         {
             if let Err(error) =
@@ -335,6 +337,76 @@ fn main() {
         return;
     }
     run_agent_forever();
+}
+
+/// Initializes tracing. Console mode keeps stdout output and mirrors it into
+/// the rotating file; service mode writes only to the file. When the log
+/// directory is unusable, logging falls back to console output alone.
+fn setup_logging(console: bool) {
+    let file_layer = create_file_writer().map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+    });
+    let stdout_layer = console.then(|| tracing_subscriber::fmt::layer().with_ansi(true));
+    tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+}
+
+/// Resolves the rotating log directory: `TUNNEL_LOG_DIR` overrides the default
+/// `%PROGRAMDATA%\TunnelControl\logs` on Windows. Returns None on non-Windows
+/// builds without an explicit override so development runs keep stdout only.
+fn log_dir() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("TUNNEL_LOG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(windows)]
+    {
+        env::var_os("PROGRAMDATA")
+            .map(|root| PathBuf::from(root).join("TunnelControl").join("logs"))
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Creates the log directory and a non-blocking file writer for
+/// `agent.log` with daily rotation. The worker guard is leaked so the writer
+/// stays alive for the whole process.
+fn create_file_writer() -> Option<tracing_appender::non_blocking::NonBlocking> {
+    let dir = log_dir()?;
+    if let Err(error) = fs::create_dir_all(&dir) {
+        eprintln!("agent log directory {dir:?} unavailable ({error}); logging to console only");
+        return None;
+    }
+    clean_old_logs(&dir);
+    let appender = tracing_appender::rolling::daily(&dir, "agent.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    Box::leak(Box::new(guard));
+    Some(writer)
+}
+
+/// Deletes rotated agent log files older than seven days; runs at startup.
+fn clean_old_logs(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let retention = Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("agent.log.") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(now);
+        if now.duration_since(modified).unwrap_or(Duration::ZERO) > retention {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -497,6 +569,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
     let (socket, _) = connect_async(&config.server).await?;
     enable_tcp_keepalive(&socket);
     status.connected.store(true, Ordering::Relaxed);
+    tracing::info!(server = %config.server, "control connection established");
     let (mut write, mut read) = socket.split();
     // Control messages (register, heartbeat, ping, probe results, close) use a
     // dedicated channel; tunnel payload moves over separate data channels, so
@@ -629,6 +702,13 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                                 opened_at,
                             },
                         );
+                        tracing::info!(
+                            stream_id = %id,
+                            tunnel_id = %tunnel_id,
+                            data_channel,
+                            public_port = spec.public_port,
+                            "stream opened"
+                        );
                         // Flush frames that arrived on a data socket before
                         // this StreamOpen was processed (cross-connection
                         // ordering is not guaranteed).
@@ -679,8 +759,13 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                         });
                         reader_bridge_tasks.lock().await.insert(id, task);
                     }
-                    Ok(ControlMessage::StreamClose { stream_id, .. }) => {
+                    Ok(ControlMessage::StreamClose { stream_id, reason }) => {
                         if let Ok(id) = stream_id.parse::<u128>() {
+                            tracing::info!(
+                                stream_id = %stream_id,
+                                reason = reason.as_deref().unwrap_or("server_close"),
+                                "stream closed"
+                            );
                             reader_streams.write().await.remove(&id);
                             reader_connections.write().await.remove(&id);
                             reader_pending.write().await.remove(&id);
@@ -918,8 +1003,7 @@ async fn route_agent_binary(
     }
     // Never block a data channel on one saturated TCP stream; close it so the
     // client can reconnect.
-    streams.write().await.remove(&id);
-    connections.write().await.remove(&id);
+    drop_stream(&streams, &connections, id, "local_saturated").await;
     send_close(control, id.to_string(), Some("local_saturated".into()));
 }
 
@@ -964,8 +1048,7 @@ async fn bridge_local(
 ) {
     let Ok(socket) = TcpStream::connect(format!("{}:{}", spec.local_host, spec.local_port)).await
     else {
-        streams.write().await.remove(&id);
-        connections.write().await.remove(&id);
+        drop_stream(&streams, &connections, id, "local_connect_failed").await;
         send_close(
             &control,
             id.to_string(),
@@ -1000,8 +1083,7 @@ async fn bridge_local(
             }
         }
     }
-    streams.write().await.remove(&id);
-    connections.write().await.remove(&id);
+    drop_stream(&streams, &connections, id, "ended").await;
     write_task.abort();
     send_close(&control, id.to_string(), None);
 }
@@ -1017,8 +1099,7 @@ async fn bridge_local_udp(
     limiter: BandwidthLimiter,
 ) {
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
-        streams.write().await.remove(&id);
-        connections.write().await.remove(&id);
+        drop_stream(&streams, &connections, id, "local_bind_failed").await;
         send_close(&control, id.to_string(), Some("local_bind_failed".into()));
         return;
     };
@@ -1027,8 +1108,7 @@ async fn bridge_local_udp(
         .await
         .is_err()
     {
-        streams.write().await.remove(&id);
-        connections.write().await.remove(&id);
+        drop_stream(&streams, &connections, id, "local_connect_failed").await;
         send_close(
             &control,
             id.to_string(),
@@ -1064,10 +1144,15 @@ async fn bridge_local_udp(
             }
         }
     }
-    streams.write().await.remove(&id);
-    connections.write().await.remove(&id);
+    drop_stream(&streams, &connections, id, "ended").await;
     write_task.abort();
     send_close(&control, id.to_string(), None);
+}
+
+async fn drop_stream(streams: &StreamMap, connections: &ConnectionMap, id: u128, reason: &str) {
+    streams.write().await.remove(&id);
+    connections.write().await.remove(&id);
+    tracing::info!(stream_id = %id, reason, "stream closed");
 }
 
 fn send_close(control: &mpsc::Sender<Message>, stream_id: String, reason: Option<String>) {
