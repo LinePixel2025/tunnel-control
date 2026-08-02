@@ -29,7 +29,7 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, UdpSocket},
-    sync::{RwLock, mpsc},
+    sync::{RwLock, mpsc, oneshot},
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tunnel_protocol::{
@@ -49,6 +49,7 @@ struct AppState {
     listeners: Arc<RwLock<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
     udp_sessions: Arc<RwLock<HashMap<u128, UdpSession>>>,
     udp_session_idle_secs: u64,
+    probes: Arc<RwLock<HashMap<String, oneshot::Sender<ProbeOutcome>>>>,
     tunnel_port_start: u16,
     tunnel_port_end: u16,
 }
@@ -61,6 +62,11 @@ struct UdpSession {
     peer: SocketAddr,
     socket: Arc<UdpSocket>,
     last_seen: Instant,
+}
+#[derive(Clone)]
+struct ProbeOutcome {
+    ok: bool,
+    message: Option<String>,
 }
 #[derive(Serialize, FromRow)]
 struct Device {
@@ -188,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         listeners: Arc::new(RwLock::new(HashMap::new())),
         udp_sessions: Arc::new(RwLock::new(HashMap::new())),
         udp_session_idle_secs,
+        probes: Arc::new(RwLock::new(HashMap::new())),
         tunnel_port_start,
         tunnel_port_end,
     };
@@ -210,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
             put(update_tunnel).delete(delete_tunnel),
         )
         .route("/api/v1/tunnels/{id}/toggle", post(toggle_tunnel))
+        .route("/api/v1/tunnels/{id}/probe", post(probe_tunnel))
         .route("/api/v1/keys", get(list_keys).post(create_key))
         .route("/api/v1/keys/{id}", put(update_key).delete(delete_key))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
@@ -521,6 +529,95 @@ async fn delete_tunnel(
     sync_device_tunnels(&state, current.device_id).await;
     audit(&state.db, actor.id, "tunnel.deleted", &current.name).await;
     Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+async fn probe_tunnel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let tunnel = get_tunnel(&state.db, id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "Tunnel not found".into()))?;
+    let listener_active = state.listeners.read().await.contains_key(&id);
+    let agent_online = state.sessions.read().await.contains_key(&tunnel.device_id);
+    if !listener_active || !agent_online {
+        let message = if !listener_active {
+            "tunnel listener is not active"
+        } else {
+            "agent is offline"
+        };
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "listener": listener_active,
+            "agent_online": agent_online,
+            "local": serde_json::Value::Null,
+            "message": message,
+        })));
+    }
+    let probe_id = Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<ProbeOutcome>();
+    state.probes.write().await.insert(probe_id.clone(), tx);
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&tunnel.device_id)
+        .cloned()
+        .unwrap();
+    let probe = ControlMessage::ProbeLocal {
+        probe_id: probe_id.clone(),
+        tunnel_id: tunnel.id.to_string(),
+    };
+    let Ok(payload) = encode(&probe) else {
+        state.probes.write().await.remove(&probe_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not encode probe".into(),
+        ));
+    };
+    if session
+        .send(Message::Text(
+            String::from_utf8_lossy(&payload).into_owned().into(),
+        ))
+        .await
+        .is_err()
+    {
+        state.probes.write().await.remove(&probe_id);
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "listener": listener_active,
+            "agent_online": false,
+            "local": serde_json::Value::Null,
+            "message": "agent went offline while probing",
+        })));
+    }
+    match tokio::time::timeout(StdDuration::from_secs(10), rx).await {
+        Ok(Ok(outcome)) => Ok(Json(serde_json::json!({
+            "ok": outcome.ok,
+            "listener": listener_active,
+            "agent_online": agent_online,
+            "local": outcome.ok,
+            "message": outcome.message,
+        }))),
+        Ok(Err(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Probe channel failed".into(),
+        )),
+        Err(_) => {
+            state.probes.write().await.remove(&probe_id);
+            Ok(Json(serde_json::json!({
+                "ok": false,
+                "listener": listener_active,
+                "agent_online": agent_online,
+                "local": serde_json::Value::Null,
+                "message": "probe timed out; agent may be running an older version",
+            })))
+        }
+    }
 }
 
 async fn list_keys(
@@ -872,6 +969,15 @@ async fn control_loop(socket: WebSocket, state: AppState) {
                     if let Ok(id) = stream_id.parse::<u128>() {
                         state.streams.write().await.remove(&id);
                         state.udp_sessions.write().await.remove(&id);
+                    }
+                } else if let Ok(ControlMessage::ProbeResult {
+                    probe_id,
+                    ok,
+                    message,
+                }) = decode(text.as_bytes())
+                {
+                    if let Some(tx) = state.probes.write().await.remove(&probe_id) {
+                        let _ = tx.send(ProbeOutcome { ok, message });
                     }
                 }
             }

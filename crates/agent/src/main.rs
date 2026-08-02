@@ -437,6 +437,28 @@ async fn run(
                             reader_connections.write().await.remove(&id);
                         }
                     }
+                    Ok(ControlMessage::ProbeLocal {
+                        probe_id,
+                        tunnel_id,
+                    }) => {
+                        let spec = reader_specs.read().await.get(&tunnel_id).cloned();
+                        let (ok, message) = match spec {
+                            None => (false, Some("unknown_tunnel".into())),
+                            Some(spec) => probe_local_service(&spec).await,
+                        };
+                        let result = ControlMessage::ProbeResult {
+                            probe_id,
+                            ok,
+                            message,
+                        };
+                        if let Ok(payload) = encode(&result) {
+                            let _ = reader_out
+                                .send(Message::Text(
+                                    String::from_utf8_lossy(&payload).into_owned().into(),
+                                ))
+                                .await;
+                        }
+                    }
                     _ => {}
                 },
                 Message::Binary(bytes) => {
@@ -480,6 +502,35 @@ async fn run(
     writer_task.abort();
     reader_task.abort();
     Err("control channel closed; reconnecting".into())
+}
+
+/// Verifies the agent can reach the tunnel's local service. TCP/HTTP attempt a
+/// real connect; UDP only proves the local socket can bind/connect because UDP
+/// has no connection semantics and the service protocol is unknown.
+async fn probe_local_service(spec: &TunnelSpec) -> (bool, Option<String>) {
+    let target = format!("{}:{}", spec.local_host, spec.local_port);
+    match &spec.kind {
+        TunnelKind::Udp => match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => {
+                match tokio::time::timeout(Duration::from_secs(5), socket.connect(target)).await {
+                    Ok(Ok(())) => (
+                        true,
+                        Some("udp socket ready; real reachability requires a live client".into()),
+                    ),
+                    Ok(Err(error)) => (false, Some(format!("udp local connect failed: {error}"))),
+                    Err(_) => (false, Some("udp local connect timed out".into())),
+                }
+            }
+            Err(error) => (false, Some(format!("udp bind failed: {error}"))),
+        },
+        _ => {
+            match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&target)).await {
+                Ok(Ok(_)) => (true, Some("local tcp service reachable".into())),
+                Ok(Err(error)) => (false, Some(format!("local tcp connect failed: {error}"))),
+                Err(_) => (false, Some("local tcp connect timed out".into())),
+            }
+        }
+    }
 }
 
 async fn bridge_local(
