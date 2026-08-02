@@ -466,20 +466,27 @@ async fn run(
                     if let Ok((id, data)) = decode_stream_data(&bytes) {
                         if let Some(tx) = reader_streams.read().await.get(&id).cloned() {
                             if tx.try_send(data.to_vec()).is_err() {
+                                let is_udp = reader_connections
+                                    .read()
+                                    .await
+                                    .get(&id)
+                                    .map(|connection| connection.kind == "udp")
+                                    .unwrap_or(false);
+                                if is_udp {
+                                    // UDP tolerates loss; drop the datagram and
+                                    // keep the session alive.
+                                    continue;
+                                }
                                 // Never block the shared control channel on one
-                                // saturated stream; drop the stream and ask the
-                                // server to clean up its side.
+                                // saturated TCP stream; close it so the client
+                                // can reconnect.
                                 reader_streams.write().await.remove(&id);
                                 reader_connections.write().await.remove(&id);
-                                let close = ControlMessage::StreamClose {
-                                    stream_id: id.to_string(),
-                                    reason: Some("local_saturated".into()),
-                                };
-                                if let Ok(payload) = encode(&close) {
-                                    let _ = reader_out.try_send(Message::Text(
-                                        String::from_utf8_lossy(&payload).into_owned().into(),
-                                    ));
-                                }
+                                send_close(
+                                    &reader_out,
+                                    id.to_string(),
+                                    Some("local_saturated".into()),
+                                );
                             }
                         }
                     }
@@ -500,17 +507,14 @@ async fn run(
             version: PROTOCOL_VERSION,
             latency_ms: 0,
         };
-        if out_tx
-            .try_send(Message::Text(
-                String::from_utf8(encode(&heartbeat)?)?.into(),
-            ))
-            .is_err()
-        {
-            break;
+        if let Ok(payload) = encode(&heartbeat) {
+            // A momentarily full queue must not tear down the connection;
+            // connection health is decided by the 45s pong timeout above.
+            let _ = out_tx.try_send(Message::Text(
+                String::from_utf8_lossy(&payload).into_owned().into(),
+            ));
         }
-        if out_tx.try_send(Message::Ping(Vec::new().into())).is_err() {
-            break;
-        }
+        let _ = out_tx.try_send(Message::Ping(Vec::new().into()));
     }
     status.connected.store(false, Ordering::Relaxed);
     status.connections.write().await.clear();
