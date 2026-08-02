@@ -259,14 +259,18 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
                             continue;
                         };
                         if let Some(spec) = reader_specs.read().await.get(&tunnel_id).cloned() {
+                            let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+                            // Register the stream before spawning the bridge so the
+                            // first data frame following StreamOpen is never dropped.
+                            reader_streams.write().await.insert(id, tx);
                             let out = reader_out.clone();
                             let streams = reader_streams.clone();
                             tokio::spawn(async move {
                                 match spec.kind {
                                     TunnelKind::Udp => {
-                                        bridge_local_udp(id, spec, out, streams).await;
+                                        bridge_local_udp(id, spec, rx, out, streams).await;
                                     }
-                                    _ => bridge_local(id, spec, out, streams).await,
+                                    _ => bridge_local(id, spec, rx, out, streams).await,
                                 }
                             });
                         } else {
@@ -306,15 +310,20 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
     }
 }
 
-async fn bridge_local(id: u128, spec: TunnelSpec, out: mpsc::Sender<Message>, streams: StreamMap) {
+async fn bridge_local(
+    id: u128,
+    spec: TunnelSpec,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    out: mpsc::Sender<Message>,
+    streams: StreamMap,
+) {
     let Ok(socket) = TcpStream::connect(format!("{}:{}", spec.local_host, spec.local_port)).await
     else {
+        streams.write().await.remove(&id);
         send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
         return;
     };
     let (mut reader, mut writer) = socket.into_split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(128);
-    streams.write().await.insert(id, tx);
     let write_task = tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
             if writer.write_all(&data).await.is_err() {
@@ -344,10 +353,12 @@ async fn bridge_local(id: u128, spec: TunnelSpec, out: mpsc::Sender<Message>, st
 async fn bridge_local_udp(
     id: u128,
     spec: TunnelSpec,
+    mut rx: mpsc::Receiver<Vec<u8>>,
     out: mpsc::Sender<Message>,
     streams: StreamMap,
 ) {
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        streams.write().await.remove(&id);
         send_close(&out, id.to_string(), Some("local_bind_failed".into())).await;
         return;
     };
@@ -356,12 +367,11 @@ async fn bridge_local_udp(
         .await
         .is_err()
     {
+        streams.write().await.remove(&id);
         send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
         return;
     }
     let socket = Arc::new(socket);
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(128);
-    streams.write().await.insert(id, tx);
     let writer_socket = socket.clone();
     let write_task = tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
@@ -426,20 +436,11 @@ mod tests {
         };
         let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
         let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
-        let bridge = tokio::spawn(bridge_local_udp(42, spec, out_tx, streams.clone()));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+        // The StreamOpen handler registers the stream before spawning the bridge.
+        streams.write().await.insert(42, tx.clone());
+        let bridge = tokio::spawn(bridge_local_udp(42, spec, rx, out_tx, streams.clone()));
 
-        for _ in 0..100 {
-            if streams.read().await.contains_key(&42) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            streams.read().await.contains_key(&42),
-            "bridge never registered"
-        );
-
-        let tx = streams.read().await.get(&42).cloned().unwrap();
         tx.send(b"hello-udp".to_vec()).await.unwrap();
 
         let message = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
