@@ -37,6 +37,16 @@ pub enum ControlMessage {
         stream_id: String,
         reason: Option<String>,
     },
+    /// Asks the agent to verify it can reach the tunnel's local service.
+    ProbeLocal {
+        probe_id: String,
+        tunnel_id: String,
+    },
+    ProbeResult {
+        probe_id: String,
+        ok: bool,
+        message: Option<String>,
+    },
     Error {
         code: String,
         message: String,
@@ -164,5 +174,19 @@ mod tests {
                 tunnels: vec![spec],
             }
         );
+    }
+    #[test]
+    fn probe_messages_round_trip() {
+        let input = ControlMessage::ProbeLocal {
+            probe_id: "probe-1".into(),
+            tunnel_id: "tunnel-1".into(),
+        };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
+        let result = ControlMessage::ProbeResult {
+            probe_id: "probe-1".into(),
+            ok: true,
+            message: Some("local tcp reachable".into()),
+        };
+        assert_eq!(decode(&encode(&result).unwrap()).unwrap(), result);
     }
 }

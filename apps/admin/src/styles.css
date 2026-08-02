@@ -238,3 +238,5 @@ code { font-family: "DM Mono"; font-size: 11px; color: #405047; }
   .row > *:nth-child(5) { display: none; }
   .two { grid-template-columns: 1fr; }
 }
+.probe{margin:14px 18px 0;padding:11px 14px;border-radius:6px;font-size:12px;display:flex;gap:10px;align-items:baseline;border:1px solid}
+.probe b{font-size:12px}.probe span{color:#55635b}.probe.ok{background:#e9f8f0;border-color:#b9e5cf;color:#0f6b4a}.probe.fail{background:#fdf0ee;border-color:#f0c7bf;color:#a13a2a}.icon-button:disabled{opacity:.45;cursor:default}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
