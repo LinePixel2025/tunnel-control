@@ -50,6 +50,7 @@ struct AppState {
     udp_sessions: Arc<RwLock<HashMap<u128, UdpSession>>>,
     udp_session_idle_secs: u64,
     probes: Arc<RwLock<HashMap<String, oneshot::Sender<ProbeOutcome>>>>,
+    bandwidth: BandwidthLimiter,
     tunnel_port_start: u16,
     tunnel_port_end: u16,
 }
@@ -60,13 +61,94 @@ struct UdpSession {
     device_id: Uuid,
     tunnel_id: Uuid,
     peer: SocketAddr,
-    socket: Arc<UdpSocket>,
+    outbox: mpsc::Sender<Vec<u8>>,
     last_seen: Instant,
 }
 #[derive(Clone)]
 struct ProbeOutcome {
     ok: bool,
     message: Option<String>,
+}
+
+/// Shared token bucket that throttles traffic so the server's bandwidth stays
+/// under the configured cap. `rate` is bytes per second; a rate of 0 disables
+/// throttling. All tunnels draw from one bucket, so when the cap is reached
+/// every connection slows down fairly instead of being dropped.
+#[derive(Clone)]
+struct BandwidthLimiter {
+    rate: f64,
+    burst: f64,
+    state: Arc<tokio::sync::Mutex<BucketState>>,
+}
+
+struct BucketState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl BandwidthLimiter {
+    fn new(mbps: u64) -> Self {
+        let rate = mbps as f64 * 1_000_000.0 / 8.0;
+        Self {
+            rate,
+            burst: rate,
+            state: Arc::new(tokio::sync::Mutex::new(BucketState {
+                tokens: rate,
+                last: Instant::now(),
+            })),
+        }
+    }
+
+    async fn acquire(&self, bytes: usize) {
+        if self.rate <= 0.0 {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        loop {
+            let now = Instant::now();
+            let elapsed = now.duration_since(state.last).as_secs_f64();
+            state.last = now;
+            state.tokens = (state.tokens + elapsed * self.rate).min(self.burst);
+            if state.tokens >= bytes as f64 {
+                state.tokens -= bytes as f64;
+                return;
+            }
+            let wait = (bytes as f64 - state.tokens) / self.rate;
+            drop(state);
+            tokio::time::sleep(StdDuration::from_secs_f64(wait.min(0.5))).await;
+            state = self.state.lock().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bandwidth_limiter_caps_throughput() {
+        let limiter = BandwidthLimiter::new(1);
+        let started = Instant::now();
+        let mut sent = 0usize;
+        // Four seconds worth of budget: the first second is the burst, the
+        // remaining three seconds must be paced by the token bucket.
+        while sent < 500_000 {
+            limiter.acquire(1_250).await;
+            sent += 1_250;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        assert!(elapsed >= 2.5 && elapsed < 6.0, "elapsed {elapsed}");
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limiter_disabled_passes_through() {
+        let limiter = BandwidthLimiter::new(0);
+        let started = Instant::now();
+        for _ in 0..100 {
+            limiter.acquire(64 * 1024).await;
+        }
+        assert!(started.elapsed().as_millis() < 500);
+    }
 }
 #[derive(Serialize, FromRow)]
 struct Device {
@@ -171,6 +253,12 @@ async fn main() -> anyhow::Result<()> {
     if tunnel_port_start > tunnel_port_end {
         anyhow::bail!("TUNNEL_PORT_START must not be greater than TUNNEL_PORT_END");
     }
+    let bandwidth = BandwidthLimiter::new(
+        env::var("BANDWIDTH_LIMIT_MBPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    );
     let udp_session_idle_secs = env::var("UDP_SESSION_IDLE_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -195,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         udp_sessions: Arc::new(RwLock::new(HashMap::new())),
         udp_session_idle_secs,
         probes: Arc::new(RwLock::new(HashMap::new())),
+        bandwidth,
         tunnel_port_start,
         tunnel_port_end,
     };
@@ -984,7 +1073,15 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             Message::Binary(bytes) => {
                 if let Ok((id, data)) = decode_stream_data(&bytes) {
                     if let Some(session) = state.udp_sessions.read().await.get(&id).cloned() {
-                        let _ = session.socket.send_to(data, session.peer).await;
+                        match session.outbox.try_send(data.to_vec()) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                state.udp_sessions.write().await.remove(&id);
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // UDP tolerates loss; drop the datagram.
+                            }
+                        }
                         if let Some(current) = state.udp_sessions.write().await.get_mut(&id) {
                             current.last_seen = Instant::now();
                         }
@@ -1180,8 +1277,10 @@ async fn bridge_public_connection(
         return;
     }
     let out = session.clone();
+    let limiter = state.bandwidth.clone();
     let inbound = tokio::spawn(async move {
         while let Some(data) = incoming_rx.recv().await {
+            limiter.acquire(data.len()).await;
             if writer.write_all(&data).await.is_err() {
                 break;
             }
@@ -1192,22 +1291,14 @@ async fn bridge_public_connection(
         match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                state.bandwidth.acquire(n).await;
                 let Ok(frame) = encode_stream_data(id, &buf[..n]) else {
                     break;
                 };
-                if out.try_send(Message::Binary(frame.into())).is_err() {
-                    // Never stall the device's outbound queue on one stream;
-                    // close it so the client can reconnect.
-                    state.streams.write().await.remove(&id);
-                    let close = ControlMessage::StreamClose {
-                        stream_id: id.to_string(),
-                        reason: Some("stream_saturated".into()),
-                    };
-                    if let Ok(payload) = encode(&close) {
-                        let _ = session.try_send(Message::Text(
-                            String::from_utf8_lossy(&payload).into_owned().into(),
-                        ));
-                    }
+                // This bridge task may wait for the device's outbound queue or
+                // the bandwidth budget; it never blocks the control loop, and
+                // TCP must not drop bytes, so queue here instead of closing.
+                if out.send(Message::Binary(frame.into())).await.is_err() {
                     break;
                 }
             }
@@ -1290,6 +1381,7 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                 let Ok((size, peer)) = result else {
                     break;
                 };
+                state.bandwidth.acquire(size).await;
                 let stream_id = {
                     let sessions = state.udp_sessions.read().await;
                     sessions
@@ -1337,13 +1429,25 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                         {
                             continue;
                         }
+                        let (outbox_tx, mut outbox_rx) = mpsc::channel::<Vec<u8>>(512);
+                        let send_socket = socket.clone();
+                        let send_peer = peer;
+                        let limiter = state.bandwidth.clone();
+                        tokio::spawn(async move {
+                            while let Some(data) = outbox_rx.recv().await {
+                                limiter.acquire(data.len()).await;
+                                if send_socket.send_to(&data, send_peer).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
                         state.udp_sessions.write().await.insert(
                             id,
                             UdpSession {
                                 device_id: tunnel.device_id,
                                 tunnel_id: tunnel.id,
                                 peer,
-                                socket: socket.clone(),
+                                outbox: outbox_tx,
                                 last_seen: Instant::now(),
                             },
                         );
