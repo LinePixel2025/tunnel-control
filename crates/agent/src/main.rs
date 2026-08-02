@@ -7,12 +7,15 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     process::Command,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{RwLock, mpsc},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -22,6 +25,117 @@ use tunnel_protocol::{
 };
 
 type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
+type ConnectionMap = Arc<RwLock<HashMap<u128, ConnectionInfo>>>;
+
+/// Shared runtime state exposed to the local GUI through the status server.
+#[derive(Clone, Default)]
+struct AgentStatus {
+    connected: Arc<AtomicBool>,
+    specs: Arc<RwLock<HashMap<String, TunnelSpec>>>,
+    connections: ConnectionMap,
+}
+
+#[derive(Clone)]
+struct ConnectionInfo {
+    stream_id: String,
+    tunnel_id: String,
+    kind: String,
+    public_port: u16,
+    local_host: String,
+    local_port: u16,
+    opened_at: u64,
+}
+
+fn kind_str(kind: &TunnelKind) -> &'static str {
+    match kind {
+        TunnelKind::Tcp => "tcp",
+        TunnelKind::Http => "http",
+        TunnelKind::Udp => "udp",
+    }
+}
+
+/// Serves `GET http://127.0.0.1:17890/status` for the local GUI. The service
+/// binds only to loopback and exposes no secrets, so a plain CORS-enabled
+/// JSON endpoint is sufficient.
+async fn status_server(status: AgentStatus) {
+    let Ok(listener) = TcpListener::bind("127.0.0.1:17890").await else {
+        tracing::warn!("local status server could not bind 127.0.0.1:17890");
+        return;
+    };
+    loop {
+        let Ok((socket, _)) = listener.accept().await else {
+            continue;
+        };
+        let status = status.clone();
+        tokio::spawn(async move {
+            handle_status_request(socket, status).await;
+        });
+    }
+}
+
+async fn handle_status_request(mut socket: TcpStream, status: AgentStatus) {
+    let mut buffer = [0_u8; 1024];
+    let Ok(size) = socket.read(&mut buffer).await else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buffer[..size]);
+    let path = request.split_whitespace().nth(1).unwrap_or("/");
+    let (code, body) = if path == "/status" {
+        ("200 OK", build_status_json(&status).await)
+    } else {
+        ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+    };
+    let response = format!(
+        "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = socket.write_all(response.as_bytes()).await;
+}
+
+async fn build_status_json(status: &AgentStatus) -> String {
+    let connected = status.connected.load(Ordering::Relaxed);
+    let tunnels: Vec<serde_json::Value> = status
+        .specs
+        .read()
+        .await
+        .values()
+        .map(|tunnel| {
+            serde_json::json!({
+                "id": tunnel.id,
+                "name": tunnel.name,
+                "kind": kind_str(&tunnel.kind),
+                "public_port": tunnel.public_port,
+                "local_host": tunnel.local_host,
+                "local_port": tunnel.local_port,
+                "enabled": tunnel.enabled,
+                "max_connections": tunnel.max_connections,
+            })
+        })
+        .collect();
+    let connections: Vec<serde_json::Value> = status
+        .connections
+        .read()
+        .await
+        .values()
+        .map(|connection| {
+            serde_json::json!({
+                "stream_id": connection.stream_id,
+                "tunnel_id": connection.tunnel_id,
+                "kind": connection.kind,
+                "public_port": connection.public_port,
+                "local_host": connection.local_host,
+                "local_port": connection.local_port,
+                "opened_at": connection.opened_at,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "connected": connected,
+        "tunnels": tunnels,
+        "connections": connections,
+    })
+    .to_string()
+}
 
 #[cfg(windows)]
 use windows_service::{
@@ -124,8 +238,13 @@ fn run_agent_forever() {
         .build()
         .expect("failed to build tokio runtime");
     runtime.block_on(async move {
+        let status = AgentStatus::default();
+        let status_server_status = status.clone();
+        tokio::spawn(async move {
+            status_server(status_server_status).await;
+        });
         loop {
-            if let Err(error) = run(&server, &token, &name).await {
+            if let Err(error) = run(&server, &token, &name, &status).await {
                 tracing::warn!(%error, "agent disconnected; retrying");
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -215,12 +334,19 @@ fn load_file_config() -> HashMap<String, String> {
         .collect()
 }
 
-async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    server: &str,
+    token: &str,
+    name: &str,
+    status: &AgentStatus,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (socket, _) = connect_async(server).await?;
+    status.connected.store(true, Ordering::Relaxed);
     let (mut write, mut read) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
-    let specs = Arc::new(RwLock::new(HashMap::<String, TunnelSpec>::new()));
+    let specs = status.specs.clone();
     let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+    let connections = status.connections.clone();
     let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
 
     let register = ControlMessage::Register {
@@ -242,6 +368,7 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
     let reader_out = out_tx.clone();
     let reader_specs = specs.clone();
     let reader_streams = streams.clone();
+    let reader_connections = connections.clone();
     let reader_pong = last_pong.clone();
     let reader_task = tokio::spawn(async move {
         while let Some(Ok(message)) = read.next().await {
@@ -270,14 +397,34 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
                             // Register the stream before spawning the bridge so the
                             // first data frame following StreamOpen is never dropped.
                             reader_streams.write().await.insert(id, tx);
+                            let opened_at = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .map(|duration| duration.as_secs())
+                                .unwrap_or(0);
+                            reader_connections.write().await.insert(
+                                id,
+                                ConnectionInfo {
+                                    stream_id: id.to_string(),
+                                    tunnel_id: tunnel_id.clone(),
+                                    kind: kind_str(&spec.kind).to_string(),
+                                    public_port: spec.public_port,
+                                    local_host: spec.local_host.clone(),
+                                    local_port: spec.local_port,
+                                    opened_at,
+                                },
+                            );
                             let out = reader_out.clone();
                             let streams = reader_streams.clone();
+                            let connections = reader_connections.clone();
                             tokio::spawn(async move {
                                 match spec.kind {
                                     TunnelKind::Udp => {
-                                        bridge_local_udp(id, spec, rx, out, streams).await;
+                                        bridge_local_udp(id, spec, rx, out, streams, connections)
+                                            .await;
                                     }
-                                    _ => bridge_local(id, spec, rx, out, streams).await,
+                                    _ => {
+                                        bridge_local(id, spec, rx, out, streams, connections).await
+                                    }
                                 }
                             });
                         } else {
@@ -287,6 +434,7 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
                     Ok(ControlMessage::StreamClose { stream_id, .. }) => {
                         if let Ok(id) = stream_id.parse::<u128>() {
                             reader_streams.write().await.remove(&id);
+                            reader_connections.write().await.remove(&id);
                         }
                     }
                     _ => {}
@@ -327,6 +475,8 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
             break;
         }
     }
+    status.connected.store(false, Ordering::Relaxed);
+    status.connections.write().await.clear();
     writer_task.abort();
     reader_task.abort();
     Err("control channel closed; reconnecting".into())
@@ -338,10 +488,12 @@ async fn bridge_local(
     mut rx: mpsc::Receiver<Vec<u8>>,
     out: mpsc::Sender<Message>,
     streams: StreamMap,
+    connections: ConnectionMap,
 ) {
     let Ok(socket) = TcpStream::connect(format!("{}:{}", spec.local_host, spec.local_port)).await
     else {
         streams.write().await.remove(&id);
+        connections.write().await.remove(&id);
         send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
         return;
     };
@@ -368,6 +520,7 @@ async fn bridge_local(
         }
     }
     streams.write().await.remove(&id);
+    connections.write().await.remove(&id);
     write_task.abort();
     send_close(&out, id.to_string(), None).await;
 }
@@ -378,9 +531,11 @@ async fn bridge_local_udp(
     mut rx: mpsc::Receiver<Vec<u8>>,
     out: mpsc::Sender<Message>,
     streams: StreamMap,
+    connections: ConnectionMap,
 ) {
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
         streams.write().await.remove(&id);
+        connections.write().await.remove(&id);
         send_close(&out, id.to_string(), Some("local_bind_failed".into())).await;
         return;
     };
@@ -390,6 +545,7 @@ async fn bridge_local_udp(
         .is_err()
     {
         streams.write().await.remove(&id);
+        connections.write().await.remove(&id);
         send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
         return;
     }
@@ -417,6 +573,7 @@ async fn bridge_local_udp(
         }
     }
     streams.write().await.remove(&id);
+    connections.write().await.remove(&id);
     write_task.abort();
     send_close(&out, id.to_string(), None).await;
 }
@@ -458,10 +615,18 @@ mod tests {
         };
         let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
         let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
         // The StreamOpen handler registers the stream before spawning the bridge.
         streams.write().await.insert(42, tx.clone());
-        let bridge = tokio::spawn(bridge_local_udp(42, spec, rx, out_tx, streams.clone()));
+        let bridge = tokio::spawn(bridge_local_udp(
+            42,
+            spec,
+            rx,
+            out_tx,
+            streams.clone(),
+            connections.clone(),
+        ));
 
         tx.send(b"hello-udp".to_vec()).await.unwrap();
 
