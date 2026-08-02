@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +60,7 @@ pub struct TunnelSpec {
 pub enum TunnelKind {
     Tcp,
     Http,
+    Udp,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -135,8 +136,33 @@ mod tests {
     #[test]
     fn rejects_wrong_version() {
         assert_eq!(
-            decode(br#"{"type":"heartbeat","version":99,"latency_ms":1}"#),
-            Err(ProtocolError::UnsupportedVersion(99))
+            decode(br#"{"type":"heartbeat","version":1,"latency_ms":1}"#),
+            Err(ProtocolError::UnsupportedVersion(1))
+        );
+    }
+    #[test]
+    fn udp_tunnel_spec_round_trip() {
+        let spec = TunnelSpec {
+            id: "tunnel-1".into(),
+            name: "Bedrock server".into(),
+            kind: TunnelKind::Udp,
+            public_port: 19132,
+            local_host: "127.0.0.1".into(),
+            local_port: 19132,
+            enabled: true,
+            max_connections: 50,
+        };
+        let encoded = encode(&ControlMessage::Registered {
+            device_id: "device-1".into(),
+            tunnels: vec![spec.clone()],
+        })
+        .unwrap();
+        assert_eq!(
+            decode(&encoded).unwrap(),
+            ControlMessage::Registered {
+                device_id: "device-1".into(),
+                tunnels: vec![spec],
+            }
         );
     }
 }
