@@ -15,7 +15,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Set a long random JWT signing secret}
     ports:
       - "${TUNNEL_PORT_START:-10000}-${TUNNEL_PORT_END:-10100}:${TUNNEL_PORT_START:-10000}-${TUNNEL_PORT_END:-10100}"
-      - "${TUNNEL_PORT_START:-10000}-${TUNNEL_PORT_END:-10100}/udp:${TUNNEL_PORT_START:-10000}-${TUNNEL_PORT_END:-10100}/udp"
+      - "${TUNNEL_PORT_START:-10000}-${TUNNEL_PORT_END:-10100}:${TUNNEL_PORT_START:-10000}-${TUNNEL_PORT_END:-10100}/udp"
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
