@@ -23,7 +23,10 @@ use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration as StdDuration, Instant},
 };
 use tokio::{
@@ -76,8 +79,7 @@ struct ProbeOutcome {
 /// every connection slows down fairly instead of being dropped.
 #[derive(Clone)]
 struct BandwidthLimiter {
-    rate: f64,
-    burst: f64,
+    mbps: Arc<AtomicU64>,
     state: Arc<tokio::sync::Mutex<BucketState>>,
 }
 
@@ -88,32 +90,45 @@ struct BucketState {
 
 impl BandwidthLimiter {
     fn new(mbps: u64) -> Self {
-        let rate = mbps as f64 * 1_000_000.0 / 8.0;
         Self {
-            rate,
-            burst: rate,
+            mbps: Arc::new(AtomicU64::new(mbps)),
             state: Arc::new(tokio::sync::Mutex::new(BucketState {
-                tokens: rate,
+                tokens: mbps as f64 * 1_000_000.0 / 8.0,
                 last: Instant::now(),
             })),
         }
     }
 
+    fn current_mbps(&self) -> u64 {
+        self.mbps.load(Ordering::Relaxed)
+    }
+
+    fn set_mbps(&self, mbps: u64) {
+        self.mbps.store(mbps, Ordering::Relaxed);
+    }
+
     async fn acquire(&self, bytes: usize) {
-        if self.rate <= 0.0 {
+        let mbps = self.mbps.load(Ordering::Relaxed);
+        if mbps == 0 {
             return;
         }
         let mut state = self.state.lock().await;
         loop {
+            let mbps = self.mbps.load(Ordering::Relaxed);
+            if mbps == 0 {
+                return;
+            }
+            let rate = mbps as f64 * 1_000_000.0 / 8.0;
+            let burst = rate;
             let now = Instant::now();
             let elapsed = now.duration_since(state.last).as_secs_f64();
             state.last = now;
-            state.tokens = (state.tokens + elapsed * self.rate).min(self.burst);
+            state.tokens = (state.tokens + elapsed * rate).min(burst);
             if state.tokens >= bytes as f64 {
                 state.tokens -= bytes as f64;
                 return;
             }
-            let wait = (bytes as f64 - state.tokens) / self.rate;
+            let wait = (bytes as f64 - state.tokens) / rate;
             drop(state);
             tokio::time::sleep(StdDuration::from_secs_f64(wait.min(0.5))).await;
             state = self.state.lock().await;
@@ -142,7 +157,8 @@ mod tests {
 
     #[tokio::test]
     async fn bandwidth_limiter_disabled_passes_through() {
-        let limiter = BandwidthLimiter::new(0);
+        let limiter = BandwidthLimiter::new(1);
+        limiter.set_mbps(0);
         let started = Instant::now();
         for _ in 0..100 {
             limiter.acquire(64 * 1024).await;
@@ -176,6 +192,10 @@ struct TunnelRecord {
 struct Login {
     email: String,
     password: String,
+}
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    bandwidth_limit_mbps: u64,
 }
 #[derive(Deserialize)]
 struct CreateTunnel {
@@ -264,6 +284,15 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse().ok())
         .filter(|secs| *secs >= 30)
         .unwrap_or(120);
+    if let Some(stored) = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'bandwidth_limit_mbps'",
+    )
+    .fetch_optional(&db)
+    .await?
+    .and_then(|value| value.parse().ok())
+    {
+        bandwidth.set_mbps(stored);
+    }
     let state = AppState {
         db,
         redis: redis::Client::open(redis_url)?,
@@ -299,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/summary", get(summary))
+        .route("/api/v1/settings", get(get_settings).put(update_settings))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
         .route(
@@ -438,6 +468,59 @@ async fn summary(
     Ok(Json(
         serde_json::json!({"devices":row.0,"online_devices":row.1,"tunnels":row.2,"active_connections":0}),
     ))
+}
+async fn get_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Settings>, StatusCode> {
+    admin(&headers, &state).await?;
+    let stored: Option<u64> = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'bandwidth_limit_mbps'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .and_then(|value| value.parse().ok());
+    Ok(Json(Settings {
+        bandwidth_limit_mbps: stored.unwrap_or_else(|| state.bandwidth.current_mbps()),
+    }))
+}
+async fn update_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Settings>,
+) -> Result<Json<Settings>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    if input.bandwidth_limit_mbps > 10_000 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bandwidth_limit_mbps must be at most 10000".into(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO settings(key, value) VALUES('bandwidth_limit_mbps', $1) \
+         ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(input.bandwidth_limit_mbps.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save settings".into(),
+        )
+    })?;
+    state.bandwidth.set_mbps(input.bandwidth_limit_mbps);
+    audit(
+        &state.db,
+        actor.id,
+        "settings.bandwidth_updated",
+        &input.bandwidth_limit_mbps.to_string(),
+    )
+    .await;
+    Ok(Json(input))
 }
 async fn list_devices(
     State(state): State<AppState>,
