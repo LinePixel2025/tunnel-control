@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +28,9 @@ pub enum ControlMessage {
     StreamOpen {
         stream_id: String,
         tunnel_id: String,
+        /// Data channel assigned by the server. The agent routes all data
+        /// frames for this stream through the matching WebSocket.
+        data_channel: u16,
     },
     StreamData {
         stream_id: String,
@@ -51,6 +54,15 @@ pub enum ControlMessage {
     /// throttle its own outbound data at the source. 0 disables throttling.
     BandwidthConfig {
         mbps: u64,
+    },
+    /// First message on a data WebSocket: binds the socket to an online
+    /// device using the same agent token as the control registration.
+    DataBind {
+        token: String,
+    },
+    /// Server -> agent reply on a data WebSocket, assigning its channel id.
+    DataBound {
+        channel_id: u16,
     },
     Error {
         code: String,
@@ -193,6 +205,26 @@ mod tests {
             message: Some("local tcp reachable".into()),
         };
         assert_eq!(decode(&encode(&result).unwrap()).unwrap(), result);
+    }
+    #[test]
+    fn stream_open_carries_data_channel() {
+        let input = ControlMessage::StreamOpen {
+            stream_id: "stream-1".into(),
+            tunnel_id: "tunnel-1".into(),
+            data_channel: 2,
+        };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
+        let text = String::from_utf8(encode(&input).unwrap()).unwrap();
+        assert!(text.contains("\"data_channel\":2"));
+    }
+    #[test]
+    fn data_bind_bound_round_trip() {
+        let bind = ControlMessage::DataBind {
+            token: "agent-token".into(),
+        };
+        assert_eq!(decode(&encode(&bind).unwrap()).unwrap(), bind);
+        let bound = ControlMessage::DataBound { channel_id: 1 };
+        assert_eq!(decode(&encode(&bound).unwrap()).unwrap(), bound);
     }
     #[test]
     fn bandwidth_config_round_trip() {
