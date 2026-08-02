@@ -1,7 +1,17 @@
-@media(max-width:760px){nav{grid-template-columns:repeat(4,1fr)}}
-.key-hint{font-size:13px;color:#6c7a71;margin-bottom:12px}
-.key-token{display:flex;align-items:center;gap:10px;background:#f3f7f4;border:1px solid #dce5df;border-radius:6px;padding:10px 12px}
-.key-token code{font-size:12px;word-break:break-all;flex:1}
-.keys-table .row{grid-template-columns:1.1fr .8fr .6fr 1fr 1fr 1fr 36px}
-.icon-button:disabled{opacity:.35;cursor:not-allowed}
-.icon-button:disabled:hover{background:transparent}
+@media (max-width: 760px) {
+  nav { grid-template-columns: repeat(4, 1fr); }
+}
+.key-hint { font-size: 13px; color: #6c7a71; margin-bottom: 12px; }
+.key-token {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #f3f7f4;
+  border: 1px solid #dce5df;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.key-token code { font-size: 12px; word-break: break-all; flex: 1; }
+.keys-table .row { grid-template-columns: 1.1fr .8fr .6fr 1fr 1fr 1fr 76px; }
+.icon-button:disabled { opacity: .35; cursor: not-allowed; }
+.icon-button:disabled:hover { background: transparent; }
