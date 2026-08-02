@@ -513,6 +513,18 @@ async fn update_settings(
         )
     })?;
     state.bandwidth.set_mbps(input.bandwidth_limit_mbps);
+    // Reconfigure every online agent so its source-side throttle tracks the
+    // server cap. This keeps the agent -> server direction from saturating
+    // the shared control WebSocket whenever the admin changes the limit.
+    let bandwidth_config = ControlMessage::BandwidthConfig {
+        mbps: input.bandwidth_limit_mbps,
+    };
+    if let Ok(payload) = encode(&bandwidth_config) {
+        let message = Message::Text(String::from_utf8_lossy(&payload).into_owned().into());
+        for session in state.sessions.read().await.values() {
+            let _ = session.try_send(message.clone());
+        }
+    }
     audit(
         &state.db,
         actor.id,
@@ -1123,6 +1135,19 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             .into(),
         ))
         .await;
+    // Push the current bandwidth cap so the agent throttles its own outbound
+    // data at the source; otherwise fast local traffic can saturate the shared
+    // control WebSocket and starve keepalives/control messages.
+    let bandwidth_config = ControlMessage::BandwidthConfig {
+        mbps: state.bandwidth.current_mbps(),
+    };
+    if let Ok(payload) = encode(&bandwidth_config) {
+        let _ = out_tx
+            .send(Message::Text(
+                String::from_utf8_lossy(&payload).into_owned().into(),
+            ))
+            .await;
+    }
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             if sink.send(message).await.is_err() {

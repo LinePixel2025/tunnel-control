@@ -47,6 +47,11 @@ pub enum ControlMessage {
         ok: bool,
         message: Option<String>,
     },
+    /// Server pushes its current bandwidth cap to the agent so the agent can
+    /// throttle its own outbound data at the source. 0 disables throttling.
+    BandwidthConfig {
+        mbps: u64,
+    },
     Error {
         code: String,
         message: String,
@@ -188,5 +193,10 @@ mod tests {
             message: Some("local tcp reachable".into()),
         };
         assert_eq!(decode(&encode(&result).unwrap()).unwrap(), result);
+    }
+    #[test]
+    fn bandwidth_config_round_trip() {
+        let input = ControlMessage::BandwidthConfig { mbps: 3 };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
     }
 }
