@@ -29,6 +29,13 @@ type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 type ConnectionMap = Arc<RwLock<HashMap<u128, ConnectionInfo>>>;
 type DataSenderMap = Arc<RwLock<HashMap<u16, mpsc::Sender<Message>>>>;
 type TaskMap = Arc<tokio::sync::Mutex<HashMap<u128, tokio::task::JoinHandle<()>>>>;
+type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>)>>>;
+
+/// Upper bound on frames buffered for one stream that has not been registered
+/// yet. `StreamOpen` travels on the control socket while data frames use data
+/// sockets, so the first frames can arrive first; the race window is a few
+/// milliseconds, so this cap is never approached in practice.
+const PENDING_STREAM_FRAMES: usize = 64;
 
 /// Shared runtime state exposed to the local GUI through the status server.
 #[derive(Clone, Default)]
@@ -500,6 +507,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
     let connections = status.connections.clone();
     let data_channels = status.data_channels.clone();
     let bandwidth = status.bandwidth.clone();
+    let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
     let bridge_tasks: TaskMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let data_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -531,6 +539,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
     let reader_data_channels = data_channels.clone();
     let reader_bandwidth = bandwidth.clone();
     let reader_bridge_tasks = bridge_tasks.clone();
+    let reader_pending = pending.clone();
     let reader_pong = last_pong.clone();
     let reader_config = config.clone();
     let reader_status = status.clone();
@@ -563,6 +572,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                                     reader_streams.clone(),
                                     reader_connections.clone(),
                                     reader_control.clone(),
+                                    reader_pending.clone(),
                                 ));
                                 reader_data_tasks.lock().await.push(task);
                             }
@@ -601,7 +611,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
                         // Register the stream before spawning the bridge so the
                         // first data frame following StreamOpen is never dropped.
-                        reader_streams.write().await.insert(id, tx);
+                        reader_streams.write().await.insert(id, tx.clone());
                         let opened_at = SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .map(|duration| duration.as_secs())
@@ -619,6 +629,20 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                                 opened_at,
                             },
                         );
+                        // Flush frames that arrived on a data socket before
+                        // this StreamOpen was processed (cross-connection
+                        // ordering is not guaranteed).
+                        let buffered = reader_pending
+                            .write()
+                            .await
+                            .remove(&id)
+                            .map(|(_, frames)| frames)
+                            .unwrap_or_default();
+                        for frame in buffered {
+                            if tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
                         let control = reader_control.clone();
                         let limiter = reader_bandwidth.clone();
                         let streams = reader_streams.clone();
@@ -659,6 +683,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                         if let Ok(id) = stream_id.parse::<u128>() {
                             reader_streams.write().await.remove(&id);
                             reader_connections.write().await.remove(&id);
+                            reader_pending.write().await.remove(&id);
                             if let Some(task) = reader_bridge_tasks.lock().await.remove(&id) {
                                 task.abort();
                             }
@@ -702,6 +727,11 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
             _ = tokio::time::sleep(Duration::from_secs(config.heartbeat_secs)) => {}
             _ = reader_done.notified() => break,
         }
+        let now = Instant::now();
+        pending
+            .write()
+            .await
+            .retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(10));
         // After wake-from-sleep the TCP connection may be dead while the OS
         // keeps retransmitting; require a fresh pong or reconnect promptly.
         if last_pong.lock().unwrap().elapsed() > Duration::from_secs(config.pong_timeout_secs) {
@@ -729,6 +759,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
     }
     streams.write().await.clear();
     data_channels.write().await.clear();
+    pending.write().await.clear();
     writer_task.abort();
     reader_task.abort();
     Err("control channel closed; reconnecting".into())
@@ -758,6 +789,7 @@ async fn data_channel_task(
     streams: StreamMap,
     connections: ConnectionMap,
     control: mpsc::Sender<Message>,
+    pending: PendingMap,
 ) {
     loop {
         match connect_async(&config.data_server).await {
@@ -814,6 +846,7 @@ async fn data_channel_task(
                 let reader_streams = streams.clone();
                 let reader_connections = connections.clone();
                 let reader_control = control.clone();
+                let reader_pending = pending.clone();
                 while let Some(Ok(message)) = source.next().await {
                     if let Message::Binary(bytes) = message {
                         if let Ok((id, data)) = decode_stream_data(&bytes) {
@@ -821,6 +854,7 @@ async fn data_channel_task(
                                 &reader_streams,
                                 &reader_connections,
                                 &reader_control,
+                                &reader_pending,
                                 id,
                                 data,
                             )
@@ -847,6 +881,7 @@ async fn route_agent_binary(
     streams: &StreamMap,
     connections: &ConnectionMap,
     control: &mpsc::Sender<Message>,
+    pending: &PendingMap,
     id: u128,
     data: &[u8],
 ) {
@@ -855,6 +890,17 @@ async fn route_agent_binary(
         map.get(&id).cloned()
     };
     let Some(tx) = tx else {
+        // `StreamOpen` travels on the control socket while data frames arrive
+        // on data sockets; the first frames can beat the registration. Buffer
+        // them briefly so the StreamOpen handler can flush them once the
+        // stream exists, instead of silently dropping the first bytes.
+        let mut guard = pending.write().await;
+        let entry = guard
+            .entry(id)
+            .or_insert_with(|| (Instant::now(), Vec::new()));
+        if entry.1.len() < PENDING_STREAM_FRAMES {
+            entry.1.push(data.to_vec());
+        }
         return;
     };
     if tx.try_send(data.to_vec()).is_ok() {
