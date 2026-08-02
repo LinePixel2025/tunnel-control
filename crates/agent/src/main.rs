@@ -486,10 +486,7 @@ fn load_file_config() -> HashMap<String, String> {
         .collect()
 }
 
-async fn run(
-    config: &AgentConfig,
-    status: &AgentStatus,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn std::error::Error>> {
     let (socket, _) = connect_async(&config.server).await?;
     enable_tcp_keepalive(&socket);
     status.connected.store(true, Ordering::Relaxed);
@@ -507,6 +504,7 @@ async fn run(
     let data_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let reader_done = Arc::new(tokio::sync::Notify::new());
 
     let register = ControlMessage::Register {
         version: PROTOCOL_VERSION,
@@ -516,12 +514,14 @@ async fn run(
     control_tx
         .send(Message::Text(String::from_utf8(encode(&register)?)?.into()))
         .await?;
+    let writer_done = reader_done.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(message) = control_rx.recv().await {
             if write.send(message).await.is_err() {
                 break;
             }
         }
+        writer_done.notify_one();
     });
 
     let reader_control = control_tx.clone();
@@ -535,6 +535,7 @@ async fn run(
     let reader_config = config.clone();
     let reader_status = status.clone();
     let reader_data_tasks = data_tasks.clone();
+    let reader_done_notify = reader_done.clone();
     let reader_task = tokio::spawn(async move {
         let mut data_channels_opened = false;
         while let Some(Ok(message)) = read.next().await {
@@ -552,6 +553,9 @@ async fn run(
                         tracing::info!(count = map.len(), "tunnel configuration synchronized");
                         if !data_channels_opened {
                             data_channels_opened = true;
+                            // Drop any stale channel entries left by a previous
+                            // run, then open a fresh set for this session.
+                            reader_data_channels.write().await.clear();
                             for _ in 0..reader_config.data_channels {
                                 let task = tokio::spawn(data_channel_task(
                                     reader_config.clone(),
@@ -581,7 +585,11 @@ async fn run(
                             send_close(&reader_control, stream_id, Some("unknown_tunnel".into()));
                             continue;
                         };
-                        let channel_tx = reader_data_channels.read().await.get(&data_channel).cloned();
+                        let channel_tx = reader_data_channels
+                            .read()
+                            .await
+                            .get(&data_channel)
+                            .cloned();
                         let Some(channel_tx) = channel_tx else {
                             send_close(
                                 &reader_control,
@@ -686,10 +694,14 @@ async fn run(
                 _ => {}
             }
         }
+        reader_done_notify.notify_one();
     });
 
     loop {
-        tokio::time::sleep(Duration::from_secs(config.heartbeat_secs)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(config.heartbeat_secs)) => {}
+            _ = reader_done.notified() => break,
+        }
         // After wake-from-sleep the TCP connection may be dead while the OS
         // keeps retransmitting; require a fresh pong or reconnect promptly.
         if last_pong.lock().unwrap().elapsed() > Duration::from_secs(config.pong_timeout_secs) {
@@ -726,13 +738,14 @@ async fn run(
 /// table loss, WiFi handoff) is detected by the OS instead of waiting for the
 /// pong timeout. Applied to the control socket and every data socket.
 fn enable_tcp_keepalive(
-    socket: &tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 ) {
     if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
         let socket_ref = socket2::SockRef::from(tcp);
-        let _ = socket_ref.set_tcp_keepalive(
-            &socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)),
-        );
+        let _ = socket_ref
+            .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)));
     }
 }
 
@@ -1158,7 +1171,10 @@ mod tests {
         };
         let (id, data) = decode_stream_data(&bytes).unwrap();
         assert_eq!(id, 43);
-        assert!(data.is_empty(), "zero-length datagram must be relayed intact");
+        assert!(
+            data.is_empty(),
+            "zero-length datagram must be relayed intact"
+        );
 
         // The session must still be alive after the empty datagram.
         tx.send(b"still-alive".to_vec()).await.unwrap();
