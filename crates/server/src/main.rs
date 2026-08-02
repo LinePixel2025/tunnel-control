@@ -7,7 +7,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::{Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -82,9 +82,28 @@ struct CreateTunnel {
     max_connections: Option<u16>,
 }
 #[derive(Deserialize)]
+struct UpdateTunnel {
+    name: String,
+    kind: TunnelKind,
+    public_port: u16,
+    local_host: String,
+    local_port: u16,
+    device_id: Uuid,
+    max_connections: Option<u16>,
+    enabled: Option<bool>,
+}
+#[derive(Deserialize)]
 struct CreateKey {
     label: String,
     device_id: Option<Uuid>,
+    expires_in_days: Option<i64>,
+}
+#[derive(Deserialize)]
+struct UpdateKey {
+    label: Option<String>,
+    /// None keeps the current binding, Some(None) unbinds, Some(Some(id)) rebinds.
+    device_id: Option<Option<Uuid>>,
+    /// None keeps the current expiry, Some(0) clears it, Some(days) sets a new one.
     expires_in_days: Option<i64>,
 }
 #[derive(Serialize, FromRow)]
@@ -161,8 +180,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/summary", get(summary))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
+        .route(
+            "/api/v1/tunnels/{id}",
+            put(update_tunnel).delete(delete_tunnel),
+        )
         .route("/api/v1/tunnels/{id}/toggle", post(toggle_tunnel))
         .route("/api/v1/keys", get(list_keys).post(create_key))
+        .route("/api/v1/keys/{id}", put(update_key).delete(delete_key))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .route("/control", get(control_socket))
         .layer(CorsLayer::permissive())
@@ -381,6 +405,100 @@ async fn toggle_tunnel(
     sync_device_tunnels(&state, tunnel.device_id).await;
     Ok(Json(tunnel))
 }
+async fn update_tunnel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<UpdateTunnel>,
+) -> Result<Json<TunnelRecord>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    if input.public_port < state.tunnel_port_start || input.public_port > state.tunnel_port_end {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Public port must be between {} and {}",
+                state.tunnel_port_start, state.tunnel_port_end
+            ),
+        ));
+    }
+    let current = get_tunnel(&state.db, id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "Tunnel not found".into()))?;
+    let kind = match input.kind {
+        TunnelKind::Tcp => "tcp",
+        TunnelKind::Http => "http",
+    };
+    let enabled = input.enabled.unwrap_or(current.enabled);
+    let result = sqlx::query(
+        "UPDATE tunnels SET name=$1,kind=$2,public_port=$3,local_host=$4,local_port=$5,enabled=$6,max_connections=$7,device_id=$8 WHERE id=$9",
+    )
+    .bind(&input.name)
+    .bind(kind)
+    .bind(input.public_port as i32)
+    .bind(&input.local_host)
+    .bind(input.local_port as i32)
+    .bind(enabled)
+    .bind(input.max_connections.unwrap_or(current.max_connections as u16) as i32)
+    .bind(input.device_id)
+    .bind(id)
+    .execute(&state.db)
+    .await;
+    if result.is_err() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Public port is unavailable or device does not exist".into(),
+        ));
+    }
+    audit(&state.db, actor.id, "tunnel.updated", &input.name).await;
+    // The listener captures the tunnel config, so restart it whenever the tunnel is updated.
+    if let Some(task) = state.listeners.write().await.remove(&id) {
+        task.abort();
+    }
+    if enabled {
+        start_listener(state.clone(), id)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    }
+    sync_device_tunnels(&state, current.device_id).await;
+    sync_device_tunnels(&state, input.device_id).await;
+    let tunnel = get_tunnel(&state.db, id).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not reload tunnel".into(),
+        )
+    })?;
+    Ok(Json(tunnel))
+}
+async fn delete_tunnel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let current = get_tunnel(&state.db, id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "Tunnel not found".into()))?;
+    sqlx::query("DELETE FROM tunnels WHERE id=$1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not delete tunnel".into(),
+            )
+        })?;
+    if let Some(task) = state.listeners.write().await.remove(&id) {
+        task.abort();
+    }
+    sync_device_tunnels(&state, current.device_id).await;
+    audit(&state.db, actor.id, "tunnel.deleted", &current.name).await;
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
 
 async fn list_keys(
     State(state): State<AppState>,
@@ -464,6 +582,102 @@ async fn create_key(
         Json(serde_json::json!({"id": id, "token": token})),
     ))
 }
+async fn update_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<UpdateKey>,
+) -> Result<Json<AccessKey>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let current = get_access_key(&state.db, id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "Access key not found".into()))?;
+    let label = input
+        .label
+        .map(|value| value.trim().to_string())
+        .unwrap_or(current.label);
+    if label.is_empty() || label.chars().count() > 100 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Label must be between 1 and 100 characters".into(),
+        ));
+    }
+    let device_id = match input.device_id {
+        Some(device_id) => device_id,
+        None => current.device_id,
+    };
+    if let Some(target) = device_id {
+        let exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM devices WHERE id=$1")
+            .bind(target)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+        if exists.is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Device does not exist".into(),
+            ));
+        }
+    }
+    let expires_at = match input.expires_in_days {
+        Some(0) => None,
+        Some(days) if days >= 1 => Some(Utc::now() + Duration::days(days)),
+        Some(_) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expires_in_days must be 0 or at least 1".into(),
+            ));
+        }
+        None => current.expires_at,
+    };
+    sqlx::query("UPDATE access_tokens SET label=$1,device_id=$2,expires_at=$3 WHERE id=$4")
+        .bind(&label)
+        .bind(device_id)
+        .bind(expires_at)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not update access key".into(),
+            )
+        })?;
+    audit(&state.db, actor.id, "update_access_key", &label).await;
+    let row = get_access_key(&state.db, id).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not reload access key".into(),
+        )
+    })?;
+    Ok(Json(row))
+}
+async fn delete_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let result = sqlx::query("DELETE FROM access_tokens WHERE id=$1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not delete access key".into(),
+            )
+        })?;
+    if result.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "Access key not found".into()));
+    }
+    audit(&state.db, actor.id, "delete_access_key", &id.to_string()).await;
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
 async fn revoke_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -510,6 +724,9 @@ async fn sync_device_tunnels(state: &AppState, device_id: Uuid) {
 }
 async fn get_tunnel(db: &PgPool, id: Uuid) -> Result<TunnelRecord, sqlx::Error> {
     sqlx::query_as::<_,TunnelRecord>("SELECT t.id,t.name,t.kind,t.public_port,t.local_host,t.local_port,t.enabled,t.max_connections,t.device_id,CASE WHEN d.status='online' THEN 'ready' ELSE 'offline' END status,0::bigint connections FROM tunnels t JOIN devices d ON d.id=t.device_id WHERE t.id=$1").bind(id).fetch_one(db).await
+}
+async fn get_access_key(db: &PgPool, id: Uuid) -> Result<AccessKey, sqlx::Error> {
+    sqlx::query_as::<_,AccessKey>("SELECT t.id,t.label,t.device_id,d.name AS device_name,t.created_at,t.expires_at,t.revoked_at,t.last_used_at,CASE WHEN t.revoked_at IS NOT NULL THEN 'revoked' WHEN t.expires_at IS NOT NULL AND t.expires_at<=now() THEN 'expired' ELSE 'active' END AS status FROM access_tokens t LEFT JOIN devices d ON d.id=t.device_id WHERE t.id=$1").bind(id).fetch_one(db).await
 }
 async fn audit(db: &PgPool, actor: Uuid, action: &str, subject: &str) {
     let _ = sqlx::query("INSERT INTO audit_events(id,actor_id,action,subject) VALUES($1,$2,$3,$4)")
