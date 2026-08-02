@@ -1,8 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
     ffi::OsString,
+    fs,
     io::{self, Write},
     path::PathBuf,
     process::Command,
@@ -25,7 +26,10 @@ type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 #[cfg(windows)]
 use windows_service::{
     define_windows_service,
-    service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType},
+    service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    },
     service_control_handler::{self, ServiceControlHandlerResult},
 };
 
@@ -38,7 +42,9 @@ fn main() {
     if arguments.iter().any(|argument| argument == "--service") {
         #[cfg(windows)]
         {
-            if let Err(error) = windows_service::service_dispatcher::start("TunnelAgent", ffi_service_main) {
+            if let Err(error) =
+                windows_service::service_dispatcher::start("TunnelAgent", ffi_service_main)
+            {
                 eprintln!("Service dispatcher failed: {error}");
                 std::process::exit(1);
             }
