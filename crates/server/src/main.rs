@@ -231,11 +231,7 @@ async fn pick_data_channel(state: &AppState, device_id: Uuid) -> Option<u16> {
 /// Removes every stream and UDP session assigned to one data channel and
 /// returns their ids so the caller can notify the agent. Used when a data
 /// socket drops or a control session ends.
-async fn close_channel_streams(
-    plane: &DataPlane,
-    device_id: Uuid,
-    channel_id: u16,
-) -> Vec<u128> {
+async fn close_channel_streams(plane: &DataPlane, device_id: Uuid, channel_id: u16) -> Vec<u128> {
     let tcp: Vec<u128> = plane
         .streams
         .read()
@@ -433,9 +429,17 @@ mod tests {
         );
         // A stale control loop finishing after a fast reconnect must not
         // remove the newer session registered under the same device.
-        assert!(!remove_session_if_owned(&mut sessions, device, old_connection));
+        assert!(!remove_session_if_owned(
+            &mut sessions,
+            device,
+            old_connection
+        ));
         assert!(sessions.contains_key(&device));
-        assert!(remove_session_if_owned(&mut sessions, device, new_connection));
+        assert!(remove_session_if_owned(
+            &mut sessions,
+            device,
+            new_connection
+        ));
         assert!(!sessions.contains_key(&device));
     }
 
@@ -530,6 +534,8 @@ mod tests {
             .iter()
             .map(|(id, entry)| (*id, entry.data_channel))
             .collect();
+        let mut remaining = remaining;
+        remaining.sort_unstable();
         assert_eq!(remaining, vec![(3, 2), (4, 2)]);
     }
 
@@ -550,7 +556,10 @@ mod tests {
                 last_seen: Instant::now(),
             },
         );
-        assert_eq!(route_stream_data(&plane, udp_id, &[]).await, RouteOutcome::Ok);
+        assert_eq!(
+            route_stream_data(&plane, udp_id, &[]).await,
+            RouteOutcome::Ok
+        );
         let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
             .await
             .expect("empty datagram was not relayed")
@@ -766,7 +775,8 @@ async fn shutdown_signal(state: AppState) {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             signal.recv().await;
         }
@@ -777,7 +787,10 @@ async fn shutdown_signal(state: AppState) {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tracing::info!("shutdown signal received; draining for {}s", state.shutdown_drain_secs);
+    tracing::info!(
+        "shutdown signal received; draining for {}s",
+        state.shutdown_drain_secs
+    );
     state.accepting.store(false, Ordering::Relaxed);
     let tcp: Vec<(u128, Uuid)> = state
         .plane
@@ -799,7 +812,14 @@ async fn shutdown_signal(state: AppState) {
         )
         .await;
     }
-    let udp: Vec<u128> = state.plane.udp_sessions.read().await.keys().copied().collect();
+    let udp: Vec<u128> = state
+        .plane
+        .udp_sessions
+        .read()
+        .await
+        .keys()
+        .copied()
+        .collect();
     for id in udp {
         if let Some(session) = state.plane.udp_sessions.read().await.get(&id).cloned() {
             state.plane.udp_sessions.write().await.remove(&id);
@@ -1191,7 +1211,12 @@ async fn probe_tunnel(
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Tunnel not found".into()))?;
     let listener_active = state.listeners.read().await.contains_key(&id);
-    let agent_online = state.plane.sessions.read().await.contains_key(&tunnel.device_id);
+    let agent_online = state
+        .plane
+        .sessions
+        .read()
+        .await
+        .contains_key(&tunnel.device_id);
     if !listener_active || !agent_online {
         let message = if !listener_active {
             "tunnel listener is not active"
@@ -1549,12 +1574,13 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             .await;
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(1024);
     let connection_id = Uuid::new_v4();
-    state
-        .plane
-        .sessions
-        .write()
-        .await
-        .insert(device_id, SessionEntry { connection_id, tx: out_tx.clone() });
+    state.plane.sessions.write().await.insert(
+        device_id,
+        SessionEntry {
+            connection_id,
+            tx: out_tx.clone(),
+        },
+    );
     if let Ok(mut redis) = state.redis.get_multiplexed_tokio_connection().await {
         let _: Result<(), _> = redis.set_ex(format!("online:{device_id}"), "1", 60).await;
     }
@@ -1691,8 +1717,8 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
         if channels.len() as u16 >= state.data_channels_max {
             return;
         }
-        let Some(channel_id) = (1u16..=state.data_channels_max)
-            .find(|id| !channels.contains_key(id))
+        let Some(channel_id) =
+            (1u16..=state.data_channels_max).find(|id| !channels.contains_key(id))
         else {
             return;
         };
@@ -1737,6 +1763,17 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
                             )
                             .await;
                         }
+                        RouteOutcome::UdpSessionGone(stream_id) => {
+                            send_control(
+                                &reader_state,
+                                device_id,
+                                &ControlMessage::StreamClose {
+                                    stream_id: stream_id.to_string(),
+                                    reason: Some("udp_session_closed".into()),
+                                },
+                            )
+                            .await;
+                        }
                         _ => {}
                     }
                 }
@@ -1762,6 +1799,12 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
             .await
             .get_mut(&device_id)
             .map(|channels| channels.remove(&channel_id));
+        reader_state
+            .plane
+            .data_socket_tasks
+            .lock()
+            .await
+            .remove(&(device_id, channel_id));
     });
     state
         .plane
@@ -1908,7 +1951,14 @@ async fn bridge_public_connection(
     if !state.accepting.load(Ordering::Relaxed) {
         return;
     }
-    let Some(session) = state.plane.sessions.read().await.get(&tunnel.device_id).cloned() else {
+    let Some(session) = state
+        .plane
+        .sessions
+        .read()
+        .await
+        .get(&tunnel.device_id)
+        .cloned()
+    else {
         return;
     };
     let Some(channel_id) = pick_data_channel(&state, tunnel.device_id).await else {
