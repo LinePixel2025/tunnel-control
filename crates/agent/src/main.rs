@@ -12,12 +12,12 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpStream, UdpSocket},
     sync::{RwLock, mpsc},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tunnel_protocol::{
-    ControlMessage, PROTOCOL_VERSION, TunnelSpec, decode, decode_stream_data, encode,
+    ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode, decode_stream_data, encode,
     encode_stream_data,
 };
 
@@ -259,12 +259,16 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
                             continue;
                         };
                         if let Some(spec) = reader_specs.read().await.get(&tunnel_id).cloned() {
-                            tokio::spawn(bridge_local(
-                                id,
-                                spec,
-                                reader_out.clone(),
-                                reader_streams.clone(),
-                            ));
+                            let out = reader_out.clone();
+                            let streams = reader_streams.clone();
+                            tokio::spawn(async move {
+                                match spec.kind {
+                                    TunnelKind::Udp => {
+                                        bridge_local_udp(id, spec, out, streams).await;
+                                    }
+                                    _ => bridge_local(id, spec, out, streams).await,
+                                }
+                            });
                         } else {
                             send_close(&reader_out, stream_id, Some("unknown_tunnel".into())).await;
                         }
@@ -337,6 +341,54 @@ async fn bridge_local(id: u128, spec: TunnelSpec, out: mpsc::Sender<Message>, st
     send_close(&out, id.to_string(), None).await;
 }
 
+async fn bridge_local_udp(
+    id: u128,
+    spec: TunnelSpec,
+    out: mpsc::Sender<Message>,
+    streams: StreamMap,
+) {
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        send_close(&out, id.to_string(), Some("local_bind_failed".into())).await;
+        return;
+    };
+    if socket
+        .connect(format!("{}:{}", spec.local_host, spec.local_port))
+        .await
+        .is_err()
+    {
+        send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
+        return;
+    }
+    let socket = Arc::new(socket);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(128);
+    streams.write().await.insert(id, tx);
+    let writer_socket = socket.clone();
+    let write_task = tokio::spawn(async move {
+        while let Some(data) = rx.recv().await {
+            if writer_socket.send(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut buffer = [0_u8; 65536];
+    loop {
+        match socket.recv(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(size) => {
+                let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
+                    break;
+                };
+                if out.send(Message::Binary(frame.into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    streams.write().await.remove(&id);
+    write_task.abort();
+    send_close(&out, id.to_string(), None).await;
+}
+
 async fn send_close(out: &mpsc::Sender<Message>, stream_id: String, reason: Option<String>) {
     let close = ControlMessage::StreamClose { stream_id, reason };
     if let Ok(payload) = encode(&close) {
@@ -345,5 +397,63 @@ async fn send_close(out: &mpsc::Sender<Message>, stream_id: String, reason: Opti
                 String::from_utf8_lossy(&payload).into_owned().into(),
             ))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn udp_bridge_relays_datagrams_both_ways() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            let (size, peer) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..size], peer).await.unwrap();
+        });
+
+        let spec = TunnelSpec {
+            id: "tunnel-udp".into(),
+            name: "udp test".into(),
+            kind: TunnelKind::Udp,
+            public_port: 19000,
+            local_host: "127.0.0.1".into(),
+            local_port: echo_addr.port(),
+            enabled: true,
+            max_connections: 10,
+        };
+        let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let bridge = tokio::spawn(bridge_local_udp(42, spec, out_tx, streams.clone()));
+
+        for _ in 0..100 {
+            if streams.read().await.contains_key(&42) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            streams.read().await.contains_key(&42),
+            "bridge never registered"
+        );
+
+        let tx = streams.read().await.get(&42).cloned().unwrap();
+        tx.send(b"hello-udp".to_vec()).await.unwrap();
+
+        let message = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("timeout waiting for echoed datagram")
+            .expect("channel closed");
+        let Message::Binary(bytes) = message else {
+            panic!("expected binary frame with echoed datagram");
+        };
+        let (id, data) = decode_stream_data(&bytes).unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(data, b"hello-udp");
+
+        echo_task.abort();
+        bridge.abort();
     }
 }

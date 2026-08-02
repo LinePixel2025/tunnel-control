@@ -1,6 +1,6 @@
 # Tunnel Control
 
-面向团队的 Windows 到 Linux 公网服务器内网穿透首版。管理面板独立使用 HTTPS 端口；管理员分配 TCP/HTTP 公网端口，Windows 后台代理通过控制信道注册并持续发送心跳。
+面向团队的 Windows 到 Linux 公网服务器内网穿透首版。管理面板独立使用 HTTPS 端口；管理员分配 TCP/HTTP/UDP 公网端口，Windows 后台代理通过控制信道注册并持续发送心跳。
 
 ## 项目结构
 
@@ -47,6 +47,6 @@ cargo run -p tunnel-agent
 
 控制面已经可运行：令牌注册、心跳、设备在线状态、端口冲突检查、隧道创建/启停与审计事件接口都可使用。PostgreSQL/Redis 以及 Docker 部署物已准备好，但当前服务端状态仍在内存中，重启后不会恢复；将 SQLx repository 接入 API 是下一生产化迭代。
 
-同样，代理目前实现控制信道而不是公网数据面的连接多路复用。生产数据面将为每条公网连接增加受限的 `OpenStream/Data/CloseStream` 帧，并在代理端连接对应的本地 `host:port`。首版明确不支持 UDP、TLS 透传、自动 HTTPS 或自定义域名。
+数据面在控制信道上多路复用：每条公网连接/每个 UDP 会话使用受限的 `OpenStream/Data/CloseStream` 帧，代理在本地连接对应的 `host:port`。UDP 隧道把每个公网客户端视为一个会话，空闲超过 `UDP_SESSION_IDLE_SECS`（默认 120 秒）后自动回收。当前不支持 TLS 透传、自动 HTTPS 或自定义域名。
 
 Windows 打包接入建议使用 Tauri v2：将 `tunnel-agent` 编译为 Windows Service，GUI 通过命名管道调用服务，而不要把访问令牌交给 WebView 或写入配置文件。

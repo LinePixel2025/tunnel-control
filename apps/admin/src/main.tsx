@@ -7,7 +7,7 @@ import "./keys.css";
 const API = import.meta.env.VITE_API_URL ?? "/api/v1";
 type Summary = { devices: number; online_devices: number; tunnels: number; active_connections: number };
 type Device = { id: string; name: string; status: "online" | "offline"; latency_ms: number; last_seen_at: string | null };
-type Tunnel = { id: string; name: string; kind: "tcp" | "http"; public_port: number; local_host: string; local_port: number; enabled: boolean; max_connections: number; device_id: string; status: string; connections: number };
+type Tunnel = { id: string; name: string; kind: "tcp" | "http" | "udp"; public_port: number; local_host: string; local_port: number; enabled: boolean; max_connections: number; device_id: string; status: string; connections: number };
 type AccessKey = { id: string; label: string; device_id: string | null; device_name: string | null; created_at: string; expires_at: string | null; revoked_at: string | null; last_used_at: string | null; status: "active" | "expired" | "revoked" };
 type View = "overview" | "tunnels" | "devices" | "keys";
 
