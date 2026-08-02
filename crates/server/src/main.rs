@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{
     DecodingKey, EncodingKey, Header, Validation, decode as jwt_decode, encode as jwt_encode,
 };
+use rand_core::RngCore;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -80,6 +81,24 @@ struct CreateTunnel {
     device_id: Uuid,
     max_connections: Option<u16>,
 }
+#[derive(Deserialize)]
+struct CreateKey {
+    label: String,
+    device_id: Option<Uuid>,
+    expires_in_days: Option<i64>,
+}
+#[derive(Serialize, FromRow)]
+struct AccessKey {
+    id: Uuid,
+    label: String,
+    device_id: Option<Uuid>,
+    device_name: Option<String>,
+    created_at: chrono::DateTime<Utc>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
+    last_used_at: Option<chrono::DateTime<Utc>>,
+    status: String,
+}
 #[derive(Serialize, Deserialize)]
 struct Claims {
     sub: String,
@@ -143,6 +162,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
         .route("/api/v1/tunnels/{id}/toggle", post(toggle_tunnel))
+        .route("/api/v1/keys", get(list_keys).post(create_key))
+        .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .route("/control", get(control_socket))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -361,6 +382,117 @@ async fn toggle_tunnel(
     Ok(Json(tunnel))
 }
 
+async fn list_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AccessKey>>, StatusCode> {
+    admin(&headers, &state).await?;
+    let rows = sqlx::query_as::<_, AccessKey>(
+        "SELECT t.id,t.label,t.device_id,d.name AS device_name,t.created_at,t.expires_at,t.revoked_at,t.last_used_at,\
+         CASE WHEN t.revoked_at IS NOT NULL THEN 'revoked' WHEN t.expires_at IS NOT NULL AND t.expires_at<=now() THEN 'expired' ELSE 'active' END AS status \
+         FROM access_tokens t LEFT JOIN devices d ON d.id=t.device_id ORDER BY t.created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows))
+}
+async fn create_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateKey>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let label = input.label.trim().to_string();
+    if label.is_empty() || label.chars().count() > 100 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Label must be between 1 and 100 characters".into(),
+        ));
+    }
+    if input.expires_in_days.is_some_and(|days| days < 1) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_in_days must be at least 1".into(),
+        ));
+    }
+    if let Some(device_id) = input.device_id {
+        let exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM devices WHERE id=$1")
+            .bind(device_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+        if exists.is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Device does not exist".into(),
+            ));
+        }
+    }
+    let mut bytes = [0_u8; 32];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
+    let id = Uuid::new_v4();
+    let expires_at = input
+        .expires_in_days
+        .map(|days| Utc::now() + Duration::days(days));
+    let result = sqlx::query(
+        "INSERT INTO access_tokens(id,device_id,label,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(id)
+    .bind(input.device_id)
+    .bind(&label)
+    .bind(&token_hash)
+    .bind(expires_at)
+    .execute(&state.db)
+    .await;
+    if result.is_err() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not create access key".into(),
+        ));
+    }
+    audit(&state.db, actor.id, "create_access_key", &label).await;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"id": id, "token": token})),
+    ))
+}
+async fn revoke_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let result =
+        sqlx::query("UPDATE access_tokens SET revoked_at=now() WHERE id=$1 AND revoked_at IS NULL")
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not revoke access key".into(),
+                )
+            })?;
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Access key not found or already revoked".into(),
+        ));
+    }
+    audit(&state.db, actor.id, "revoke_access_key", &id.to_string()).await;
+    Ok(Json(serde_json::json!({"revoked": true})))
+}
+
 async fn sync_device_tunnels(state: &AppState, device_id: Uuid) {
     let Some(session) = state.sessions.read().await.get(&device_id).cloned() else {
         return;
@@ -404,9 +536,25 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         return;
     };
     let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
-    let device:Option<Uuid>=sqlx::query_scalar("SELECT device_id FROM access_tokens WHERE token_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())").bind(&token_hash).fetch_optional(&state.db).await.ok().flatten();
-    let device_id = match device {
-        Some(id) => id,
+    let token_row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, device_id FROM access_tokens WHERE token_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let device_id = match token_row {
+        Some((_, Some(device_id))) => device_id,
+        Some((token_id, None)) => {
+            match bind_pending_device(&state.db, token_id, &device_name).await {
+                Ok(device_id) => device_id,
+                Err(error) => {
+                    tracing::warn!(%error, "pending access key device registration failed");
+                    return;
+                }
+            }
+        }
         None if state.bootstrap_agent_token_hash.as_deref() == Some(token_hash.as_str()) => {
             match bootstrap_device(&state.db, &device_name, &token_hash).await {
                 Ok(id) => id,
@@ -527,6 +675,48 @@ async fn bootstrap_device(
         .execute(db)
         .await?;
     tracing::info!(%device_id, "bootstrap device registered");
+    Ok(device_id)
+}
+async fn bind_pending_device(
+    db: &PgPool,
+    token_id: Uuid,
+    device_name: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let mut tx = db.begin().await?;
+    let pending: Option<(Uuid, Option<Uuid>)> =
+        sqlx::query_as("SELECT id, device_id FROM access_tokens WHERE id=$1 FOR UPDATE")
+            .bind(token_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match pending {
+        Some((_, Some(device_id))) => {
+            tx.commit().await?;
+            return Ok(device_id);
+        }
+        None => {
+            tx.rollback().await?;
+            return Err(sqlx::Error::RowNotFound);
+        }
+        _ => {}
+    }
+    let workspace =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM workspaces ORDER BY created_at LIMIT 1")
+            .fetch_one(&mut *tx)
+            .await?;
+    let device_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO devices(id,workspace_id,name) VALUES($1,$2,$3)")
+        .bind(device_id)
+        .bind(workspace)
+        .bind(device_name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE access_tokens SET device_id=$1 WHERE id=$2")
+        .bind(device_id)
+        .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    tracing::info!(%device_id, "access key bound to new device");
     Ok(device_id)
 }
 async fn load_specs(db: &PgPool, device_id: Uuid) -> Vec<TunnelSpec> {
