@@ -35,6 +35,7 @@ struct AppState {
     db: PgPool,
     redis: redis::Client,
     jwt_secret: Arc<String>,
+    admin_token_ttl_hours: i64,
     bootstrap_agent_token_hash: Option<String>,
     sessions: Arc<RwLock<HashMap<Uuid, mpsc::Sender<Message>>>>,
     streams: Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>,
@@ -112,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
         db,
         redis: redis::Client::open(redis_url)?,
         jwt_secret: Arc::new(env::var("JWT_SECRET").expect("JWT_SECRET is required")),
+        admin_token_ttl_hours: env::var("ADMIN_TOKEN_TTL_HOURS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|hours| *hours > 0)
+            .unwrap_or(24 * 30),
         bootstrap_agent_token_hash: env::var("BOOTSTRAP_AGENT_TOKEN")
             .ok()
             .filter(|token| !token.trim().is_empty())
@@ -246,7 +252,7 @@ async fn login(
     let claims = Claims {
         sub: user.0.to_string(),
         role: user.2,
-        exp: (Utc::now() + Duration::hours(8)).timestamp() as usize,
+        exp: (Utc::now() + Duration::hours(state.admin_token_ttl_hours)).timestamp() as usize,
     };
     let token = jwt_encode(
         &Header::default(),

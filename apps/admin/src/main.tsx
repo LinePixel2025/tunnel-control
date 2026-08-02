@@ -19,6 +19,11 @@ function App() {
 
   const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const response = await fetch(`${API}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init?.headers } });
+    if (response.status === 401) {
+      localStorage.removeItem("tunnel-admin-token");
+      setToken("");
+      throw new Error("登录已过期，请重新登录");
+    }
     if (!response.ok) throw new Error(await response.text() || "请求失败");
     return response.json() as Promise<T>;
   };
