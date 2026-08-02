@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -221,6 +221,7 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let specs = Arc::new(RwLock::new(HashMap::<String, TunnelSpec>::new()));
     let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+    let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
 
     let register = ControlMessage::Register {
         version: PROTOCOL_VERSION,
@@ -230,7 +231,7 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
     out_tx
         .send(Message::Text(String::from_utf8(encode(&register)?)?.into()))
         .await?;
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             if write.send(message).await.is_err() {
                 break;
@@ -241,9 +242,15 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
     let reader_out = out_tx.clone();
     let reader_specs = specs.clone();
     let reader_streams = streams.clone();
-    tokio::spawn(async move {
+    let reader_pong = last_pong.clone();
+    let reader_task = tokio::spawn(async move {
         while let Some(Ok(message)) = read.next().await {
             match message {
+                Message::Pong(_) => {
+                    if let Ok(mut guard) = reader_pong.lock() {
+                        *guard = Instant::now();
+                    }
+                }
                 Message::Text(text) => match decode(text.as_bytes()) {
                     Ok(ControlMessage::Registered { tunnels, .. })
                     | Ok(ControlMessage::SyncTunnels { tunnels }) => {
@@ -298,16 +305,31 @@ async fn run(server: &str, token: &str, name: &str) -> Result<(), Box<dyn std::e
 
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
+        // After wake-from-sleep the TCP connection may be dead while the OS
+        // keeps retransmitting; require a fresh pong or reconnect promptly.
+        if last_pong.lock().unwrap().elapsed() > Duration::from_secs(45) {
+            break;
+        }
         let heartbeat = ControlMessage::Heartbeat {
             version: PROTOCOL_VERSION,
             latency_ms: 0,
         };
-        out_tx
+        if out_tx
             .send(Message::Text(
                 String::from_utf8(encode(&heartbeat)?)?.into(),
             ))
-            .await?;
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if out_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+            break;
+        }
     }
+    writer_task.abort();
+    reader_task.abort();
+    Err("control channel closed; reconnecting".into())
 }
 
 async fn bridge_local(
