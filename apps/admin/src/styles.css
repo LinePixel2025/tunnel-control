@@ -143,6 +143,10 @@ h3 { font-size: 16px; margin-bottom: 7px; }
 }
 .row b { display: flex; align-items: center; gap: 7px; }
 .row small { font: 500 9px "DM Mono"; color: #17785f; background: #def5ea; padding: 3px 4px; border-radius: 3px; }
+.logs-table .row { grid-template-columns: 1.7fr 1fr 1fr 2fr; }
+.log-action { font-size: 11px; color: #17785f; }
+.log-action.fail { color: #b3372b; }
+.log-subject { color: #405047; word-break: break-all; }
 code { font-family: "DM Mono"; font-size: 11px; color: #405047; }
 .status { font-size: 11px; color: #9a6817; }
 .status:before {

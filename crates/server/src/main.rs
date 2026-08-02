@@ -2,7 +2,7 @@ use argon2::PasswordHasher;
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -645,6 +645,15 @@ struct AccessKey {
     last_used_at: Option<chrono::DateTime<Utc>>,
     status: String,
 }
+#[derive(Serialize, FromRow)]
+struct LogEntry {
+    id: Uuid,
+    actor_id: Option<Uuid>,
+    actor_email: Option<String>,
+    action: String,
+    subject: String,
+    created_at: chrono::DateTime<Utc>,
+}
 #[derive(Serialize, Deserialize)]
 struct Claims {
     sub: String,
@@ -741,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/summary", get(summary))
         .route("/api/v1/settings", get(get_settings).put(update_settings))
+        .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
         .route(
@@ -910,12 +920,18 @@ async fn login(
     Json(input): Json<Login>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let user: (Uuid, String, String) =
-        sqlx::query_as("SELECT id, password_hash, role FROM users WHERE email = $1")
+        match sqlx::query_as("SELECT id, password_hash, role FROM users WHERE email = $1")
             .bind(&input.email)
             .fetch_optional(&state.db)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+        {
+            Some(user) => user,
+            None => {
+                audit(&state.db, None, "auth.login_failed", &input.email).await;
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        };
     let valid = argon2::PasswordHash::new(&user.1)
         .ok()
         .and_then(|h| {
@@ -928,8 +944,10 @@ async fn login(
         })
         .is_some();
     if !valid {
+        audit(&state.db, None, "auth.login_failed", &input.email).await;
         return Err(StatusCode::UNAUTHORIZED);
     }
+    audit(&state.db, Some(user.0), "auth.login", &input.email).await;
     let claims = Claims {
         sub: user.0.to_string(),
         role: user.2,
@@ -1011,7 +1029,7 @@ async fn update_settings(
     }
     audit(
         &state.db,
-        actor.id,
+        Some(actor.id),
         "settings.bandwidth_updated",
         &input.bandwidth_limit_mbps.to_string(),
     )
@@ -1069,7 +1087,7 @@ async fn create_tunnel(
             "Public port is unavailable or device does not exist".into(),
         ));
     }
-    audit(&state.db, actor.id, "tunnel.created", &input.name).await;
+    audit(&state.db, Some(actor.id), "tunnel.created", &input.name).await;
     let tunnel = get_tunnel(&state.db, id).await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1096,7 +1114,7 @@ async fn toggle_tunnel(
     let tunnel = get_tunnel(&state.db, id)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    audit(&state.db, actor.id, "tunnel.toggled", &tunnel.name).await;
+    audit(&state.db, Some(actor.id), "tunnel.toggled", &tunnel.name).await;
     if tunnel.enabled {
         start_listener(state.clone(), id)
             .await
@@ -1154,7 +1172,7 @@ async fn update_tunnel(
             "Public port is unavailable or device does not exist".into(),
         ));
     }
-    audit(&state.db, actor.id, "tunnel.updated", &input.name).await;
+    audit(&state.db, Some(actor.id), "tunnel.updated", &input.name).await;
     // The listener captures the tunnel config, so restart it whenever the tunnel is updated.
     remove_listener(&state, id).await;
     if enabled {
@@ -1195,7 +1213,7 @@ async fn delete_tunnel(
         })?;
     remove_listener(&state, id).await;
     sync_device_tunnels(&state, current.device_id).await;
-    audit(&state.db, actor.id, "tunnel.deleted", &current.name).await;
+    audit(&state.db, Some(actor.id), "tunnel.deleted", &current.name).await;
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
@@ -1349,7 +1367,7 @@ async fn create_key(
             "Could not create access key".into(),
         ));
     }
-    audit(&state.db, actor.id, "create_access_key", &label).await;
+    audit(&state.db, Some(actor.id), "create_access_key", &label).await;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({"id": id, "token": token})),
@@ -1418,7 +1436,7 @@ async fn update_key(
                 "Could not update access key".into(),
             )
         })?;
-    audit(&state.db, actor.id, "update_access_key", &label).await;
+    audit(&state.db, Some(actor.id), "update_access_key", &label).await;
     let row = get_access_key(&state.db, id).await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1448,7 +1466,13 @@ async fn delete_key(
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Access key not found".into()));
     }
-    audit(&state.db, actor.id, "delete_access_key", &id.to_string()).await;
+    audit(
+        &state.db,
+        Some(actor.id),
+        "delete_access_key",
+        &id.to_string(),
+    )
+    .await;
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 async fn revoke_key(
@@ -1476,7 +1500,13 @@ async fn revoke_key(
             "Access key not found or already revoked".into(),
         ));
     }
-    audit(&state.db, actor.id, "revoke_access_key", &id.to_string()).await;
+    audit(
+        &state.db,
+        Some(actor.id),
+        "revoke_access_key",
+        &id.to_string(),
+    )
+    .await;
     Ok(Json(serde_json::json!({"revoked": true})))
 }
 
@@ -1492,7 +1522,9 @@ async fn get_tunnel(db: &PgPool, id: Uuid) -> Result<TunnelRecord, sqlx::Error> 
 async fn get_access_key(db: &PgPool, id: Uuid) -> Result<AccessKey, sqlx::Error> {
     sqlx::query_as::<_,AccessKey>("SELECT t.id,t.label,t.device_id,d.name AS device_name,t.created_at,t.expires_at,t.revoked_at,t.last_used_at,CASE WHEN t.revoked_at IS NOT NULL THEN 'revoked' WHEN t.expires_at IS NOT NULL AND t.expires_at<=now() THEN 'expired' ELSE 'active' END AS status FROM access_tokens t LEFT JOIN devices d ON d.id=t.device_id WHERE t.id=$1").bind(id).fetch_one(db).await
 }
-async fn audit(db: &PgPool, actor: Uuid, action: &str, subject: &str) {
+/// Records one admin-side event. `actor` is the signed-in user; `None` is used
+/// for attempts where the actor could not be identified (e.g. failed logins).
+async fn audit(db: &PgPool, actor: Option<Uuid>, action: &str, subject: &str) {
     let _ = sqlx::query("INSERT INTO audit_events(id,actor_id,action,subject) VALUES($1,$2,$3,$4)")
         .bind(Uuid::new_v4())
         .bind(actor)
@@ -1500,6 +1532,28 @@ async fn audit(db: &PgPool, actor: Uuid, action: &str, subject: &str) {
         .bind(subject)
         .execute(db)
         .await;
+}
+async fn list_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<LogEntry>>, StatusCode> {
+    admin(&headers, &state).await?;
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(200)
+        .clamp(1, 500);
+    let rows = sqlx::query_as::<_, LogEntry>(
+        "SELECT a.id,a.actor_id,u.email AS actor_email,a.action,a.subject,a.created_at \
+         FROM audit_events a LEFT JOIN users u ON u.id=a.actor_id \
+         ORDER BY a.created_at DESC, a.id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows))
 }
 
 async fn control_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
