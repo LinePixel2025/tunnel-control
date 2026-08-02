@@ -583,9 +583,10 @@ async fn bridge_local(
                 let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
                     break;
                 };
-                if out.try_send(Message::Binary(frame.into())).is_err() {
-                    // Never stall the shared outbound queue on one stream; close
-                    // this stream so the client can reconnect.
+                // The bridge task may wait for the shared outbound queue; it
+                // never blocks the reader, and TCP must not drop bytes, so
+                // queue here instead of closing the stream.
+                if out.send(Message::Binary(frame.into())).await.is_err() {
                     break;
                 }
             }
