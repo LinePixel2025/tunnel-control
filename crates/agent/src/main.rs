@@ -464,7 +464,22 @@ async fn run(
                 Message::Binary(bytes) => {
                     if let Ok((id, data)) = decode_stream_data(&bytes) {
                         if let Some(tx) = reader_streams.read().await.get(&id).cloned() {
-                            let _ = tx.send(data.to_vec()).await;
+                            if tx.try_send(data.to_vec()).is_err() {
+                                // Never block the shared control channel on one
+                                // saturated stream; drop the stream and ask the
+                                // server to clean up its side.
+                                reader_streams.write().await.remove(&id);
+                                reader_connections.write().await.remove(&id);
+                                let close = ControlMessage::StreamClose {
+                                    stream_id: id.to_string(),
+                                    reason: Some("local_saturated".into()),
+                                };
+                                if let Ok(payload) = encode(&close) {
+                                    let _ = reader_out.try_send(Message::Text(
+                                        String::from_utf8_lossy(&payload).into_owned().into(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -485,15 +500,14 @@ async fn run(
             latency_ms: 0,
         };
         if out_tx
-            .send(Message::Text(
+            .try_send(Message::Text(
                 String::from_utf8(encode(&heartbeat)?)?.into(),
             ))
-            .await
             .is_err()
         {
             break;
         }
-        if out_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+        if out_tx.try_send(Message::Ping(Vec::new().into())).is_err() {
             break;
         }
     }

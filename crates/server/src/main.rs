@@ -989,7 +989,22 @@ async fn control_loop(socket: WebSocket, state: AppState) {
                             current.last_seen = Instant::now();
                         }
                     } else if let Some(tx) = state.streams.read().await.get(&id).cloned() {
-                        let _ = tx.send(data.to_vec()).await;
+                        if tx.try_send(data.to_vec()).is_err() {
+                            // Never block the shared control loop on one slow
+                            // stream; close it so the client can reconnect.
+                            state.streams.write().await.remove(&id);
+                            let close = ControlMessage::StreamClose {
+                                stream_id: id.to_string(),
+                                reason: Some("stream_saturated".into()),
+                            };
+                            if let Ok(payload) = encode(&close) {
+                                let _ = out_tx
+                                    .try_send(Message::Text(
+                                        String::from_utf8_lossy(&payload).into_owned().into(),
+                                    ))
+                                    .ok();
+                            }
+                        }
                     }
                 }
             }
