@@ -36,7 +36,8 @@ use tokio::{
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tunnel_protocol::{
-    ControlMessage, TunnelKind, TunnelSpec, decode, decode_stream_data, encode, encode_stream_data,
+    ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode, decode_stream_data, encode,
+    encode_stream_data,
 };
 use uuid::Uuid;
 
@@ -1747,36 +1748,55 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
             .await;
     }
     let reader_state = state.clone();
+    let heartbeat_out = out_tx.clone();
     let reader = tokio::spawn(async move {
         while let Some(Ok(message)) = source.next().await {
-            if let Message::Binary(bytes) = message {
-                if let Ok((id, data)) = decode_stream_data(&bytes) {
-                    match route_stream_data(&reader_state.plane, id, data).await {
-                        RouteOutcome::StreamSaturated(stream_id) => {
-                            send_control(
-                                &reader_state,
-                                device_id,
-                                &ControlMessage::StreamClose {
-                                    stream_id: stream_id.to_string(),
-                                    reason: Some("stream_saturated".into()),
-                                },
-                            )
-                            .await;
+            match message {
+                Message::Binary(bytes) => {
+                    if let Ok((id, data)) = decode_stream_data(&bytes) {
+                        match route_stream_data(&reader_state.plane, id, data).await {
+                            RouteOutcome::StreamSaturated(stream_id) => {
+                                send_control(
+                                    &reader_state,
+                                    device_id,
+                                    &ControlMessage::StreamClose {
+                                        stream_id: stream_id.to_string(),
+                                        reason: Some("stream_saturated".into()),
+                                    },
+                                )
+                                .await;
+                            }
+                            RouteOutcome::UdpSessionGone(stream_id) => {
+                                send_control(
+                                    &reader_state,
+                                    device_id,
+                                    &ControlMessage::StreamClose {
+                                        stream_id: stream_id.to_string(),
+                                        reason: Some("udp_session_closed".into()),
+                                    },
+                                )
+                                .await;
+                            }
+                            _ => {}
                         }
-                        RouteOutcome::UdpSessionGone(stream_id) => {
-                            send_control(
-                                &reader_state,
-                                device_id,
-                                &ControlMessage::StreamClose {
-                                    stream_id: stream_id.to_string(),
-                                    reason: Some("udp_session_closed".into()),
-                                },
-                            )
-                            .await;
-                        }
-                        _ => {}
                     }
                 }
+                // Echo the agent's data-channel heartbeat so the proxy/NAT
+                // sees traffic in both directions even when the tunnel is
+                // idle; otherwise a long-lived WebSocket gets timed out.
+                Message::Text(text) => {
+                    if let Ok(ControlMessage::Heartbeat { .. }) = decode(text.as_bytes()) {
+                        if let Ok(payload) = encode(&ControlMessage::Heartbeat {
+                            version: PROTOCOL_VERSION,
+                            latency_ms: 0,
+                        }) {
+                            let _ = heartbeat_out.try_send(Message::Text(
+                                String::from_utf8_lossy(&payload).into_owned().into(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         writer.abort();
