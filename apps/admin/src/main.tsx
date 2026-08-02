@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { Activity, Cable, Check, CirclePlus, Computer, Copy, FlaskConical, KeyRound, LogIn, Pencil, Power, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Activity, Cable, Check, CirclePlus, Computer, Copy, FlaskConical, KeyRound, LogIn, Pencil, Power, RefreshCw, Settings, ShieldCheck, Trash2 } from "lucide-react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import "./keys.css";
@@ -10,9 +10,10 @@ type Device = { id: string; name: string; status: "online" | "offline"; latency_
 type Tunnel = { id: string; name: string; kind: "tcp" | "http" | "udp"; public_port: number; local_host: string; local_port: number; enabled: boolean; max_connections: number; device_id: string; status: string; connections: number };
 type ProbeResult = { ok: boolean; listener: boolean; agent_online: boolean; local: boolean | null; message: string | null };
 type AccessKey = { id: string; label: string; device_id: string | null; device_name: string | null; created_at: string; expires_at: string | null; revoked_at: string | null; last_used_at: string | null; status: "active" | "expired" | "revoked" };
-type View = "overview" | "tunnels" | "devices" | "keys";
+type SettingsData = { bandwidth_limit_mbps: number };
+type View = "overview" | "tunnels" | "devices" | "keys" | "settings";
 
-const viewTitle: Record<View, string> = { overview: "隧道运营", tunnels: "公网隧道", devices: "Windows 设备", keys: "接入密钥" };
+const viewTitle: Record<View, string> = { overview: "隧道运营", tunnels: "公网隧道", devices: "Windows 设备", keys: "接入密钥", settings: "系统设置" };
 const keyStatusLabel: Record<AccessKey["status"], string> = { active: "有效", expired: "已过期", revoked: "已撤销" };
 const formatDate = (value: string | null) => (value ? new Date(value).toLocaleString() : "—");
 
@@ -30,6 +31,7 @@ function App() {
   const [createdKey, setCreatedKey] = useState<{ id: string; token: string } | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
+  const [settings, setSettings] = useState<SettingsData>({ bandwidth_limit_mbps: 0 });
   const [activeView, setActiveView] = useState<View>("overview");
 
   const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
@@ -48,7 +50,30 @@ function App() {
       setSummary(nextSummary); setDevices(nextDevices); setTunnels(nextTunnels); setKeys(nextKeys); setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法连接管理服务"); }
   };
-  useEffect(() => { if (!token) return; refresh(); const timer = window.setInterval(refresh, 7000); return () => window.clearInterval(timer); }, [token]);
+  const loadSettings = async () => {
+    try {
+      setSettings(await request<SettingsData>("/settings"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法加载设置");
+    }
+  };
+  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const enabled = form.get("enabled") === "on";
+    const mbps = Number(form.get("mbps") ?? 0);
+    try {
+      setSettings(await request<SettingsData>("/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bandwidth_limit_mbps: enabled ? mbps : 0 }),
+      }));
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "保存失败");
+    }
+  };
+  useEffect(() => { if (!token) return; refresh(); loadSettings(); const timer = window.setInterval(refresh, 7000); return () => window.clearInterval(timer); }, [token]);
   if (!token) return <Login onAuthenticated={value => { localStorage.setItem("tunnel-admin-token", value); setToken(value); }} />;
   const createTunnel = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -121,7 +146,7 @@ function App() {
     if (!window.confirm(`确定删除接入密钥「${key.label}」吗？删除后该令牌立即失效且不可恢复。`)) return;
     try { await request<{ deleted: boolean }>(`/keys/${key.id}`, { method: "DELETE" }); refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败"); }
   };
-  return <div className="app-shell"><aside><div className="brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel<br/><b>Control</b></span></div><nav><button type="button" className={activeView === "overview" ? "nav-active" : ""} aria-current={activeView === "overview" ? "page" : undefined} onClick={() => setActiveView("overview")}><Activity size={17}/>运营概览</button><button type="button" className={activeView === "tunnels" ? "nav-active" : ""} aria-current={activeView === "tunnels" ? "page" : undefined} onClick={() => setActiveView("tunnels")}><Cable size={17}/>公网隧道</button><button type="button" className={activeView === "devices" ? "nav-active" : ""} aria-current={activeView === "devices" ? "page" : undefined} onClick={() => setActiveView("devices")}><Computer size={17}/>Windows 设备</button><button type="button" className={activeView === "keys" ? "nav-active" : ""} aria-current={activeView === "keys" ? "page" : undefined} onClick={() => setActiveView("keys")}><KeyRound size={17}/>接入密钥</button></nav><div className="secure"><ShieldCheck size={16}/><span>管理控制面<br/><b>管理员会话已验证</b></span></div></aside><main><header><div><p className="eyebrow">默认工作区</p><h1>{viewTitle[activeView]}</h1></div><div className="header-actions"><span className="online-dot"/>服务运行中<button className="icon-button" title="刷新数据" onClick={refresh}><RefreshCw size={16}/></button><button className="text-button" onClick={() => { localStorage.removeItem("tunnel-admin-token"); setToken(""); }}>退出</button></div></header>{error && <div className="notice"><b>连接提示</b>{error}</div>}<section className="metrics"><Metric label="在线设备" value={`${summary?.online_devices ?? 0} / ${summary?.devices ?? 0}`} icon={<Computer size={21}/>}/><Metric label="启用隧道" value={`${tunnels.filter(t => t.enabled).length}`} icon={<Cable size={21}/>}/><Metric label="活动连接" value={`${summary?.active_connections ?? 0}`} icon={<Activity size={21}/>}/></section>{activeView !== "devices" && activeView !== "keys" && <TunnelsPanel tunnels={tunnels} devices={devices} onToggle={toggle} onEdit={setEditingTunnel} onDelete={deleteTunnel} onCreate={() => setShowForm(true)} onProbe={probeTunnel} testingId={testingId} probeResult={probeResult}/>}{activeView !== "tunnels" && activeView !== "keys" && <DevicesPanel devices={devices} goKeys={() => setActiveView("keys")}/>}{activeView === "keys" && <KeysPanel keys={keys} onCreate={() => setShowKeyForm(true)} onEdit={setEditingKey} onDelete={deleteKey} onRevoke={revokeKey}/>}</main>{(showForm || editingTunnel) && <TunnelForm devices={devices} tunnel={editingTunnel ?? undefined} onClose={() => { setShowForm(false); setEditingTunnel(null); }} onSubmit={editingTunnel ? updateTunnel : createTunnel}/>}{(showKeyForm || editingKey) && <KeyForm devices={devices} accessKey={editingKey ?? undefined} onClose={() => { setShowKeyForm(false); setEditingKey(null); }} onSubmit={editingKey ? updateKey : createKey}/>}{createdKey && <KeyCreatedModal token={createdKey.token} onClose={() => setCreatedKey(null)}/>}</div>;
+  return <div className="app-shell"><aside><div className="brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel<br/><b>Control</b></span></div><nav><button type="button" className={activeView === "overview" ? "nav-active" : ""} aria-current={activeView === "overview" ? "page" : undefined} onClick={() => setActiveView("overview")}><Activity size={17}/>运营概览</button><button type="button" className={activeView === "tunnels" ? "nav-active" : ""} aria-current={activeView === "tunnels" ? "page" : undefined} onClick={() => setActiveView("tunnels")}><Cable size={17}/>公网隧道</button><button type="button" className={activeView === "devices" ? "nav-active" : ""} aria-current={activeView === "devices" ? "page" : undefined} onClick={() => setActiveView("devices")}><Computer size={17}/>Windows 设备</button><button type="button" className={activeView === "keys" ? "nav-active" : ""} aria-current={activeView === "keys" ? "page" : undefined} onClick={() => setActiveView("keys")}><KeyRound size={17}/>接入密钥</button><button type="button" className={activeView === "settings" ? "nav-active" : ""} aria-current={activeView === "settings" ? "page" : undefined} onClick={() => setActiveView("settings")}><Settings size={17}/>系统设置</button></nav><div className="secure"><ShieldCheck size={16}/><span>管理控制面<br/><b>管理员会话已验证</b></span></div></aside><main><header><div><p className="eyebrow">默认工作区</p><h1>{viewTitle[activeView]}</h1></div><div className="header-actions"><span className="online-dot"/>服务运行中<button className="icon-button" title="刷新数据" onClick={refresh}><RefreshCw size={16}/></button><button className="text-button" onClick={() => { localStorage.removeItem("tunnel-admin-token"); setToken(""); }}>退出</button></div></header>{error && <div className="notice"><b>连接提示</b>{error}</div>}{activeView !== "settings" && <section className="metrics"><Metric label="在线设备" value={`${summary?.online_devices ?? 0} / ${summary?.devices ?? 0}`} icon={<Computer size={21}/>}/><Metric label="启用隧道" value={`${tunnels.filter(t => t.enabled).length}`} icon={<Cable size={21}/>}/><Metric label="活动连接" value={`${summary?.active_connections ?? 0}`} icon={<Activity size={21}/>}/></section>}{activeView !== "devices" && activeView !== "keys" && activeView !== "settings" && <TunnelsPanel tunnels={tunnels} devices={devices} onToggle={toggle} onEdit={setEditingTunnel} onDelete={deleteTunnel} onCreate={() => setShowForm(true)} onProbe={probeTunnel} testingId={testingId} probeResult={probeResult}/>}{activeView !== "tunnels" && activeView !== "keys" && activeView !== "settings" && <DevicesPanel devices={devices} goKeys={() => setActiveView("keys")}/>}{activeView === "keys" && <KeysPanel keys={keys} onCreate={() => setShowKeyForm(true)} onEdit={setEditingKey} onDelete={deleteKey} onRevoke={revokeKey}/>}{activeView === "settings" && <SettingsPanel settings={settings} onSave={saveSettings}/>}</main>{(showForm || editingTunnel) && <TunnelForm devices={devices} tunnel={editingTunnel ?? undefined} onClose={() => { setShowForm(false); setEditingTunnel(null); }} onSubmit={editingTunnel ? updateTunnel : createTunnel}/>}{(showKeyForm || editingKey) && <KeyForm devices={devices} accessKey={editingKey ?? undefined} onClose={() => { setShowKeyForm(false); setEditingKey(null); }} onSubmit={editingKey ? updateKey : createKey}/>}{createdKey && <KeyCreatedModal token={createdKey.token} onClose={() => setCreatedKey(null)}/>}</div>;
 }
 function Login({ onAuthenticated }: { onAuthenticated: (token: string) => void }) { const [error, setError] = useState(""); const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const values = new FormData(event.currentTarget); const response = await fetch(`${API}/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: values.get("email"), password: values.get("password") }) }); if (!response.ok) { setError("邮箱或密码不正确，或管理服务暂不可用。"); return; } onAuthenticated((await response.json()).access_token); }; return <div className="login-page"><form className="login" onSubmit={submit}><div className="brand login-brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel <b>Control</b></span></div><h1>管理员登录</h1><p>使用部署时创建的管理账号进入控制台。</p>{error && <div className="notice">{error}</div>}<label>邮箱<input name="email" type="email" required autoComplete="username" placeholder="admin@example.com"/></label><label>密码<input name="password" type="password" required autoComplete="current-password"/></label><button className="primary login-submit"><LogIn size={16}/>登录</button></form></div>; }
 function Metric({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) { return <div className="metric"><div><p>{label}</p><strong>{value}</strong></div>{icon}</div>; }
@@ -142,6 +167,9 @@ function KeyCreatedModal({ token, onClose }: { token: string; onClose: () => voi
   const [copied, setCopied] = useState(false);
   const copy = async () => { try { await navigator.clipboard.writeText(token); setCopied(true); } catch { /* clipboard unavailable */ } };
   return <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true"><div className="modal-head"><div><p className="eyebrow">密钥已创建</p><h2>请立即保存</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><p className="key-hint">令牌只显示这一次，关闭后将无法再次查看，请先复制并妥善保存。</p><div className="key-token"><code>{token}</code><button type="button" className="text-button" onClick={copy}>{copied ? <Check size={15}/> : <Copy size={15}/>}{copied ? "已复制" : "复制"}</button></div><div className="modal-actions"><button className="primary" type="button" onClick={onClose}>我已完成保存</button></div></div></div>;
+}
+function SettingsPanel({ settings, onSave }: { settings: SettingsData; onSave: (event: FormEvent<HTMLFormElement>) => void }) {
+  return <section className="panel"><div className="panel-heading"><div><h2>带宽限速</h2><p>设置服务器总带宽上限（Mbps）。接近上限时所有隧道公平降速，连接保持不断开。</p></div></div><form className="settings-form" onSubmit={onSave}><label className="check"><input name="enabled" type="checkbox" defaultChecked={settings.bandwidth_limit_mbps > 0}/><span>启用带宽限速</span></label><label className="mbps">带宽上限<input name="mbps" type="number" min="1" max="10000" defaultValue={settings.bandwidth_limit_mbps || 3}/><small>Mbps</small></label><div className="modal-actions"><button className="primary" type="submit"><Check size={16}/>保存设置</button></div></form></section>;
 }
 function TunnelForm({ devices, tunnel, onClose, onSubmit }: { devices: Device[]; tunnel?: Tunnel; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   const targetDevices = tunnel ? devices : devices.filter(device => device.status === "online");
