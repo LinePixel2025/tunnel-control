@@ -23,9 +23,12 @@ use tunnel_protocol::{
     ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode, decode_stream_data, encode,
     encode_stream_data,
 };
+use url::Url;
 
 type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 type ConnectionMap = Arc<RwLock<HashMap<u128, ConnectionInfo>>>;
+type DataSenderMap = Arc<RwLock<HashMap<u16, mpsc::Sender<Message>>>>;
+type TaskMap = Arc<tokio::sync::Mutex<HashMap<u128, tokio::task::JoinHandle<()>>>>;
 
 /// Shared runtime state exposed to the local GUI through the status server.
 #[derive(Clone, Default)]
@@ -33,6 +36,7 @@ struct AgentStatus {
     connected: Arc<AtomicBool>,
     specs: Arc<RwLock<HashMap<String, TunnelSpec>>>,
     connections: ConnectionMap,
+    data_channels: DataSenderMap,
     bandwidth: BandwidthLimiter,
 }
 
@@ -44,7 +48,80 @@ struct ConnectionInfo {
     public_port: u16,
     local_host: String,
     local_port: u16,
+    data_channel: u16,
     opened_at: u64,
+}
+
+/// Connection parameters for one agent run. Values come from environment
+/// variables with safe defaults, so recovery timing is tunable per deploy.
+#[derive(Clone)]
+struct AgentConfig {
+    server: String,
+    data_server: String,
+    token: String,
+    name: String,
+    data_channels: u16,
+    heartbeat_secs: u64,
+    pong_timeout_secs: u64,
+    reconnect_min_secs: u64,
+    reconnect_max_secs: u64,
+}
+
+impl AgentConfig {
+    fn from_env() -> Self {
+        let server = env::var("TUNNEL_SERVER_URL")
+            .ok()
+            .or_else(|| load_file_config().get("TUNNEL_SERVER_URL").cloned())
+            .unwrap_or_else(|| "ws://127.0.0.1:18080/control".into());
+        let token = env::var("TUNNEL_TOKEN")
+            .ok()
+            .or_else(|| load_file_config().get("TUNNEL_TOKEN").cloned())
+            .unwrap_or_else(|| "change-me-agent-token".into());
+        let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows agent".into());
+        let data_server = Url::parse(&server)
+            .map(|mut url| {
+                url.set_path("/data");
+                url.to_string()
+            })
+            .unwrap_or_else(|_| format!("{}/data", server.trim_end_matches('/')));
+        let data_channels = env::var("DATA_CHANNELS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|channels| (1..=8).contains(channels))
+            .unwrap_or(2);
+        let heartbeat_secs = env_secs("AGENT_HEARTBEAT_SECS", 10, 3, 60);
+        let pong_timeout_secs = env_secs("AGENT_PONG_TIMEOUT_SECS", 25, 5, 300);
+        let reconnect_min_secs = env_secs("AGENT_RECONNECT_MIN_SECS", 1, 1, 60);
+        let reconnect_max_secs =
+            env_secs("AGENT_RECONNECT_MAX_SECS", 10, 1, 300).max(reconnect_min_secs);
+        Self {
+            server,
+            data_server,
+            token,
+            name,
+            data_channels,
+            heartbeat_secs,
+            pong_timeout_secs,
+            reconnect_min_secs,
+            reconnect_max_secs,
+        }
+    }
+}
+
+fn env_secs(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|secs| *secs >= min && *secs <= max)
+        .unwrap_or(default)
+}
+
+/// Backoff before the next reconnect attempt: exponential growth from `min` up
+/// to `max`, scaled by a caller-provided jitter fraction (0.7..=1.3).
+fn reconnect_delay(attempt: u32, min_secs: u64, max_secs: u64, jitter: f64) -> Duration {
+    let growth = 2_f64.powi(attempt.min(5) as i32);
+    let base = (min_secs as f64 * growth).min(max_secs as f64);
+    Duration::from_secs_f64((base * jitter).max(0.1))
 }
 
 /// Shared token bucket that throttles the agent's outbound (agent -> server)
@@ -190,12 +267,19 @@ async fn build_status_json(status: &AgentStatus) -> String {
                 "public_port": connection.public_port,
                 "local_host": connection.local_host,
                 "local_port": connection.local_port,
+                "data_channel": connection.data_channel,
                 "opened_at": connection.opened_at,
             })
         })
         .collect();
+    let data_channels: Vec<u16> = {
+        let mut channels: Vec<u16> = status.data_channels.read().await.keys().copied().collect();
+        channels.sort_unstable();
+        channels
+    };
     serde_json::json!({
         "connected": connected,
+        "data_channels": data_channels,
         "tunnels": tunnels,
         "connections": connections,
     })
@@ -288,16 +372,7 @@ fn service_main(_arguments: Vec<OsString>) {
 }
 
 fn run_agent_forever() {
-    let file_config = load_file_config();
-    let server = env::var("TUNNEL_SERVER_URL")
-        .ok()
-        .or_else(|| file_config.get("TUNNEL_SERVER_URL").cloned())
-        .unwrap_or_else(|| "ws://127.0.0.1:18080/control".into());
-    let token = env::var("TUNNEL_TOKEN")
-        .ok()
-        .or_else(|| file_config.get("TUNNEL_TOKEN").cloned())
-        .unwrap_or_else(|| "change-me-agent-token".into());
-    let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows agent".into());
+    let config = AgentConfig::from_env();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -308,11 +383,23 @@ fn run_agent_forever() {
         tokio::spawn(async move {
             status_server(status_server_status).await;
         });
+        let mut attempt = 0_u32;
+        let mut jitter = 0_u64;
         loop {
-            if let Err(error) = run(&server, &token, &name, &status).await {
+            if let Err(error) = run(&config, &status).await {
                 tracing::warn!(%error, "agent disconnected; retrying");
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            jitter = jitter.wrapping_add(17).wrapping_mul(31);
+            let fraction = 0.7 + (jitter % 61) as f64 / 100.0;
+            let delay = reconnect_delay(
+                attempt,
+                config.reconnect_min_secs,
+                config.reconnect_max_secs,
+                fraction,
+            );
+            attempt = attempt.saturating_add(1);
+            tracing::info!(seconds = delay.as_secs_f64(), "retrying control connection");
+            tokio::time::sleep(delay).await;
         }
     });
 }
@@ -400,66 +487,56 @@ fn load_file_config() -> HashMap<String, String> {
 }
 
 async fn run(
-    server: &str,
-    token: &str,
-    name: &str,
+    config: &AgentConfig,
     status: &AgentStatus,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (socket, _) = connect_async(server).await?;
+    let (socket, _) = connect_async(&config.server).await?;
+    enable_tcp_keepalive(&socket);
     status.connected.store(true, Ordering::Relaxed);
     let (mut write, mut read) = socket.split();
     // Control messages (register, heartbeat, ping, probe results, close) use a
-    // dedicated channel that the writer drains before data frames, so a burst
-    // of tunnel traffic can never starve the keepalive or the control plane.
+    // dedicated channel; tunnel payload moves over separate data channels, so
+    // a data burst can never starve the keepalive or the control plane.
     let (control_tx, mut control_rx) = mpsc::channel::<Message>(256);
-    let (data_tx, mut data_rx) = mpsc::channel::<Message>(1024);
     let specs = status.specs.clone();
     let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
     let connections = status.connections.clone();
+    let data_channels = status.data_channels.clone();
     let bandwidth = status.bandwidth.clone();
+    let bridge_tasks: TaskMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let data_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
 
     let register = ControlMessage::Register {
         version: PROTOCOL_VERSION,
-        token: token.into(),
-        device_name: name.into(),
+        token: config.token.clone(),
+        device_name: config.name.clone(),
     };
     control_tx
         .send(Message::Text(String::from_utf8(encode(&register)?)?.into()))
         .await?;
     let writer_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                message = control_rx.recv() => {
-                    match message {
-                        Some(message) => {
-                            if write.send(message).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                message = data_rx.recv() => {
-                    if let Some(message) = message {
-                        if write.send(message).await.is_err() {
-                            break;
-                        }
-                    }
-                }
+        while let Some(message) = control_rx.recv().await {
+            if write.send(message).await.is_err() {
+                break;
             }
         }
     });
 
     let reader_control = control_tx.clone();
-    let reader_data = data_tx.clone();
     let reader_specs = specs.clone();
     let reader_streams = streams.clone();
     let reader_connections = connections.clone();
+    let reader_data_channels = data_channels.clone();
     let reader_bandwidth = bandwidth.clone();
+    let reader_bridge_tasks = bridge_tasks.clone();
     let reader_pong = last_pong.clone();
+    let reader_config = config.clone();
+    let reader_status = status.clone();
+    let reader_data_tasks = data_tasks.clone();
     let reader_task = tokio::spawn(async move {
+        let mut data_channels_opened = false;
         while let Some(Ok(message)) = read.next().await {
             match message {
                 Message::Pong(_) => {
@@ -473,6 +550,19 @@ async fn run(
                         let mut map = reader_specs.write().await;
                         *map = tunnels.into_iter().map(|t| (t.id.clone(), t)).collect();
                         tracing::info!(count = map.len(), "tunnel configuration synchronized");
+                        if !data_channels_opened {
+                            data_channels_opened = true;
+                            for _ in 0..reader_config.data_channels {
+                                let task = tokio::spawn(data_channel_task(
+                                    reader_config.clone(),
+                                    reader_status.clone(),
+                                    reader_streams.clone(),
+                                    reader_connections.clone(),
+                                    reader_control.clone(),
+                                ));
+                                reader_data_tasks.lock().await.push(task);
+                            }
+                        }
                     }
                     Ok(ControlMessage::BandwidthConfig { mbps }) => {
                         reader_bandwidth.set_mbps(mbps);
@@ -481,74 +571,89 @@ async fn run(
                     Ok(ControlMessage::StreamOpen {
                         stream_id,
                         tunnel_id,
+                        data_channel,
                     }) => {
                         let Ok(id) = stream_id.parse::<u128>() else {
                             continue;
                         };
-                        if let Some(spec) = reader_specs.read().await.get(&tunnel_id).cloned() {
-                            let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-                            // Register the stream before spawning the bridge so the
-                            // first data frame following StreamOpen is never dropped.
-                            reader_streams.write().await.insert(id, tx);
-                            let opened_at = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .map(|duration| duration.as_secs())
-                                .unwrap_or(0);
-                            reader_connections.write().await.insert(
-                                id,
-                                ConnectionInfo {
-                                    stream_id: id.to_string(),
-                                    tunnel_id: tunnel_id.clone(),
-                                    kind: kind_str(&spec.kind).to_string(),
-                                    public_port: spec.public_port,
-                                    local_host: spec.local_host.clone(),
-                                    local_port: spec.local_port,
-                                    opened_at,
-                                },
-                            );
-                            let data = reader_data.clone();
-                            let control = reader_control.clone();
-                            let limiter = reader_bandwidth.clone();
-                            let streams = reader_streams.clone();
-                            let connections = reader_connections.clone();
-                            tokio::spawn(async move {
-                                match spec.kind {
-                                    TunnelKind::Udp => {
-                                        bridge_local_udp(
-                                            id,
-                                            spec,
-                                            rx,
-                                            data,
-                                            control,
-                                            streams,
-                                            connections,
-                                            limiter,
-                                        )
-                                        .await;
-                                    }
-                                    _ => {
-                                        bridge_local(
-                                            id,
-                                            spec,
-                                            rx,
-                                            data,
-                                            control,
-                                            streams,
-                                            connections,
-                                            limiter,
-                                        )
-                                        .await
-                                    }
-                                }
-                            });
-                        } else {
+                        let spec = reader_specs.read().await.get(&tunnel_id).cloned();
+                        let Some(spec) = spec else {
                             send_close(&reader_control, stream_id, Some("unknown_tunnel".into()));
-                        }
+                            continue;
+                        };
+                        let channel_tx = reader_data_channels.read().await.get(&data_channel).cloned();
+                        let Some(channel_tx) = channel_tx else {
+                            send_close(
+                                &reader_control,
+                                stream_id,
+                                Some("data_channel_unavailable".into()),
+                            );
+                            continue;
+                        };
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+                        // Register the stream before spawning the bridge so the
+                        // first data frame following StreamOpen is never dropped.
+                        reader_streams.write().await.insert(id, tx);
+                        let opened_at = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs())
+                            .unwrap_or(0);
+                        reader_connections.write().await.insert(
+                            id,
+                            ConnectionInfo {
+                                stream_id: id.to_string(),
+                                tunnel_id: tunnel_id.clone(),
+                                kind: kind_str(&spec.kind).to_string(),
+                                public_port: spec.public_port,
+                                local_host: spec.local_host.clone(),
+                                local_port: spec.local_port,
+                                data_channel,
+                                opened_at,
+                            },
+                        );
+                        let control = reader_control.clone();
+                        let limiter = reader_bandwidth.clone();
+                        let streams = reader_streams.clone();
+                        let connections = reader_connections.clone();
+                        let task = tokio::spawn(async move {
+                            match spec.kind {
+                                TunnelKind::Udp => {
+                                    bridge_local_udp(
+                                        id,
+                                        spec,
+                                        rx,
+                                        channel_tx,
+                                        control,
+                                        streams,
+                                        connections,
+                                        limiter,
+                                    )
+                                    .await;
+                                }
+                                _ => {
+                                    bridge_local(
+                                        id,
+                                        spec,
+                                        rx,
+                                        channel_tx,
+                                        control,
+                                        streams,
+                                        connections,
+                                        limiter,
+                                    )
+                                    .await
+                                }
+                            }
+                        });
+                        reader_bridge_tasks.lock().await.insert(id, task);
                     }
                     Ok(ControlMessage::StreamClose { stream_id, .. }) => {
                         if let Ok(id) = stream_id.parse::<u128>() {
                             reader_streams.write().await.remove(&id);
                             reader_connections.write().await.remove(&id);
+                            if let Some(task) = reader_bridge_tasks.lock().await.remove(&id) {
+                                task.abort();
+                            }
                         }
                     }
                     Ok(ControlMessage::ProbeLocal {
@@ -578,45 +683,16 @@ async fn run(
                     }
                     _ => {}
                 },
-                Message::Binary(bytes) => {
-                    if let Ok((id, data)) = decode_stream_data(&bytes) {
-                        if let Some(tx) = reader_streams.read().await.get(&id).cloned() {
-                            if tx.try_send(data.to_vec()).is_err() {
-                                let is_udp = reader_connections
-                                    .read()
-                                    .await
-                                    .get(&id)
-                                    .map(|connection| connection.kind == "udp")
-                                    .unwrap_or(false);
-                                if is_udp {
-                                    // UDP tolerates loss; drop the datagram and
-                                    // keep the session alive.
-                                    continue;
-                                }
-                                // Never block the shared control channel on one
-                                // saturated TCP stream; close it so the client
-                                // can reconnect.
-                                reader_streams.write().await.remove(&id);
-                                reader_connections.write().await.remove(&id);
-                                send_close(
-                                    &reader_control,
-                                    id.to_string(),
-                                    Some("local_saturated".into()),
-                                );
-                            }
-                        }
-                    }
-                }
                 _ => {}
             }
         }
     });
 
     loop {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_secs(config.heartbeat_secs)).await;
         // After wake-from-sleep the TCP connection may be dead while the OS
         // keeps retransmitting; require a fresh pong or reconnect promptly.
-        if last_pong.lock().unwrap().elapsed() > Duration::from_secs(45) {
+        if last_pong.lock().unwrap().elapsed() > Duration::from_secs(config.pong_timeout_secs) {
             break;
         }
         let heartbeat = ControlMessage::Heartbeat {
@@ -624,8 +700,7 @@ async fn run(
             latency_ms: 0,
         };
         if let Ok(payload) = encode(&heartbeat) {
-            // The control channel has priority over data, and the 45s pong
-            // timeout still guards a dead connection.
+            // The pong timeout still guards a dead connection.
             let _ = control_tx.try_send(Message::Text(
                 String::from_utf8_lossy(&payload).into_owned().into(),
             ));
@@ -634,9 +709,159 @@ async fn run(
     }
     status.connected.store(false, Ordering::Relaxed);
     status.connections.write().await.clear();
+    for task in data_tasks.lock().await.drain(..) {
+        task.abort();
+    }
+    for (_, task) in bridge_tasks.lock().await.drain() {
+        task.abort();
+    }
+    streams.write().await.clear();
+    data_channels.write().await.clear();
     writer_task.abort();
     reader_task.abort();
     Err("control channel closed; reconnecting".into())
+}
+
+/// Sets an aggressive TCP keepalive so a half-open link (router reboot, NAT
+/// table loss, WiFi handoff) is detected by the OS instead of waiting for the
+/// pong timeout. Applied to the control socket and every data socket.
+fn enable_tcp_keepalive(
+    socket: &tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+        let socket_ref = socket2::SockRef::from(tcp);
+        let _ = socket_ref.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)),
+        );
+    }
+}
+
+/// One data WebSocket: binds to the control session with `DataBind`, waits for
+/// `DataBound`, then relays binary frames until the socket drops. On failure it
+/// retries with a short pause; the task is aborted when the control run ends.
+async fn data_channel_task(
+    config: AgentConfig,
+    status: AgentStatus,
+    streams: StreamMap,
+    connections: ConnectionMap,
+    control: mpsc::Sender<Message>,
+) {
+    loop {
+        match connect_async(&config.data_server).await {
+            Ok((socket, _)) => {
+                enable_tcp_keepalive(&socket);
+                let (mut sink, mut source) = socket.split();
+                let bind = ControlMessage::DataBind {
+                    token: config.token.clone(),
+                };
+                let Ok(payload) = encode(&bind) else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                if sink
+                    .send(Message::Text(
+                        String::from_utf8_lossy(&payload).into_owned().into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                let bound = tokio::time::timeout(Duration::from_secs(5), async {
+                    while let Some(Ok(message)) = source.next().await {
+                        if let Message::Text(text) = message {
+                            if let Ok(ControlMessage::DataBound { channel_id }) =
+                                decode(text.as_bytes())
+                            {
+                                return Some(channel_id);
+                            }
+                        }
+                    }
+                    None
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(channel_id) = bound else {
+                    // The server may reject us while the control session is not
+                    // ready yet; retry shortly.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                let (tx, mut rx) = mpsc::channel::<Message>(512);
+                status.data_channels.write().await.insert(channel_id, tx);
+                let writer = tokio::spawn(async move {
+                    while let Some(message) = rx.recv().await {
+                        if sink.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let reader_streams = streams.clone();
+                let reader_connections = connections.clone();
+                let reader_control = control.clone();
+                while let Some(Ok(message)) = source.next().await {
+                    if let Message::Binary(bytes) = message {
+                        if let Ok((id, data)) = decode_stream_data(&bytes) {
+                            route_agent_binary(
+                                &reader_streams,
+                                &reader_connections,
+                                &reader_control,
+                                id,
+                                data,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                writer.abort();
+                status.data_channels.write().await.remove(&channel_id);
+                tracing::warn!(channel_id, "data channel lost; reconnecting");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "data channel connect failed; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// Routes one binary frame arriving on a data socket to its stream. TCP
+/// streams are closed when saturated; UDP datagrams are dropped instead.
+async fn route_agent_binary(
+    streams: &StreamMap,
+    connections: &ConnectionMap,
+    control: &mpsc::Sender<Message>,
+    id: u128,
+    data: &[u8],
+) {
+    let tx = {
+        let map = streams.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(tx) = tx else {
+        return;
+    };
+    if tx.try_send(data.to_vec()).is_ok() {
+        return;
+    }
+    let is_udp = connections
+        .read()
+        .await
+        .get(&id)
+        .map(|connection| connection.kind == "udp")
+        .unwrap_or(false);
+    if is_udp {
+        // UDP tolerates loss; drop the datagram and keep the session alive.
+        return;
+    }
+    // Never block a data channel on one saturated TCP stream; close it so the
+    // client can reconnect.
+    streams.write().await.remove(&id);
+    connections.write().await.remove(&id);
+    send_close(control, id.to_string(), Some("local_saturated".into()));
 }
 
 /// Verifies the agent can reach the tunnel's local service. TCP/HTTP attempt a
@@ -764,7 +989,9 @@ async fn bridge_local_udp(
     let mut buffer = [0_u8; 65536];
     loop {
         match socket.recv(&mut buffer).await {
-            Ok(0) | Err(_) => break,
+            // A zero-length datagram is a valid UDP packet; relay it instead
+            // of treating it as EOF (which would silently kill the session).
+            Err(_) => break,
             Ok(size) => {
                 limiter.acquire(size).await;
                 let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
@@ -875,5 +1102,140 @@ mod tests {
 
         echo_task.abort();
         bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_bridge_relays_zero_length_datagram() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            loop {
+                let Ok((size, peer)) = echo.recv_from(&mut buf).await else {
+                    break;
+                };
+                if echo.send_to(&buf[..size], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let spec = TunnelSpec {
+            id: "tunnel-udp-empty".into(),
+            name: "udp empty test".into(),
+            kind: TunnelKind::Udp,
+            public_port: 19001,
+            local_host: "127.0.0.1".into(),
+            local_port: echo_addr.port(),
+            enabled: true,
+            max_connections: 10,
+        };
+        let (data_tx, mut data_rx) = mpsc::channel::<Message>(64);
+        let (control_tx, _control_rx) = mpsc::channel::<Message>(64);
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+        streams.write().await.insert(43, tx.clone());
+        let bridge = tokio::spawn(bridge_local_udp(
+            43,
+            spec,
+            rx,
+            data_tx,
+            control_tx,
+            streams.clone(),
+            connections.clone(),
+            BandwidthLimiter::new(0),
+        ));
+
+        // An empty datagram is legal; it must be relayed, not treated as EOF.
+        tx.send(Vec::new()).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+            .await
+            .expect("timeout waiting for empty datagram")
+            .expect("channel closed");
+        let Message::Binary(bytes) = message else {
+            panic!("expected binary frame");
+        };
+        let (id, data) = decode_stream_data(&bytes).unwrap();
+        assert_eq!(id, 43);
+        assert!(data.is_empty(), "zero-length datagram must be relayed intact");
+
+        // The session must still be alive after the empty datagram.
+        tx.send(b"still-alive".to_vec()).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+            .await
+            .expect("timeout waiting for second datagram")
+            .expect("channel closed");
+        let Message::Binary(bytes) = message else {
+            panic!("expected binary frame");
+        };
+        let (_, data) = decode_stream_data(&bytes).unwrap();
+        assert_eq!(data, b"still-alive");
+
+        echo_task.abort();
+        bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_close_aborts_idle_bridge() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            // Accept and hold the connection open without ever writing, so the
+            // bridge read loop would block forever without the abort.
+            let _ = listener.accept().await;
+        });
+        let spec = TunnelSpec {
+            id: "tunnel-tcp-close".into(),
+            name: "tcp close test".into(),
+            kind: TunnelKind::Tcp,
+            public_port: 18002,
+            local_host: "127.0.0.1".into(),
+            local_port: addr.port(),
+            enabled: true,
+            max_connections: 10,
+        };
+        let (data_tx, _data_rx) = mpsc::channel::<Message>(64);
+        let (control_tx, _control_rx) = mpsc::channel::<Message>(64);
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+        streams.write().await.insert(7, tx.clone());
+        let bridge = tokio::spawn(bridge_local(
+            7,
+            spec,
+            rx,
+            data_tx,
+            control_tx,
+            streams.clone(),
+            connections.clone(),
+            BandwidthLimiter::new(0),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Simulate the StreamClose handler: unregister the stream and abort
+        // the bridge so it cannot linger on an idle local connection.
+        streams.write().await.remove(&7);
+        bridge.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), bridge)
+                .await
+                .is_ok(),
+            "bridge task must terminate after StreamClose abort"
+        );
+        accept_task.abort();
+    }
+
+    #[test]
+    fn reconnect_delay_grows_and_stays_bounded() {
+        let min = 1;
+        let max = 10;
+        assert_eq!(reconnect_delay(0, min, max, 1.0), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(4, min, max, 1.0), Duration::from_secs(10));
+        let base = reconnect_delay(2, min, max, 1.0);
+        let low = reconnect_delay(2, min, max, 0.7);
+        let high = reconnect_delay(2, min, max, 1.3);
+        assert!(low < base && base < high);
+        let extreme = reconnect_delay(10, min, max, 1.3);
+        assert!(extreme.as_secs_f64() <= max as f64 * 1.3 + 1e-9);
     }
 }
