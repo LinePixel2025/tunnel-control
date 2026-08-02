@@ -1,6 +1,6 @@
 # Tunnel Control
 
-面向团队的 Windows 到 Linux 公网服务器内网穿透首版。管理面板独立使用 HTTPS 端口；管理员分配 TCP/HTTP/UDP 公网端口，Windows 后台代理通过控制信道注册并持续发送心跳。
+面向团队的 Windows 到 Linux 公网服务器内网穿透。管理面板独立使用 HTTPS 端口；管理员分配 TCP/HTTP/UDP 公网端口，Windows 后台代理通过控制通道注册并持续发送心跳，数据流量在独立的 K 条数据通道上多路复用。
 
 ## 项目结构
 
@@ -47,6 +47,21 @@ cargo run -p tunnel-agent
 
 控制面已经可运行：令牌注册、心跳、设备在线状态、端口冲突检查、隧道创建/启停与审计事件接口都可使用。PostgreSQL/Redis 以及 Docker 部署物已准备好，但当前服务端状态仍在内存中，重启后不会恢复；将 SQLx repository 接入 API 是下一生产化迭代。
 
-数据面在控制信道上多路复用：每条公网连接/每个 UDP 会话使用受限的 `OpenStream/Data/CloseStream` 帧，代理在本地连接对应的 `host:port`。UDP 隧道把每个公网客户端视为一个会话，空闲超过 `UDP_SESSION_IDLE_SECS`（默认 120 秒）后自动回收。当前不支持 TLS 透传、自动 HTTPS 或自定义域名。
+## 数据面与稳定性语义
+
+协议 v3 起数据面与控制面分离：1 条控制 WebSocket 只承载注册、心跳、`StreamOpen/Close` 等小消息；注册成功后代理额外打开 `DATA_CHANNELS`（默认 2，服务端上限 `DATA_CHANNELS_MAX` 默认 4）条数据 WebSocket，每条先以 `DataBind` 绑定再以 `DataBound` 获得通道号。每条公网连接/每个 UDP 会话由服务端分配到一个数据通道（`StreamOpen` 携带通道号），该通道上的二进制帧只走对应的数据套接字。
+
+- 任一数据通道抖动只关闭它承载的流（约 1/K），其他通道不受影响；控制通道不会被数据突发饿死。
+- 可探测故障（RST、正常关闭）下，代理按 1s 起、×2、上限 10s 的退避重连，新连接约 1–3s 恢复；静默黑洞最坏受 `AGENT_PONG_TIMEOUT_SECS`（默认 25s）约束，可通过环境变量调小。
+- 整链路断网时，在途 TCP 连接会被切断（裸 TCP 字节流无法透明续传），恢复语义为"新连接快速可用"；数据库连接池、HTTP 客户端等长连接应用应自行重试。UDP 会话在重连后由下一个客户端报文自动重建。
+- UDP 隧道把每个公网客户端视为一个会话，空闲超过 `UDP_SESSION_IDLE_SECS`（默认 120 秒）后自动回收；零长度 UDP 报文也会被正常转发。
+
+当前不支持 TLS 透传、自动 HTTPS 或自定义域名。协议 v3 与旧版代理/服务端不兼容，升级时需要同时发布两侧。
+
+### 可调环境变量
+
+服务端：`DATA_CHANNELS_MAX`（1–16）、`SHUTDOWN_DRAIN_SECS`（优雅停机排水秒数，默认 10）、`BANDWIDTH_LIMIT_MBPS`、`UDP_SESSION_IDLE_SECS`。
+
+代理端：`DATA_CHANNELS`（1–8）、`AGENT_HEARTBEAT_SECS`（默认 10）、`AGENT_PONG_TIMEOUT_SECS`（默认 25）、`AGENT_RECONNECT_MIN_SECS`（默认 1）、`AGENT_RECONNECT_MAX_SECS`（默认 10）。可通过环境变量或 `agent.env` 设置。
 
 Windows 打包接入建议使用 Tauri v2：将 `tunnel-agent` 编译为 Windows Service，GUI 通过命名管道调用服务，而不要把访问令牌交给 WebView 或写入配置文件。
