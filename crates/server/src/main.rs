@@ -928,7 +928,7 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             .bind(device_id)
             .execute(&state.db)
             .await;
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(1024);
     state
         .sessions
         .write()
@@ -1195,25 +1195,35 @@ async fn bridge_public_connection(
                 let Ok(frame) = encode_stream_data(id, &buf[..n]) else {
                     break;
                 };
-                if out.send(Message::Binary(frame.into())).await.is_err() {
+                if out.try_send(Message::Binary(frame.into())).is_err() {
+                    // Never stall the device's outbound queue on one stream;
+                    // close it so the client can reconnect.
+                    state.streams.write().await.remove(&id);
+                    let close = ControlMessage::StreamClose {
+                        stream_id: id.to_string(),
+                        reason: Some("stream_saturated".into()),
+                    };
+                    if let Ok(payload) = encode(&close) {
+                        let _ = session.try_send(Message::Text(
+                            String::from_utf8_lossy(&payload).into_owned().into(),
+                        ));
+                    }
                     break;
                 }
             }
         }
     }
-    let _ = session
-        .send(Message::Text(
-            String::from_utf8(
-                encode(&ControlMessage::StreamClose {
-                    stream_id: id.to_string(),
-                    reason: None,
-                })
-                .unwrap(),
-            )
-            .unwrap()
-            .into(),
-        ))
-        .await;
+    let _ = session.try_send(Message::Text(
+        String::from_utf8(
+            encode(&ControlMessage::StreamClose {
+                stream_id: id.to_string(),
+                reason: None,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+        .into(),
+    ));
     state.streams.write().await.remove(&id);
     inbound.abort();
 }
@@ -1320,10 +1330,9 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                             continue;
                         };
                         if session
-                            .send(Message::Text(
+                            .try_send(Message::Text(
                                 String::from_utf8_lossy(&payload).into_owned().into(),
                             ))
-                            .await
                             .is_err()
                         {
                             continue;
@@ -1351,8 +1360,14 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                 else {
                     continue;
                 };
-                if session.send(Message::Binary(frame.into())).await.is_err() {
-                    drop_invalid_udp_sessions(&state, tunnel.device_id).await;
+                match session.try_send(Message::Binary(frame.into())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        drop_invalid_udp_sessions(&state, tunnel.device_id).await;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // UDP tolerates loss; drop the datagram.
+                    }
                 }
             }
             _ = cleanup.tick() => {
@@ -1379,11 +1394,9 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                         if let Some(session) =
                             state.sessions.read().await.get(&tunnel.device_id).cloned()
                         {
-                            let _ = session
-                                .send(Message::Text(
-                                    String::from_utf8_lossy(&payload).into_owned().into(),
-                                ))
-                                .await;
+                            let _ = session.try_send(Message::Text(
+                                String::from_utf8_lossy(&payload).into_owned().into(),
+                            ));
                         }
                     }
                 }

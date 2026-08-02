@@ -343,7 +343,7 @@ async fn run(
     let (socket, _) = connect_async(server).await?;
     status.connected.store(true, Ordering::Relaxed);
     let (mut write, mut read) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(1024);
     let specs = status.specs.clone();
     let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
     let connections = status.connections.clone();
@@ -428,7 +428,7 @@ async fn run(
                                 }
                             });
                         } else {
-                            send_close(&reader_out, stream_id, Some("unknown_tunnel".into())).await;
+                            send_close(&reader_out, stream_id, Some("unknown_tunnel".into()));
                         }
                     }
                     Ok(ControlMessage::StreamClose { stream_id, .. }) => {
@@ -442,22 +442,23 @@ async fn run(
                         tunnel_id,
                     }) => {
                         let spec = reader_specs.read().await.get(&tunnel_id).cloned();
-                        let (ok, message) = match spec {
-                            None => (false, Some("unknown_tunnel".into())),
-                            Some(spec) => probe_local_service(&spec).await,
-                        };
-                        let result = ControlMessage::ProbeResult {
-                            probe_id,
-                            ok,
-                            message,
-                        };
-                        if let Ok(payload) = encode(&result) {
-                            let _ = reader_out
-                                .send(Message::Text(
+                        let out = reader_out.clone();
+                        tokio::spawn(async move {
+                            let (ok, message) = match spec {
+                                None => (false, Some("unknown_tunnel".into())),
+                                Some(spec) => probe_local_service(&spec).await,
+                            };
+                            let result = ControlMessage::ProbeResult {
+                                probe_id,
+                                ok,
+                                message,
+                            };
+                            if let Ok(payload) = encode(&result) {
+                                let _ = out.try_send(Message::Text(
                                     String::from_utf8_lossy(&payload).into_owned().into(),
-                                ))
-                                .await;
-                        }
+                                ));
+                            }
+                        });
                     }
                     _ => {}
                 },
@@ -559,7 +560,7 @@ async fn bridge_local(
     else {
         streams.write().await.remove(&id);
         connections.write().await.remove(&id);
-        send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
+        send_close(&out, id.to_string(), Some("local_connect_failed".into()));
         return;
     };
     let (mut reader, mut writer) = socket.into_split();
@@ -578,7 +579,9 @@ async fn bridge_local(
                 let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
                     break;
                 };
-                if out.send(Message::Binary(frame.into())).await.is_err() {
+                if out.try_send(Message::Binary(frame.into())).is_err() {
+                    // Never stall the shared outbound queue on one stream; close
+                    // this stream so the client can reconnect.
                     break;
                 }
             }
@@ -587,7 +590,7 @@ async fn bridge_local(
     streams.write().await.remove(&id);
     connections.write().await.remove(&id);
     write_task.abort();
-    send_close(&out, id.to_string(), None).await;
+    send_close(&out, id.to_string(), None);
 }
 
 async fn bridge_local_udp(
@@ -601,7 +604,7 @@ async fn bridge_local_udp(
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
         streams.write().await.remove(&id);
         connections.write().await.remove(&id);
-        send_close(&out, id.to_string(), Some("local_bind_failed".into())).await;
+        send_close(&out, id.to_string(), Some("local_bind_failed".into()));
         return;
     };
     if socket
@@ -611,7 +614,7 @@ async fn bridge_local_udp(
     {
         streams.write().await.remove(&id);
         connections.write().await.remove(&id);
-        send_close(&out, id.to_string(), Some("local_connect_failed".into())).await;
+        send_close(&out, id.to_string(), Some("local_connect_failed".into()));
         return;
     }
     let socket = Arc::new(socket);
@@ -631,8 +634,10 @@ async fn bridge_local_udp(
                 let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
                     break;
                 };
-                if out.send(Message::Binary(frame.into())).await.is_err() {
-                    break;
+                if out.try_send(Message::Binary(frame.into())).is_err() {
+                    // UDP tolerates loss; drop the datagram rather than stall
+                    // the shared outbound queue.
+                    continue;
                 }
             }
         }
@@ -640,17 +645,15 @@ async fn bridge_local_udp(
     streams.write().await.remove(&id);
     connections.write().await.remove(&id);
     write_task.abort();
-    send_close(&out, id.to_string(), None).await;
+    send_close(&out, id.to_string(), None);
 }
 
-async fn send_close(out: &mpsc::Sender<Message>, stream_id: String, reason: Option<String>) {
+fn send_close(out: &mpsc::Sender<Message>, stream_id: String, reason: Option<String>) {
     let close = ControlMessage::StreamClose { stream_id, reason };
     if let Ok(payload) = encode(&close) {
-        let _ = out
-            .send(Message::Text(
-                String::from_utf8_lossy(&payload).into_owned().into(),
-            ))
-            .await;
+        let _ = out.try_send(Message::Text(
+            String::from_utf8_lossy(&payload).into_owned().into(),
+        ));
     }
 }
 
