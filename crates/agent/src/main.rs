@@ -9,14 +9,14 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{RwLock, mpsc},
+    sync::{Mutex, RwLock, mpsc},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tunnel_protocol::{
@@ -33,6 +33,7 @@ struct AgentStatus {
     connected: Arc<AtomicBool>,
     specs: Arc<RwLock<HashMap<String, TunnelSpec>>>,
     connections: ConnectionMap,
+    bandwidth: BandwidthLimiter,
 }
 
 #[derive(Clone)]
@@ -44,6 +45,70 @@ struct ConnectionInfo {
     local_host: String,
     local_port: u16,
     opened_at: u64,
+}
+
+/// Shared token bucket that throttles the agent's outbound (agent -> server)
+/// direction so the single WebSocket channel can never be saturated by TCP or
+/// UDP data. 0 disables throttling; the server pushes the cap via
+/// `ControlMessage::BandwidthConfig`.
+#[derive(Clone)]
+struct BandwidthLimiter {
+    mbps: Arc<AtomicU64>,
+    state: Arc<Mutex<BucketState>>,
+}
+
+struct BucketState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Default for BandwidthLimiter {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl BandwidthLimiter {
+    fn new(mbps: u64) -> Self {
+        Self {
+            mbps: Arc::new(AtomicU64::new(mbps)),
+            state: Arc::new(Mutex::new(BucketState {
+                tokens: mbps as f64 * 1_000_000.0 / 8.0,
+                last: Instant::now(),
+            })),
+        }
+    }
+
+    fn set_mbps(&self, mbps: u64) {
+        self.mbps.store(mbps, Ordering::Relaxed);
+    }
+
+    async fn acquire(&self, bytes: usize) {
+        if self.mbps.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        loop {
+            let mbps = self.mbps.load(Ordering::Relaxed);
+            if mbps == 0 {
+                return;
+            }
+            let rate = mbps as f64 * 1_000_000.0 / 8.0;
+            let burst = rate;
+            let now = Instant::now();
+            let elapsed = now.duration_since(state.last).as_secs_f64();
+            state.last = now;
+            state.tokens = (state.tokens + elapsed * rate).min(burst);
+            if state.tokens >= bytes as f64 {
+                state.tokens -= bytes as f64;
+                return;
+            }
+            let wait = (bytes as f64 - state.tokens) / rate;
+            drop(state);
+            tokio::time::sleep(Duration::from_secs_f64(wait.min(0.5))).await;
+            state = self.state.lock().await;
+        }
+    }
 }
 
 fn kind_str(kind: &TunnelKind) -> &'static str {
@@ -343,10 +408,15 @@ async fn run(
     let (socket, _) = connect_async(server).await?;
     status.connected.store(true, Ordering::Relaxed);
     let (mut write, mut read) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(1024);
+    // Control messages (register, heartbeat, ping, probe results, close) use a
+    // dedicated channel that the writer drains before data frames, so a burst
+    // of tunnel traffic can never starve the keepalive or the control plane.
+    let (control_tx, mut control_rx) = mpsc::channel::<Message>(256);
+    let (data_tx, mut data_rx) = mpsc::channel::<Message>(1024);
     let specs = status.specs.clone();
     let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
     let connections = status.connections.clone();
+    let bandwidth = status.bandwidth.clone();
     let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
 
     let register = ControlMessage::Register {
@@ -354,21 +424,40 @@ async fn run(
         token: token.into(),
         device_name: name.into(),
     };
-    out_tx
+    control_tx
         .send(Message::Text(String::from_utf8(encode(&register)?)?.into()))
         .await?;
     let writer_task = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
-            if write.send(message).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                message = control_rx.recv() => {
+                    match message {
+                        Some(message) => {
+                            if write.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                message = data_rx.recv() => {
+                    if let Some(message) = message {
+                        if write.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     });
 
-    let reader_out = out_tx.clone();
+    let reader_control = control_tx.clone();
+    let reader_data = data_tx.clone();
     let reader_specs = specs.clone();
     let reader_streams = streams.clone();
     let reader_connections = connections.clone();
+    let reader_bandwidth = bandwidth.clone();
     let reader_pong = last_pong.clone();
     let reader_task = tokio::spawn(async move {
         while let Some(Ok(message)) = read.next().await {
@@ -384,6 +473,10 @@ async fn run(
                         let mut map = reader_specs.write().await;
                         *map = tunnels.into_iter().map(|t| (t.id.clone(), t)).collect();
                         tracing::info!(count = map.len(), "tunnel configuration synchronized");
+                    }
+                    Ok(ControlMessage::BandwidthConfig { mbps }) => {
+                        reader_bandwidth.set_mbps(mbps);
+                        tracing::info!(mbps, "server bandwidth limit applied");
                     }
                     Ok(ControlMessage::StreamOpen {
                         stream_id,
@@ -413,22 +506,43 @@ async fn run(
                                     opened_at,
                                 },
                             );
-                            let out = reader_out.clone();
+                            let data = reader_data.clone();
+                            let control = reader_control.clone();
+                            let limiter = reader_bandwidth.clone();
                             let streams = reader_streams.clone();
                             let connections = reader_connections.clone();
                             tokio::spawn(async move {
                                 match spec.kind {
                                     TunnelKind::Udp => {
-                                        bridge_local_udp(id, spec, rx, out, streams, connections)
-                                            .await;
+                                        bridge_local_udp(
+                                            id,
+                                            spec,
+                                            rx,
+                                            data,
+                                            control,
+                                            streams,
+                                            connections,
+                                            limiter,
+                                        )
+                                        .await;
                                     }
                                     _ => {
-                                        bridge_local(id, spec, rx, out, streams, connections).await
+                                        bridge_local(
+                                            id,
+                                            spec,
+                                            rx,
+                                            data,
+                                            control,
+                                            streams,
+                                            connections,
+                                            limiter,
+                                        )
+                                        .await
                                     }
                                 }
                             });
                         } else {
-                            send_close(&reader_out, stream_id, Some("unknown_tunnel".into()));
+                            send_close(&reader_control, stream_id, Some("unknown_tunnel".into()));
                         }
                     }
                     Ok(ControlMessage::StreamClose { stream_id, .. }) => {
@@ -442,7 +556,7 @@ async fn run(
                         tunnel_id,
                     }) => {
                         let spec = reader_specs.read().await.get(&tunnel_id).cloned();
-                        let out = reader_out.clone();
+                        let control = reader_control.clone();
                         tokio::spawn(async move {
                             let (ok, message) = match spec {
                                 None => (false, Some("unknown_tunnel".into())),
@@ -454,9 +568,11 @@ async fn run(
                                 message,
                             };
                             if let Ok(payload) = encode(&result) {
-                                let _ = out.try_send(Message::Text(
-                                    String::from_utf8_lossy(&payload).into_owned().into(),
-                                ));
+                                let _ = control
+                                    .send(Message::Text(
+                                        String::from_utf8_lossy(&payload).into_owned().into(),
+                                    ))
+                                    .await;
                             }
                         });
                     }
@@ -483,7 +599,7 @@ async fn run(
                                 reader_streams.write().await.remove(&id);
                                 reader_connections.write().await.remove(&id);
                                 send_close(
-                                    &reader_out,
+                                    &reader_control,
                                     id.to_string(),
                                     Some("local_saturated".into()),
                                 );
@@ -508,13 +624,13 @@ async fn run(
             latency_ms: 0,
         };
         if let Ok(payload) = encode(&heartbeat) {
-            // A momentarily full queue must not tear down the connection;
-            // connection health is decided by the 45s pong timeout above.
-            let _ = out_tx.try_send(Message::Text(
+            // The control channel has priority over data, and the 45s pong
+            // timeout still guards a dead connection.
+            let _ = control_tx.try_send(Message::Text(
                 String::from_utf8_lossy(&payload).into_owned().into(),
             ));
         }
-        let _ = out_tx.try_send(Message::Ping(Vec::new().into()));
+        let _ = control_tx.try_send(Message::Ping(Vec::new().into()));
     }
     status.connected.store(false, Ordering::Relaxed);
     status.connections.write().await.clear();
@@ -556,15 +672,21 @@ async fn bridge_local(
     id: u128,
     spec: TunnelSpec,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    out: mpsc::Sender<Message>,
+    data: mpsc::Sender<Message>,
+    control: mpsc::Sender<Message>,
     streams: StreamMap,
     connections: ConnectionMap,
+    limiter: BandwidthLimiter,
 ) {
     let Ok(socket) = TcpStream::connect(format!("{}:{}", spec.local_host, spec.local_port)).await
     else {
         streams.write().await.remove(&id);
         connections.write().await.remove(&id);
-        send_close(&out, id.to_string(), Some("local_connect_failed".into()));
+        send_close(
+            &control,
+            id.to_string(),
+            Some("local_connect_failed".into()),
+        );
         return;
     };
     let (mut reader, mut writer) = socket.into_split();
@@ -580,13 +702,15 @@ async fn bridge_local(
         match reader.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(size) => {
+                // Throttle at the source so a fast local service can never
+                // saturate the shared control WebSocket.
+                limiter.acquire(size).await;
                 let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
                     break;
                 };
-                // The bridge task may wait for the shared outbound queue; it
-                // never blocks the reader, and TCP must not drop bytes, so
-                // queue here instead of closing the stream.
-                if out.send(Message::Binary(frame.into())).await.is_err() {
+                // TCP must not drop bytes, so queue on the data channel rather
+                // than closing the stream; control messages still jump ahead.
+                if data.send(Message::Binary(frame.into())).await.is_err() {
                     break;
                 }
             }
@@ -595,21 +719,23 @@ async fn bridge_local(
     streams.write().await.remove(&id);
     connections.write().await.remove(&id);
     write_task.abort();
-    send_close(&out, id.to_string(), None);
+    send_close(&control, id.to_string(), None);
 }
 
 async fn bridge_local_udp(
     id: u128,
     spec: TunnelSpec,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    out: mpsc::Sender<Message>,
+    data: mpsc::Sender<Message>,
+    control: mpsc::Sender<Message>,
     streams: StreamMap,
     connections: ConnectionMap,
+    limiter: BandwidthLimiter,
 ) {
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
         streams.write().await.remove(&id);
         connections.write().await.remove(&id);
-        send_close(&out, id.to_string(), Some("local_bind_failed".into()));
+        send_close(&control, id.to_string(), Some("local_bind_failed".into()));
         return;
     };
     if socket
@@ -619,7 +745,11 @@ async fn bridge_local_udp(
     {
         streams.write().await.remove(&id);
         connections.write().await.remove(&id);
-        send_close(&out, id.to_string(), Some("local_connect_failed".into()));
+        send_close(
+            &control,
+            id.to_string(),
+            Some("local_connect_failed".into()),
+        );
         return;
     }
     let socket = Arc::new(socket);
@@ -636,12 +766,13 @@ async fn bridge_local_udp(
         match socket.recv(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(size) => {
+                limiter.acquire(size).await;
                 let Ok(frame) = encode_stream_data(id, &buffer[..size]) else {
                     break;
                 };
-                if out.try_send(Message::Binary(frame.into())).is_err() {
+                if data.try_send(Message::Binary(frame.into())).is_err() {
                     // UDP tolerates loss; drop the datagram rather than stall
-                    // the shared outbound queue.
+                    // the data channel.
                     continue;
                 }
             }
@@ -650,13 +781,13 @@ async fn bridge_local_udp(
     streams.write().await.remove(&id);
     connections.write().await.remove(&id);
     write_task.abort();
-    send_close(&out, id.to_string(), None);
+    send_close(&control, id.to_string(), None);
 }
 
-fn send_close(out: &mpsc::Sender<Message>, stream_id: String, reason: Option<String>) {
+fn send_close(control: &mpsc::Sender<Message>, stream_id: String, reason: Option<String>) {
     let close = ControlMessage::StreamClose { stream_id, reason };
     if let Ok(payload) = encode(&close) {
-        let _ = out.try_send(Message::Text(
+        let _ = control.try_send(Message::Text(
             String::from_utf8_lossy(&payload).into_owned().into(),
         ));
     }
@@ -665,6 +796,31 @@ fn send_close(out: &mpsc::Sender<Message>, stream_id: String, reason: Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_limiter_paces_outbound_at_cap() {
+        let limiter = BandwidthLimiter::new(1);
+        let started = Instant::now();
+        let mut sent = 0usize;
+        // Four seconds worth of budget: the first second is the burst, the
+        // remaining three seconds must be paced by the token bucket.
+        while sent < 500_000 {
+            limiter.acquire(1_250).await;
+            sent += 1_250;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        assert!(elapsed >= 2.5 && elapsed < 6.0, "elapsed {elapsed}");
+    }
+
+    #[tokio::test]
+    async fn agent_limiter_disabled_passes_through() {
+        let limiter = BandwidthLimiter::new(0);
+        let started = Instant::now();
+        for _ in 0..100 {
+            limiter.acquire(64 * 1024).await;
+        }
+        assert!(started.elapsed().as_millis() < 500);
+    }
 
     #[tokio::test]
     async fn udp_bridge_relays_datagrams_both_ways() {
@@ -686,7 +842,8 @@ mod tests {
             enabled: true,
             max_connections: 10,
         };
-        let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+        let (data_tx, mut data_rx) = mpsc::channel::<Message>(64);
+        let (control_tx, _control_rx) = mpsc::channel::<Message>(64);
         let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
         let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
@@ -696,14 +853,16 @@ mod tests {
             42,
             spec,
             rx,
-            out_tx,
+            data_tx,
+            control_tx,
             streams.clone(),
             connections.clone(),
+            BandwidthLimiter::new(0),
         ));
 
         tx.send(b"hello-udp".to_vec()).await.unwrap();
 
-        let message = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+        let message = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
             .await
             .expect("timeout waiting for echoed datagram")
             .expect("channel closed");
