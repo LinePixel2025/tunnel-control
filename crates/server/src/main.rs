@@ -7,7 +7,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use chrono::{Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -968,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/settings", get(get_settings).put(update_settings))
         .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/devices/{id}", delete(delete_device))
         .route(
             "/api/v1/devices/{id}/settings",
             get(get_device_settings).put(update_device_settings),
@@ -1307,6 +1308,89 @@ async fn list_devices(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(rows))
+}
+
+/// Deletes a device and everything it owns: tunnels, access tokens, per-device
+/// settings, and enrollment records. Public listeners are stopped and the
+/// live control session is torn down so the device drops immediately; its
+/// (now deleted) token will be rejected on reconnect and it must re-enroll.
+async fn delete_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let device_name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let Some(device_name) = device_name else {
+        return Err((StatusCode::NOT_FOUND, "Device not found".into()));
+    };
+    // Stop every public listener owned by the device (this also drops its UDP
+    // sessions), then tear down the live control/data channels.
+    let tunnel_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tunnels WHERE device_id=$1")
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    for tunnel_id in tunnel_ids {
+        remove_listener(&state, tunnel_id).await;
+    }
+    let session = {
+        let sessions = state.plane.sessions.read().await;
+        sessions.get(&id).cloned()
+    };
+    if let Some(session) = session {
+        teardown_device_data_channels(&state, id, session.connection_id).await;
+        drop_invalid_udp_sessions(&state, id, session.connection_id).await;
+        let mut sessions = state.plane.sessions.write().await;
+        remove_session_if_owned(&mut sessions, id, session.connection_id);
+    }
+    let mut tx = state.db.begin().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not begin transaction".into(),
+        )
+    })?;
+    // enrollments reference devices without ON DELETE CASCADE; clear them
+    // first, then the devices row cascades to tunnels/access_tokens/device_settings.
+    sqlx::query("DELETE FROM enrollments WHERE device_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not delete device records".into(),
+            )
+        })?;
+    let result = sqlx::query("DELETE FROM devices WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not delete device".into(),
+            )
+        })?;
+    if result.rows_affected() == 0 {
+        let _ = tx.rollback().await;
+        return Err((StatusCode::NOT_FOUND, "Device not found".into()));
+    }
+    tx.commit().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not commit deletion".into(),
+        )
+    })?;
+    audit(&state.db, Some(actor.id), "device.deleted", &device_name).await;
+    tracing::info!(%id, "device deleted");
+    Ok(Json(serde_json::json!({"deleted": true})))
 }
 async fn list_tunnels(
     State(state): State<AppState>,
