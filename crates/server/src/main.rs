@@ -202,6 +202,11 @@ const TCP_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 /// pile waiting connections up indefinitely.
 const DATA_CHANNEL_WAIT: StdDuration = StdDuration::from_secs(3);
 
+/// How long `StreamOpen` waits for the control queue to drain before the new
+/// connection is rejected. Short enough that a congested control socket never
+/// stalls bridge tasks for long.
+const STREAM_OPEN_SEND_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+
 /// Removes a session entry only when it still belongs to `connection_id`, so a
 /// stale control loop can never delete the session of a newer connection.
 fn remove_session_if_owned(
@@ -321,22 +326,40 @@ async fn route_stream_data_with_timeout(
     }
 }
 
-/// Sends a control message to the device's current session. Returns false when
-/// the device is offline or the send failed.
+/// Sends a control message to the device's current session without blocking.
+/// A full or closed control queue counts as "control unavailable" and returns
+/// false, so callers (including the data-channel read loop) never stall on a
+/// congested control WebSocket.
 async fn send_control(state: &AppState, device_id: Uuid, message: &ControlMessage) -> bool {
-    let Ok(payload) = encode(message) else {
-        return false;
-    };
     let Some(session) = state.plane.sessions.read().await.get(&device_id).cloned() else {
         return false;
     };
-    session
-        .tx
-        .send(Message::Text(
-            String::from_utf8_lossy(&payload).into_owned().into(),
-        ))
-        .await
-        .is_ok()
+    send_control_to_session(&session, message, None).await
+}
+
+/// Encodes and sends one control message to a specific session. Tries without
+/// blocking first; when `timeout` is set and the queue is full, waits at most
+/// that long for space. Returns false when the queue is full past the timeout
+/// or the session is closed.
+async fn send_control_to_session(
+    session: &SessionEntry,
+    message: &ControlMessage,
+    timeout: Option<StdDuration>,
+) -> bool {
+    let Ok(payload) = encode(message) else {
+        return false;
+    };
+    let text = Message::Text(String::from_utf8_lossy(&payload).into_owned().into());
+    if session.tx.try_send(text.clone()).is_ok() {
+        return true;
+    }
+    let Some(timeout) = timeout else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(timeout, session.tx.send(text)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Number of live streams currently assigned to one data channel.
@@ -821,6 +844,80 @@ mod tests {
             ]),
         );
         assert_eq!(pick_data_channel(&plane, device).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn send_control_to_session_reports_full_queue_without_waiting() {
+        let (tx, _rx) = mpsc::channel::<Message>(1);
+        let send_tx = tx.clone();
+        let session = SessionEntry {
+            connection_id: Uuid::new_v4(),
+            tx,
+        };
+        let message = ControlMessage::Heartbeat {
+            version: PROTOCOL_VERSION,
+            latency_ms: 0,
+        };
+        let _ = send_tx.try_send(Message::Text(String::from("first").into()));
+        let started = Instant::now();
+        assert!(
+            !send_control_to_session(&session, &message, None).await,
+            "full queue must report control unavailable"
+        );
+        assert!(
+            started.elapsed() < StdDuration::from_millis(50),
+            "non-blocking send must not wait for queue space"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_control_to_session_waits_until_queue_drains() {
+        let (tx, mut rx) = mpsc::channel::<Message>(1);
+        let session = SessionEntry {
+            connection_id: Uuid::new_v4(),
+            tx: tx.clone(),
+        };
+        let message = ControlMessage::Heartbeat {
+            version: PROTOCOL_VERSION,
+            latency_ms: 0,
+        };
+        let _ = tx.try_send(Message::Text(String::from("first").into()));
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            let _ = rx.recv().await;
+            // Keep the receiver alive so the pending send completes instead
+            // of seeing a closed channel when this task would otherwise end.
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+        });
+        let started = Instant::now();
+        assert!(
+            send_control_to_session(&session, &message, Some(StdDuration::from_secs(2))).await,
+            "timed send must succeed once the queue drains"
+        );
+        assert!(started.elapsed() >= StdDuration::from_millis(80));
+        drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_control_to_session_times_out_when_queue_stays_full() {
+        let (tx, _rx) = mpsc::channel::<Message>(1);
+        let send_tx = tx.clone();
+        let session = SessionEntry {
+            connection_id: Uuid::new_v4(),
+            tx,
+        };
+        let message = ControlMessage::Heartbeat {
+            version: PROTOCOL_VERSION,
+            latency_ms: 0,
+        };
+        let _ = send_tx.try_send(Message::Text(String::from("first").into()));
+        let started = Instant::now();
+        assert!(
+            !send_control_to_session(&session, &message, Some(StdDuration::from_millis(50))).await,
+            "timed send must fail once the deadline passes"
+        );
+        assert!(started.elapsed() >= StdDuration::from_millis(40));
+        assert!(started.elapsed() < StdDuration::from_secs(1));
     }
 
     #[tokio::test]
@@ -3682,23 +3779,17 @@ async fn bridge_public_connection(
         // `StreamOpen`.
         return;
     }
-    if session
-        .tx
-        .send(Message::Text(
-            String::from_utf8(
-                encode(&ControlMessage::StreamOpen {
-                    stream_id: id.to_string(),
-                    tunnel_id: tunnel.id.to_string(),
-                    data_channel: channel_id,
-                })
-                .unwrap(),
-            )
-            .unwrap()
-            .into(),
-        ))
-        .await
-        .is_err()
-    {
+    // StreamOpen must be queued or the agent never learns about the stream;
+    // wait briefly for queue space, but never hang the bridge on a congested
+    // control socket.
+    let open = ControlMessage::StreamOpen {
+        stream_id: id.to_string(),
+        tunnel_id: tunnel.id.to_string(),
+        data_channel: channel_id,
+    };
+    if !send_control_to_session(&session, &open, Some(STREAM_OPEN_SEND_TIMEOUT)).await {
+        // The control queue stayed full or the session died; drop the stream
+        // entry so no orphan registration is left behind.
         state.plane.streams.write().await.remove(&id);
         return;
     }
