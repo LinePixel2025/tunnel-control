@@ -1,8 +1,11 @@
-import { FormEvent, useEffect, useState } from "react";
-import { Activity, Cable, Check, CirclePlus, Computer, Copy, FlaskConical, KeyRound, LogIn, Pencil, Power, RefreshCw, ScrollText, Settings, ShieldCheck, Trash2, UserPlus, X } from "lucide-react";
+import { FormEvent, ReactNode, useEffect, useState } from "react";
+import {
+  Activity, Cable, Check, CirclePlus, Computer, Copy, FlaskConical, KeyRound,
+  LogIn, Pencil, Power, RefreshCw, ScrollText, Settings, ShieldCheck, Trash2,
+  UserPlus, X,
+} from "lucide-react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
-import "./keys.css";
 
 const API = import.meta.env.VITE_API_URL ?? "/api/v1";
 type Summary = { devices: number; online_devices: number; tunnels: number; active_connections: number };
@@ -16,9 +19,10 @@ type DeviceOverrides = { server_url: string | null; data_channels: number | null
 type DeviceSettings = { device_name: string; settings: AgentDefaults & { device_name: string }; overrides: DeviceOverrides };
 type Enrollment = { id: string; device_name: string; status: string; created_at: string; expires_at: string };
 type LogEntry = { id: string; actor_id: string | null; actor_email: string | null; action: string; subject: string; created_at: string };
-type View = "overview" | "tunnels" | "devices" | "enrollments" | "keys" | "settings" | "logs";
 
-const viewTitle: Record<View, string> = { overview: "隧道运营", tunnels: "公网隧道", devices: "Windows 设备", enrollments: "设备注册", keys: "接入密钥", settings: "系统设置", logs: "操作日志" };
+type View = "overview" | "access" | "system";
+
+const viewTitle: Record<View, string> = { overview: "运营总览", access: "接入管理", system: "系统设置" };
 const keyStatusLabel: Record<AccessKey["status"], string> = { active: "有效", expired: "已过期", revoked: "已撤销" };
 const actionLabels: Record<string, string> = {
   "auth.login": "登录成功",
@@ -40,6 +44,8 @@ const actionLabels: Record<string, string> = {
   "device.deleted": "删除设备",
 };
 const formatDate = (value: string | null) => (value ? new Date(value).toLocaleString() : "—");
+const tunnelStatusLabel = (tunnel: Tunnel) =>
+  !tunnel.enabled ? "已停用" : tunnel.status === "ready" ? "运行中" : "设备离线";
 
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem("tunnel-admin-token") ?? "");
@@ -75,9 +81,18 @@ function App() {
   };
   const refresh = async () => {
     try {
-      const [nextSummary, nextDevices, nextTunnels, nextKeys, nextEnrollments, nextLogs] = await Promise.all([request<Summary>("/summary"), request<Device[]>("/devices"), request<Tunnel[]>("/tunnels"), request<AccessKey[]>("/keys"), request<Enrollment[]>("/enrollments"), request<LogEntry[]>("/logs")]);
+      const [nextSummary, nextDevices, nextTunnels, nextKeys, nextEnrollments, nextLogs] = await Promise.all([
+        request<Summary>("/summary"),
+        request<Device[]>("/devices"),
+        request<Tunnel[]>("/tunnels"),
+        request<AccessKey[]>("/keys"),
+        request<Enrollment[]>("/enrollments"),
+        request<LogEntry[]>("/logs"),
+      ]);
       setSummary(nextSummary); setDevices(nextDevices); setTunnels(nextTunnels); setKeys(nextKeys); setEnrollments(nextEnrollments); setLogs(nextLogs); setError("");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法连接管理服务"); }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法连接管理服务");
+    }
   };
   const loadSettings = async () => {
     try {
@@ -139,6 +154,7 @@ function App() {
     try {
       await request<{ rotated: boolean }>(`/devices/${editingSettingsDevice.id}/rotate-token`, { method: "POST" });
       setError("");
+      refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "轮换令牌失败");
     }
@@ -233,9 +249,7 @@ function App() {
     const deviceId = String(form.get("device_id") ?? "");
     const expiry = String(form.get("expires_in_days") ?? "keep");
     const body: Record<string, unknown> = { label: String(form.get("label") ?? ""), device_id: deviceId || null };
-    if (expiry === "keep") { /* keep the current expiry setting */ }
-    else if (expiry === "") body.expires_in_days = 0;
-    else body.expires_in_days = Number(expiry);
+    if (expiry !== "keep") body.expires_in_days = expiry === "" ? 0 : Number(expiry);
     try {
       await request<AccessKey>(`/keys/${editingKey.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       setEditingKey(null); refresh();
@@ -249,64 +263,290 @@ function App() {
     if (!window.confirm(`确定删除接入密钥「${key.label}」吗？删除后该令牌立即失效且不可恢复。`)) return;
     try { await request<{ deleted: boolean }>(`/keys/${key.id}`, { method: "DELETE" }); refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败"); }
   };
-  return <div className="app-shell"><aside><div className="brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel<br/><b>Control</b></span></div><nav><button type="button" className={activeView === "overview" ? "nav-active" : ""} aria-current={activeView === "overview" ? "page" : undefined} onClick={() => setActiveView("overview")}><Activity size={17}/>运营概览</button><button type="button" className={activeView === "tunnels" ? "nav-active" : ""} aria-current={activeView === "tunnels" ? "page" : undefined} onClick={() => setActiveView("tunnels")}><Cable size={17}/>公网隧道</button><button type="button" className={activeView === "devices" ? "nav-active" : ""} aria-current={activeView === "devices" ? "page" : undefined} onClick={() => setActiveView("devices")}><Computer size={17}/>Windows 设备</button><button type="button" className={activeView === "enrollments" ? "nav-active" : ""} aria-current={activeView === "enrollments" ? "page" : undefined} onClick={() => setActiveView("enrollments")}><UserPlus size={17}/>设备注册</button><button type="button" className={activeView === "keys" ? "nav-active" : ""} aria-current={activeView === "keys" ? "page" : undefined} onClick={() => setActiveView("keys")}><KeyRound size={17}/>接入密钥</button><button type="button" className={activeView === "settings" ? "nav-active" : ""} aria-current={activeView === "settings" ? "page" : undefined} onClick={() => setActiveView("settings")}><Settings size={17}/>系统设置</button><button type="button" className={activeView === "logs" ? "nav-active" : ""} aria-current={activeView === "logs" ? "page" : undefined} onClick={() => setActiveView("logs")}><ScrollText size={17}/>操作日志</button></nav><div className="secure"><ShieldCheck size={16}/><span>管理控制面<br/><b>管理员会话已验证</b></span></div></aside><main><header><div><p className="eyebrow">默认工作区</p><h1>{viewTitle[activeView]}</h1></div><div className="header-actions"><span className="online-dot"/>服务运行中<button className="icon-button" title="刷新数据" onClick={refresh}><RefreshCw size={16}/></button><button className="text-button" onClick={() => { localStorage.removeItem("tunnel-admin-token"); setToken(""); }}>退出</button></div></header>{error && <div className="notice"><b>连接提示</b>{error}</div>}{activeView !== "settings" && activeView !== "enrollments" && activeView !== "logs" && <section className="metrics"><Metric label="在线设备" value={`${summary?.online_devices ?? 0} / ${summary?.devices ?? 0}`} icon={<Computer size={21}/>}/><Metric label="启用隧道" value={`${tunnels.filter(t => t.enabled).length}`} icon={<Cable size={21}/>}/><Metric label="活动连接" value={`${summary?.active_connections ?? 0}`} icon={<Activity size={21}/>}/></section>}{activeView !== "devices" && activeView !== "enrollments" && activeView !== "keys" && activeView !== "settings" && activeView !== "logs" && <TunnelsPanel tunnels={tunnels} devices={devices} onToggle={toggle} onEdit={setEditingTunnel} onDelete={deleteTunnel} onCreate={() => setShowForm(true)} onProbe={probeTunnel} testingId={testingId} probeResult={probeResult}/>}{activeView !== "tunnels" && activeView !== "enrollments" && activeView !== "keys" && activeView !== "settings" && activeView !== "logs" && <DevicesPanel devices={devices} goKeys={() => setActiveView("keys")} onSettings={loadDeviceSettings} onDelete={deleteDevice}/>}{activeView === "devices" && <DevicesPanel devices={devices} goKeys={() => setActiveView("keys")} onSettings={loadDeviceSettings} onDelete={deleteDevice}/>}{activeView === "enrollments" && <EnrollmentsPanel enrollments={enrollments} message={enrollmentMessage} onApprove={approveEnrollment} onDeny={denyEnrollment}/>}{activeView === "keys" && <KeysPanel keys={keys} onCreate={() => setShowKeyForm(true)} onEdit={setEditingKey} onDelete={deleteKey} onRevoke={revokeKey}/>}{activeView === "settings" && <SettingsPanel settings={settings} onSave={saveSettings}/>}{activeView === "logs" && <LogsPanel logs={logs}/>}</main>{(showForm || editingTunnel) && <TunnelForm devices={devices} tunnel={editingTunnel ?? undefined} onClose={() => { setShowForm(false); setEditingTunnel(null); }} onSubmit={editingTunnel ? updateTunnel : createTunnel}/>}{(showKeyForm || editingKey) && <KeyForm devices={devices} accessKey={editingKey ?? undefined} onClose={() => { setShowKeyForm(false); setEditingKey(null); }} onSubmit={editingKey ? updateKey : createKey}/>}{createdKey && <KeyCreatedModal token={createdKey.token} onClose={() => setCreatedKey(null)}/>}{editingSettingsDevice && deviceSettings && <DeviceSettingsModal device={editingSettingsDevice} data={deviceSettings} onClose={() => { setEditingSettingsDevice(null); setDeviceSettings(null); }} onSave={saveDeviceSettings} onRotate={rotateToken}/>}</div>;
+
+  const pendingEnrollments = enrollments.length;
+  return (
+    <div className="app-shell">
+      <aside>
+        <div className="brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel<br/><b>Control</b></span></div>
+        <nav>
+          <p className="nav-label">运行管理</p>
+          <button type="button" className={activeView === "overview" ? "nav-active" : ""} aria-current={activeView === "overview" ? "page" : undefined} onClick={() => setActiveView("overview")}><Activity size={17}/>运营总览</button>
+          <button type="button" className={activeView === "access" ? "nav-active" : ""} aria-current={activeView === "access" ? "page" : undefined} onClick={() => setActiveView("access")}><KeyRound size={17}/>接入管理{pendingEnrollments > 0 && <span className="nav-badge">{pendingEnrollments}</span>}</button>
+          <p className="nav-label">系统</p>
+          <button type="button" className={activeView === "system" ? "nav-active" : ""} aria-current={activeView === "system" ? "page" : undefined} onClick={() => setActiveView("system")}><Settings size={17}/>系统设置</button>
+        </nav>
+        <div className="secure"><ShieldCheck size={16}/><span>管理控制面<br/><b>管理员会话已验证</b></span></div>
+      </aside>
+      <main>
+        <header>
+          <div><p className="eyebrow">默认工作区</p><h1>{viewTitle[activeView]}</h1></div>
+          <div className="header-actions"><span className="online-dot"/>服务运行中<button className="icon-button" title="刷新数据" onClick={refresh}><RefreshCw size={16}/></button><button className="text-button" onClick={() => { localStorage.removeItem("tunnel-admin-token"); setToken(""); }}>退出</button></div>
+        </header>
+        {error && <div className="notice"><b>连接提示</b>{error}</div>}
+        {activeView === "overview" && <OverviewPage summary={summary} tunnels={tunnels} devices={devices} enrollments={enrollments.length} onToggle={toggle} onEdit={setEditingTunnel} onDelete={deleteTunnel} onCreate={() => setShowForm(true)} onProbe={probeTunnel} testingId={testingId} probeResult={probeResult} onSettings={loadDeviceSettings} onDeleteDevice={deleteDevice} onGoAccess={() => setActiveView("access")}/>}
+        {activeView === "access" && <AccessPage keys={keys} enrollments={enrollments} message={enrollmentMessage} onCreateKey={() => setShowKeyForm(true)} onEditKey={setEditingKey} onDeleteKey={deleteKey} onRevokeKey={revokeKey} onApprove={approveEnrollment} onDeny={denyEnrollment}/>}
+        {activeView === "system" && <SystemPage settings={settings} logs={logs} onSave={saveSettings}/>}
+      </main>
+      {(showForm || editingTunnel) && <TunnelForm devices={devices} tunnel={editingTunnel ?? undefined} onClose={() => { setShowForm(false); setEditingTunnel(null); }} onSubmit={editingTunnel ? updateTunnel : createTunnel}/>}
+      {(showKeyForm || editingKey) && <KeyForm devices={devices} accessKey={editingKey ?? undefined} onClose={() => { setShowKeyForm(false); setEditingKey(null); }} onSubmit={editingKey ? updateKey : createKey}/>}
+      {createdKey && <KeyCreatedModal token={createdKey.token} onClose={() => setCreatedKey(null)}/>}
+      {editingSettingsDevice && deviceSettings && <DeviceSettingsDrawer device={editingSettingsDevice} data={deviceSettings} onClose={() => { setEditingSettingsDevice(null); setDeviceSettings(null); }} onSave={saveDeviceSettings} onRotate={rotateToken}/>}
+    </div>
+  );
 }
-function Login({ onAuthenticated }: { onAuthenticated: (token: string) => void }) { const [error, setError] = useState(""); const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const values = new FormData(event.currentTarget); const response = await fetch(`${API}/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: values.get("email"), password: values.get("password") }) }); if (!response.ok) { setError("邮箱或密码不正确，或管理服务暂不可用。"); return; } onAuthenticated((await response.json()).access_token); }; return <div className="login-page"><form className="login" onSubmit={submit}><div className="brand login-brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel <b>Control</b></span></div><h1>管理员登录</h1><p>使用部署时创建的管理账号进入控制台。</p>{error && <div className="notice">{error}</div>}<label>邮箱<input name="email" type="email" required autoComplete="username" placeholder="admin@example.com"/></label><label>密码<input name="password" type="password" required autoComplete="current-password"/></label><button className="primary login-submit"><LogIn size={16}/>登录</button></form></div>; }
-function Metric({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) { return <div className="metric"><div><p>{label}</p><strong>{value}</strong></div>{icon}</div>; }
-function Empty({ onCreate }: { onCreate: () => void }) { return <div className="empty"><span className="empty-icon"><Cable size={22}/></span><h3>还没有公网入口</h3><p>选择已连接的 Windows 设备，为本地服务分配一个对外端口。</p><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建隧道</button></div>; }
-function TunnelsPanel({ tunnels, devices, onToggle, onEdit, onDelete, onCreate, onProbe, testingId, probeResult }: { tunnels: Tunnel[]; devices: Device[]; onToggle: (id: string) => void; onEdit: (tunnel: Tunnel) => void; onDelete: (tunnel: Tunnel) => void; onCreate: () => void; onProbe: (id: string) => void; testingId: string | null; probeResult: ProbeResult | null }) {
-  return <section className="panel"><div className="panel-heading"><div><h2>公网隧道</h2><p>由管理员分配端口，并转发到指定 Windows 设备的本地服务。</p></div><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建隧道</button></div>{probeResult && <div className={`probe ${probeResult.ok ? "ok" : "fail"}`}><b>{probeResult.ok ? "连接正常" : "连接失败"}</b><span>{probeResult.message ?? ""}</span></div>}{tunnels.length ? <div className="table"><div className="row label"><span>名称</span><span>公网入口</span><span>本地目标</span><span>设备</span><span>状态</span><span/></div>{tunnels.map(tunnel => <div className="row" key={tunnel.id}><b>{tunnel.name}<small>{tunnel.kind.toUpperCase()}</small></b><code>:{tunnel.public_port}</code><code>{tunnel.local_host}:{tunnel.local_port}</code><span>{devices.find(device => device.id === tunnel.device_id)?.name ?? "未知设备"}</span><span className={`status ${tunnel.enabled ? "ready" : "off"}`}>{tunnel.enabled ? tunnel.status : "已停用"}</span><div className="row-actions"><button className="icon-button" title="测试连接" disabled={testingId === tunnel.id} onClick={() => onProbe(tunnel.id)}>{testingId === tunnel.id ? <RefreshCw size={16} className="spin"/> : <FlaskConical size={16}/>}</button><button className="icon-button" title={tunnel.enabled ? "停用隧道" : "启用隧道"} onClick={() => onToggle(tunnel.id)}><Power size={16}/></button><button className="icon-button" title="编辑隧道" onClick={() => onEdit(tunnel)}><Pencil size={16}/></button><button className="icon-button danger" title="删除隧道" onClick={() => onDelete(tunnel)}><Trash2 size={16}/></button></div></div>)}</div> : <Empty onCreate={onCreate}/>}</section>;
+
+function Login({ onAuthenticated }: { onAuthenticated: (token: string) => void }) {
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const values = new FormData(event.currentTarget);
+    const response = await fetch(`${API}/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: values.get("email"), password: values.get("password") }) });
+    if (!response.ok) { setError("邮箱或密码不正确，或管理服务暂不可用。"); return; }
+    onAuthenticated((await response.json()).access_token);
+  };
+  return (
+    <div className="login-page"><form className="login" onSubmit={submit}><div className="brand login-brand"><span className="brand-mark"><Cable size={20}/></span><span>Tunnel <b>Control</b></span></div><h1>管理员登录</h1><p>使用部署时创建的管理账号进入控制台。</p>{error && <div className="notice">{error}</div>}<label>邮箱<input name="email" type="email" required autoComplete="username" placeholder="admin@example.com"/></label><label>密码<input name="password" type="password" required autoComplete="current-password"/></label><button className="primary login-submit"><LogIn size={16}/>登录</button></form></div>
+  );
 }
-function DevicesPanel({ devices, goKeys, onSettings, onDelete }: { devices: Device[]; goKeys: () => void; onSettings: (device: Device) => void; onDelete: (device: Device) => void }) {
-  return <section className="panel devices-panel"><div className="panel-heading"><div><h2>设备状态</h2><p>设备需使用管理面板创建的接入密钥连接；点击设置可控制该设备的全部运行参数。</p></div></div>{devices.length ? devices.map(device => <div className="device" key={device.id}><span className={`device-dot ${device.status}`}/><div><b>{device.name}</b><p>{device.id.slice(0, 8)} · {device.latency_ms} ms</p></div><span className={`status ${device.status === "online" ? "ready" : "off"}`}>{device.status === "online" ? "在线" : "离线"}</span><button className="text-button" onClick={() => onSettings(device)}><Settings size={15}/>设置</button><button className="text-button danger-text" title="删除设备" onClick={() => onDelete(device)}><Trash2 size={15}/>删除</button></div>) : <div className="device-empty">尚无设备。请先在「设备注册」页批准代理的注册请求，或在「接入密钥」页创建密钥。<button className="text-button" onClick={goKeys}>去创建密钥</button></div>}</section>;
+
+function Metric({ label, value, hint, icon }: { label: string; value: string; hint?: string; icon: ReactNode }) {
+  return (
+    <div className="metric"><div><p>{label}</p><strong>{value}</strong>{hint && <small>{hint}</small>}</div><span className="metric-icon">{icon}</span></div>
+  );
 }
-function KeysPanel({ keys, onCreate, onEdit, onRevoke, onDelete }: { keys: AccessKey[]; onCreate: () => void; onEdit: (key: AccessKey) => void; onRevoke: (key: AccessKey) => void; onDelete: (key: AccessKey) => void }) {
-  return <section className="panel"><div className="panel-heading"><div><h2>接入密钥</h2><p>密钥用于客户端连接控制通道；未绑定设备的密钥在首次连接时自动注册设备。</p></div><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建密钥</button></div>{keys.length ? <div className="table keys-table"><div className="row label"><span>名称</span><span>设备</span><span>状态</span><span>创建时间</span><span>过期时间</span><span>最后使用</span><span/></div>{keys.map(key => <div className="row" key={key.id}><b>{key.label}</b><span>{key.device_name ?? "未绑定"}</span><span className={`status ${key.status === "active" ? "ready" : "off"}`}>{keyStatusLabel[key.status]}</span><span>{formatDate(key.created_at)}</span><span>{key.expires_at ? formatDate(key.expires_at) : "不过期"}</span><span>{formatDate(key.last_used_at)}</span><div className="row-actions"><button className="icon-button" title="撤销密钥" disabled={key.status !== "active"} onClick={() => onRevoke(key)}><Power size={16}/></button><button className="icon-button" title="编辑密钥" onClick={() => onEdit(key)}><Pencil size={16}/></button><button className="icon-button danger" title="删除密钥" onClick={() => onDelete(key)}><Trash2 size={16}/></button></div></div>)}</div> : <div className="device-empty">尚未创建接入密钥。创建后把令牌填入 Windows 客户端即可连接。</div>}</section>;
+
+function OverviewPage({ summary, tunnels, devices, enrollments, onToggle, onEdit, onDelete, onCreate, onProbe, testingId, probeResult, onSettings, onDeleteDevice, onGoAccess }: {
+  summary: Summary | undefined; tunnels: Tunnel[]; devices: Device[]; enrollments: number;
+  onToggle: (id: string) => void; onEdit: (tunnel: Tunnel) => void; onDelete: (tunnel: Tunnel) => void; onCreate: () => void;
+  onProbe: (id: string) => void; testingId: string | null; probeResult: ProbeResult | null;
+  onSettings: (device: Device) => void; onDeleteDevice: (device: Device) => void; onGoAccess: () => void;
+}) {
+  return (
+    <>
+      <section className="metrics">
+        <Metric label="在线设备" value={`${summary?.online_devices ?? 0} / ${summary?.devices ?? 0}`} hint="总设备数" icon={<Computer size={19}/>}/>
+        <Metric label="启用隧道" value={`${tunnels.filter(t => t.enabled).length}`} hint={`共 ${tunnels.length} 条隧道`} icon={<Cable size={19}/>}/>
+        <Metric label="活动连接" value={`${summary?.active_connections ?? 0}`} hint="实时连接数" icon={<Activity size={19}/>}/>
+        <Metric label="待审批注册" value={`${enrollments}`} hint={enrollments ? "需要处理" : "无待办"} icon={<UserPlus size={19}/>}/>
+      </section>
+      <TunnelsPanel tunnels={tunnels} devices={devices} onToggle={onToggle} onEdit={onEdit} onDelete={onDelete} onCreate={onCreate} onProbe={onProbe} testingId={testingId} probeResult={probeResult}/>
+      <DevicesPanel devices={devices} tunnels={tunnels} onSettings={onSettings} onDelete={onDeleteDevice} onGoAccess={onGoAccess}/>
+    </>
+  );
 }
-function KeyForm({ devices, accessKey, onClose, onSubmit }: { devices: Device[]; accessKey?: AccessKey; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <div className="modal-backdrop"><form className="modal" onSubmit={onSubmit}><div className="modal-head"><div><p className="eyebrow">管理员操作</p><h2>{accessKey ? "编辑接入密钥" : "新建接入密钥"}</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><label>名称<input required name="label" maxLength={100} defaultValue={accessKey?.label} placeholder="例如：研发笔记本"/></label><label>绑定设备<select name="device_id" defaultValue={accessKey?.device_id ?? ""}><option value="">未绑定（首次连接时自动注册设备）</option>{devices.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label><label>有效期<select name="expires_in_days" defaultValue={accessKey ? "keep" : ""}>{accessKey && <option value="keep">保持当前设置</option>}<option value="">不过期</option><option value="7">7 天</option><option value="30">30 天</option><option value="90">90 天</option><option value="365">365 天</option></select></label><div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button className="primary" type="submit">{accessKey ? "保存修改" : "创建密钥"}</button></div></form></div>;
+
+function AccessPage({ keys, enrollments, message, onCreateKey, onEditKey, onDeleteKey, onRevokeKey, onApprove, onDeny }: {
+  keys: AccessKey[]; enrollments: Enrollment[]; message: string;
+  onCreateKey: () => void; onEditKey: (key: AccessKey) => void; onDeleteKey: (key: AccessKey) => void; onRevokeKey: (key: AccessKey) => void;
+  onApprove: (enrollment: Enrollment, code: string) => void; onDeny: (enrollment: Enrollment) => void;
+}) {
+  return (
+    <>
+      <KeysPanel keys={keys} onCreate={onCreateKey} onEdit={onEditKey} onRevoke={onRevokeKey} onDelete={onDeleteKey}/>
+      <EnrollmentsPanel enrollments={enrollments} message={message} onApprove={onApprove} onDeny={onDeny}/>
+    </>
+  );
 }
-function KeyCreatedModal({ token, onClose }: { token: string; onClose: () => void }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => { try { await navigator.clipboard.writeText(token); setCopied(true); } catch { /* clipboard unavailable */ } };
-  return <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true"><div className="modal-head"><div><p className="eyebrow">密钥已创建</p><h2>请立即保存</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><p className="key-hint">令牌只显示这一次，关闭后将无法再次查看，请先复制并妥善保存。</p><div className="key-token"><code>{token}</code><button type="button" className="text-button" onClick={copy}>{copied ? <Check size={15}/> : <Copy size={15}/>}{copied ? "已复制" : "复制"}</button></div><div className="modal-actions"><button className="primary" type="button" onClick={onClose}>我已完成保存</button></div></div></div>;
+
+function SystemPage({ settings, logs, onSave }: { settings: SettingsData; logs: LogEntry[]; onSave: (event: FormEvent<HTMLFormElement>) => void }) {
+  return (
+    <>
+      <SettingsPanel settings={settings} onSave={onSave}/>
+      <LogsPanel logs={logs}/>
+    </>
+  );
 }
-function EnrollmentsPanel({ enrollments, message, onApprove, onDeny }: { enrollments: Enrollment[]; message: string; onApprove: (enrollment: Enrollment, code: string) => void; onDeny: (enrollment: Enrollment) => void }) {
-  return <section className="panel"><div className="panel-heading"><div><h2>设备注册</h2><p>代理首次运行会在本机显示一次性注册码；管理员输入注册码批准后，服务器生成令牌并直接下发给该设备。</p></div></div>{message && <div className="notice">{message}</div>}{enrollments.length ? <div className="table"><div className="row label"><span>设备名称</span><span>请求时间</span><span>过期时间</span><span>注册码</span><span/></div>{enrollments.map(enrollment => <EnrollmentRow key={enrollment.id} enrollment={enrollment} onApprove={onApprove} onDeny={onDeny}/>)}</div> : <div className="device-empty">暂无待审批的注册请求。在 Windows 设备上运行 tunnel-agent.exe 后，注册码会出现在这里。</div>}</section>;
+
+function Empty({ onCreate }: { onCreate: () => void }) {
+  return <div className="empty"><span className="empty-icon"><Cable size={22}/></span><h3>还没有公网入口</h3><p>选择已连接的 Windows 设备，为本地服务分配一个对外端口。</p><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建隧道</button></div>;
 }
-function EnrollmentRow({ enrollment, onApprove, onDeny }: { enrollment: Enrollment; onApprove: (enrollment: Enrollment, code: string) => void; onDeny: (enrollment: Enrollment) => void }) {
+
+function TunnelsPanel({ tunnels, devices, onToggle, onEdit, onDelete, onCreate, onProbe, testingId, probeResult }: {
+  tunnels: Tunnel[]; devices: Device[]; onToggle: (id: string) => void; onEdit: (tunnel: Tunnel) => void; onDelete: (tunnel: Tunnel) => void;
+  onCreate: () => void; onProbe: (id: string) => void; testingId: string | null; probeResult: ProbeResult | null;
+}) {
+  return (
+    <section className="panel">
+      <div className="panel-heading"><div><h2>公网隧道</h2><p>由管理员分配端口，并转发到指定 Windows 设备的本地服务。</p></div><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建隧道</button></div>
+      {probeResult && <div className={`probe ${probeResult.ok ? "ok" : "fail"}`}><b>{probeResult.ok ? "连接正常" : "连接失败"}</b><span>{probeResult.message ?? ""}</span></div>}
+      {tunnels.length ? (
+        <div className="table tunnels-table">
+          <div className="row label"><span>名称</span><span>公网入口</span><span>本地目标</span><span>设备</span><span>状态</span><span>连接</span><span/></div>
+          {tunnels.map(tunnel => (
+            <div className="row" key={tunnel.id}>
+              <b>{tunnel.name}<small>{tunnel.kind.toUpperCase()}</small></b>
+              <code>:{tunnel.public_port}</code>
+              <code>{tunnel.local_host}:{tunnel.local_port}</code>
+              <span>{devices.find(device => device.id === tunnel.device_id)?.name ?? "未知设备"}</span>
+              <span className={`status ${tunnel.enabled ? (tunnel.status === "ready" ? "ready" : "warn") : "off"}`}>{tunnelStatusLabel(tunnel)}</span>
+              <span className="conn">{tunnel.enabled ? `${tunnel.connections} / ${tunnel.max_connections}` : "—"}</span>
+              <div className="row-actions">
+                <button className="icon-button" title="测试连接" disabled={testingId === tunnel.id} onClick={() => onProbe(tunnel.id)}>{testingId === tunnel.id ? <RefreshCw size={16} className="spin"/> : <FlaskConical size={16}/>}</button>
+                <button className="icon-button" title={tunnel.enabled ? "停用隧道" : "启用隧道"} onClick={() => onToggle(tunnel.id)}><Power size={16}/></button>
+                <button className="icon-button" title="编辑隧道" onClick={() => onEdit(tunnel)}><Pencil size={16}/></button>
+                <button className="icon-button danger" title="删除隧道" onClick={() => onDelete(tunnel)}><Trash2 size={16}/></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : <Empty onCreate={onCreate}/>}
+    </section>
+  );
+}
+
+function DevicesPanel({ devices, tunnels, onSettings, onDelete, onGoAccess }: {
+  devices: Device[]; tunnels: Tunnel[]; onSettings: (device: Device) => void; onDelete: (device: Device) => void; onGoAccess: () => void;
+}) {
+  return (
+    <section className="panel devices-panel">
+      <div className="panel-heading"><div><h2>设备状态</h2><p>设备需使用接入密钥连接；点击「设置」可控制该设备的全部运行参数。</p></div></div>
+      {devices.length ? devices.map(device => {
+        const tunnelCount = tunnels.filter(tunnel => tunnel.device_id === device.id).length;
+        return (
+          <div className="device" key={device.id}>
+            <span className={`device-dot ${device.status}`}/>
+            <div className="device-main"><b>{device.name}</b><p>{device.id.slice(0, 8)} · 延迟 {device.latency_ms} ms</p></div>
+            <span className="device-tunnels"><Cable size={13}/>{tunnelCount} 条隧道</span>
+            <span className={`status ${device.status === "online" ? "ready" : "off"}`}>{device.status === "online" ? "在线" : "离线"}</span>
+            <button className="text-button" onClick={() => onSettings(device)}><Settings size={15}/>设置</button>
+            <button className="text-button danger-text" title="删除设备" onClick={() => onDelete(device)}><Trash2 size={15}/>删除</button>
+          </div>
+        );
+      }) : <div className="device-empty">尚无设备。请先在「接入管理」页批准代理的注册请求，或创建接入密钥。<button className="text-button" onClick={onGoAccess}>前往接入管理</button></div>}
+    </section>
+  );
+}
+
+function KeysPanel({ keys, onCreate, onEdit, onRevoke, onDelete }: {
+  keys: AccessKey[]; onCreate: () => void; onEdit: (key: AccessKey) => void; onRevoke: (key: AccessKey) => void; onDelete: (key: AccessKey) => void;
+}) {
+  const activeCount = keys.filter(key => key.status === "active").length;
+  return (
+    <section className="panel">
+      <div className="panel-heading"><div><h2>接入密钥</h2><p>密钥用于客户端连接控制通道；未绑定设备的密钥在首次连接时自动注册设备。当前有效 {activeCount} 个。</p></div><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建密钥</button></div>
+      {keys.length ? (
+        <div className="table keys-table">
+          <div className="row label"><span>名称</span><span>设备</span><span>状态</span><span>创建时间</span><span>过期时间</span><span>最后使用</span><span/></div>
+          {keys.map(key => (
+            <div className="row" key={key.id}>
+              <b>{key.label}</b>
+              <span>{key.device_name ?? "未绑定"}</span>
+              <span className={`status ${key.status === "active" ? "ready" : "off"}`}>{keyStatusLabel[key.status]}</span>
+              <span>{formatDate(key.created_at)}</span>
+              <span>{key.expires_at ? formatDate(key.expires_at) : "不过期"}</span>
+              <span>{formatDate(key.last_used_at)}</span>
+              <div className="row-actions">
+                <button className="icon-button" title="撤销密钥" disabled={key.status !== "active"} onClick={() => onRevoke(key)}><Power size={16}/></button>
+                <button className="icon-button" title="编辑密钥" onClick={() => onEdit(key)}><Pencil size={16}/></button>
+                <button className="icon-button danger" title="删除密钥" onClick={() => onDelete(key)}><Trash2 size={16}/></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : <div className="device-empty">尚未创建接入密钥。创建后把令牌填入 Windows 客户端即可连接。</div>}
+    </section>
+  );
+}
+
+function EnrollmentsPanel({ enrollments, message, onApprove, onDeny }: {
+  enrollments: Enrollment[]; message: string; onApprove: (enrollment: Enrollment, code: string) => void; onDeny: (enrollment: Enrollment) => void;
+}) {
+  return (
+    <section className="panel">
+      <div className="panel-heading"><div><h2>待审批注册</h2><p>代理首次运行会在本机显示一次性注册码；管理员输入注册码批准后，服务器生成令牌并直接下发给该设备。</p></div></div>
+      {message && <div className="notice">{message}</div>}
+      {enrollments.length ? (
+        <div className="table enroll-table">
+          <div className="row label"><span>设备名称</span><span>请求时间</span><span>过期时间</span><span>注册码</span><span/></div>
+          {enrollments.map(enrollment => <EnrollmentRow key={enrollment.id} enrollment={enrollment} onApprove={onApprove} onDeny={onDeny}/>)}
+        </div>
+      ) : <div className="device-empty">暂无待审批的注册请求。在 Windows 设备上运行 tunnel-agent.exe 后，注册码会出现在这里。</div>}
+    </section>
+  );
+}
+
+function EnrollmentRow({ enrollment, onApprove, onDeny }: {
+  enrollment: Enrollment; onApprove: (enrollment: Enrollment, code: string) => void; onDeny: (enrollment: Enrollment) => void;
+}) {
   const [code, setCode] = useState("");
-  return <div className="row" key={enrollment.id}><span>{enrollment.device_name}</span><span>{formatDate(enrollment.created_at)}</span><span>{formatDate(enrollment.expires_at)}</span><span><input className="enroll-code" placeholder="8位注册码" maxLength={8} spellCheck={false} value={code} onChange={event => setCode(event.target.value.toUpperCase())}/></span><div className="row-actions"><button className="icon-button" title="批准注册（输入注册码）" disabled={code.length !== 8} onClick={() => onApprove(enrollment, code)}><Check size={16}/></button><button className="icon-button danger" title="拒绝注册" onClick={() => onDeny(enrollment)}><X size={16}/></button></div></div>;
+  return (
+    <div className="row" key={enrollment.id}>
+      <span>{enrollment.device_name}</span>
+      <span>{formatDate(enrollment.created_at)}</span>
+      <span>{formatDate(enrollment.expires_at)}</span>
+      <span><input className="enroll-code" placeholder="8位注册码" maxLength={8} spellCheck={false} value={code} onChange={event => setCode(event.target.value.toUpperCase())}/></span>
+      <div className="row-actions">
+        <button className="icon-button" title="批准注册（输入注册码）" disabled={code.length !== 8} onClick={() => onApprove(enrollment, code)}><Check size={16}/></button>
+        <button className="icon-button danger" title="拒绝注册" onClick={() => onDeny(enrollment)}><X size={16}/></button>
+      </div>
+    </div>
+  );
 }
-type OverrideField = { key: keyof DeviceOverrides; label: string; kind: "text" | "number" | "select"; min?: number; max?: number };
-const overrideFields: OverrideField[] = [
-  { key: "server_url", label: "服务器地址", kind: "text" },
-  { key: "data_channels", label: "数据通道数", kind: "number", min: 1, max: 8 },
-  { key: "heartbeat_secs", label: "心跳间隔（秒）", kind: "number", min: 3, max: 60 },
-  { key: "pong_timeout_secs", label: "Pong 超时（秒）", kind: "number", min: 5, max: 300 },
-  { key: "reconnect_min_secs", label: "重连最短间隔（秒）", kind: "number", min: 1, max: 60 },
-  { key: "reconnect_max_secs", label: "重连最长间隔（秒）", kind: "number", min: 1, max: 300 },
-  { key: "log_level", label: "日志级别", kind: "select" },
+
+type OverrideField = { key: keyof DeviceOverrides; label: string; kind: "text" | "number" | "select"; min?: number; max?: number; unit?: string };
+const logLevels = ["error", "warn", "info", "debug", "trace"];
+const overrideGroups: { title: string; fields: OverrideField[] }[] = [
+  {
+    title: "连接设置",
+    fields: [
+      { key: "server_url", label: "服务器地址", kind: "text" },
+      { key: "data_channels", label: "数据通道数", kind: "number", min: 1, max: 8, unit: "通道" },
+    ],
+  },
+  {
+    title: "心跳与重连",
+    fields: [
+      { key: "heartbeat_secs", label: "心跳间隔", kind: "number", min: 3, max: 60, unit: "秒" },
+      { key: "pong_timeout_secs", label: "Pong 超时", kind: "number", min: 5, max: 300, unit: "秒" },
+      { key: "reconnect_min_secs", label: "重连最短间隔", kind: "number", min: 1, max: 60, unit: "秒" },
+      { key: "reconnect_max_secs", label: "重连最长间隔", kind: "number", min: 1, max: 300, unit: "秒" },
+    ],
+  },
+  {
+    title: "日志",
+    fields: [{ key: "log_level", label: "日志级别", kind: "select" }],
+  },
 ];
-function DeviceSettingsModal({ device, data, onClose, onSave, onRotate }: { device: Device; data: DeviceSettings; onClose: () => void; onSave: (body: { device_name?: string; overrides: DeviceOverrides }) => Promise<boolean>; onRotate: () => void }) {
+const allOverrideFields = overrideGroups.flatMap(group => group.fields);
+const formatOverrideValue = (field: OverrideField, value: string | number) => {
+  if (field.key === "server_url") return String(value) || "（未设置）";
+  return field.unit ? `${value} ${field.unit}` : String(value);
+};
+
+function DeviceSettingsDrawer({ device, data, onClose, onSave, onRotate }: {
+  device: Device; data: DeviceSettings; onClose: () => void;
+  onSave: (body: { device_name?: string; overrides: DeviceOverrides }) => Promise<boolean>; onRotate: () => void;
+}) {
   const [name, setName] = useState(data.device_name);
-  const [values, setValues] = useState<Record<string, { inherit: boolean; value: string }>>(() => {
-    const map: Record<string, { inherit: boolean; value: string }> = {};
-    for (const field of overrideFields) {
+  const [values, setValues] = useState<Record<string, { override: boolean; value: string }>>(() => {
+    const map: Record<string, { override: boolean; value: string }> = {};
+    for (const field of allOverrideFields) {
       const current = data.overrides[field.key];
-      map[field.key] = { inherit: current === null, value: current === null ? "" : String(current) };
+      const effective = data.settings[field.key as keyof DeviceSettings["settings"]];
+      map[field.key] = {
+        override: current !== null,
+        value: current === null ? String(effective) : String(current),
+      };
     }
     return map;
   });
   const [saving, setSaving] = useState(false);
-  const setField = (key: string, patch: Partial<{ inherit: boolean; value: string }>) => setValues(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
+  const setField = (key: string, patch: Partial<{ override: boolean; value: string }>) => setValues(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
+  const toggleOverride = (field: OverrideField, enabled: boolean) => setValues(prev => ({
+    ...prev,
+    [field.key]: {
+      override: enabled,
+      value: enabled ? String(data.settings[field.key as keyof DeviceSettings["settings"]]) : prev[field.key].value,
+    },
+  }));
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSaving(true);
     const overrides: DeviceOverrides = { server_url: null, data_channels: null, heartbeat_secs: null, pong_timeout_secs: null, reconnect_min_secs: null, reconnect_max_secs: null, log_level: null };
-    for (const field of overrideFields) {
+    for (const field of allOverrideFields) {
       const entry = values[field.key];
-      if (!entry.inherit) {
+      if (entry.override) {
         (overrides as Record<string, unknown>)[field.key] = field.kind === "number" ? Number(entry.value) : entry.value;
       }
     }
@@ -314,19 +554,155 @@ function DeviceSettingsModal({ device, data, onClose, onSave, onRotate }: { devi
     setSaving(false);
     if (ok) onClose();
   };
-  return <div className="modal-backdrop"><form className="modal modal-wide" onSubmit={submit}><div className="modal-head"><div><p className="eyebrow">管理员操作</p><h2>设备设置 · {device.name}</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><p className="key-hint">未勾选"继承全局默认"的字段会覆盖全局设置；修改会立即推送给在线代理。</p><label>设备名称<input value={name} maxLength={100} onChange={event => setName(event.target.value)}/></label>{overrideFields.map(field => { const entry = values[field.key]; return <div className="override-row" key={field.key}><label className="check"><input type="checkbox" checked={entry.inherit} onChange={event => setField(field.key, { inherit: event.target.checked })}/><span>继承全局默认</span></label>{field.kind === "select" ? <select disabled={entry.inherit} value={entry.value} onChange={event => setField(field.key, { value: event.target.value })}><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select> : <input disabled={entry.inherit} type={field.kind === "number" ? "number" : "text"} min={field.min} max={field.max} placeholder={String(data.settings[field.key as keyof AgentSettingsLike])} value={entry.value} onChange={event => setField(field.key, { value: event.target.value })} spellCheck={false}/>}<small>生效值：{String(data.settings[field.key as keyof AgentSettingsLike])}</small></div>; })}<div className="modal-actions"><button type="button" className="text-button danger-text" onClick={onRotate}><Power size={15}/>轮换令牌</button><button type="button" className="text-button" onClick={onClose}>取消</button><button className="primary" type="submit" disabled={saving}><Check size={16}/>{saving ? "保存中" : "保存设置"}</button></div></form></div>;
+  return (
+    <div className="drawer-backdrop" onClick={onClose}>
+      <aside className="drawer" onClick={event => event.stopPropagation()} role="dialog" aria-modal="true" aria-label={`设备设置：${device.name}`}>
+        <form onSubmit={submit}>
+          <div className="drawer-head">
+            <div><p className="eyebrow">设备配置</p><h2>{device.name}</h2></div>
+            <button type="button" className="icon-button" title="关闭" onClick={onClose}><X size={18}/></button>
+          </div>
+          <div className="drawer-meta">
+            <span className={`status ${device.status === "online" ? "ready" : "off"}`}>{device.status === "online" ? "在线" : "离线"}</span>
+            <code>{device.id}</code>
+            <span className="meta-latency">{device.latency_ms} ms</span>
+          </div>
+          <div className="drawer-body">
+            <p className="key-hint">所有设备默认继承全局默认设置；打开「覆盖」即可为这台设备单独指定。修改会立即推送给在线代理。</p>
+            <section className="drawer-section">
+              <h3>基本信息</h3>
+              <label className="field-label">设备名称<input value={name} maxLength={100} onChange={event => setName(event.target.value)} spellCheck={false}/></label>
+            </section>
+            {overrideGroups.map(group => (
+              <section className="drawer-section" key={group.title}>
+                <h3>{group.title}</h3>
+                {group.fields.map(field => {
+                  const entry = values[field.key];
+                  const effective = data.settings[field.key as keyof DeviceSettings["settings"]];
+                  return (
+                    <div className={`override-row ${entry.override ? "override-active" : ""}`} key={field.key}>
+                      <div className="override-info"><b>{field.label}{field.unit ? `（${field.unit}）` : ""}</b><small>全局默认：{formatOverrideValue(field, effective)}</small></div>
+                      <div className="override-control">
+                        {entry.override ? (
+                          field.kind === "select" ? (
+                            <select value={entry.value} onChange={event => setField(field.key, { value: event.target.value })}>
+                              {logLevels.map(level => <option key={level} value={level}>{level}</option>)}
+                            </select>
+                          ) : (
+                            <input type={field.kind === "number" ? "number" : "text"} min={field.min} max={field.max} value={entry.value} onChange={event => setField(field.key, { value: event.target.value })} spellCheck={false}/>
+                          )
+                        ) : (
+                          <div className="inherit-value"><span>{formatOverrideValue(field, entry.value)}</span><em>继承全局</em></div>
+                        )}
+                      </div>
+                      <label className="override-switch" title={entry.override ? "取消覆盖，恢复全局默认" : "为这台设备单独指定"}>
+                        <input type="checkbox" checked={entry.override} onChange={event => toggleOverride(field, event.target.checked)}/>
+                        <span className="switch-track"><span className="switch-thumb"/></span>
+                        <span>{entry.override ? "已覆盖" : "覆盖"}</span>
+                      </label>
+                    </div>
+                  );
+                })}
+              </section>
+            ))}
+            <section className="drawer-section danger-zone">
+              <h3>危险操作</h3>
+              <button type="button" className="text-button danger-text" onClick={onRotate}><Power size={15}/>轮换访问令牌</button>
+              <p>轮换后旧令牌立即失效，设备会以新令牌自动重连，无需重新注册。</p>
+            </section>
+          </div>
+          <div className="drawer-foot">
+            <button type="button" className="text-button" onClick={onClose}>取消</button>
+            <button className="primary" type="submit" disabled={saving}><Check size={16}/>{saving ? "保存中" : "保存设置"}</button>
+          </div>
+        </form>
+      </aside>
+    </div>
+  );
 }
-type AgentSettingsLike = { device_name: string } & AgentDefaults;
+
 function SettingsPanel({ settings, onSave }: { settings: SettingsData; onSave: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <section className="panel"><div className="panel-heading"><div><h2>带宽限速</h2><p>设置服务器总带宽上限（Mbps）。接近上限时所有隧道公平降速，连接保持不断开。</p></div></div><form className="settings-form" onSubmit={onSave}><div className="settings-group"><label className="check"><input name="enabled" type="checkbox" defaultChecked={settings.bandwidth_limit_mbps > 0}/><span>启用带宽限速</span></label><label className="mbps">带宽上限<input name="mbps" type="number" min="1" max="10000" defaultValue={settings.bandwidth_limit_mbps || 3}/><small>Mbps</small></label></div><div className="panel-heading"><div><h2>代理默认设置</h2><p>所有设备继承这些默认值；单个设备可在「Windows 设备」页单独覆盖。修改会立即推送给在线代理，重连类设置（服务器地址、数据通道数）由代理自动重连生效。</p></div></div><div className="settings-group"><label>服务器地址<input name="server_url" spellCheck={false} placeholder="ws://公网IP:端口/control（留空表示不修改）" defaultValue={settings.agent_defaults.server_url}/></label><label>数据通道数<input name="data_channels" type="number" min="1" max="8" defaultValue={settings.agent_defaults.data_channels}/></label></div><div className="settings-group"><label>心跳间隔（秒）<input name="heartbeat_secs" type="number" min="3" max="60" defaultValue={settings.agent_defaults.heartbeat_secs}/></label><label>Pong 超时（秒）<input name="pong_timeout_secs" type="number" min="5" max="300" defaultValue={settings.agent_defaults.pong_timeout_secs}/></label></div><div className="settings-group"><label>重连最短间隔（秒）<input name="reconnect_min_secs" type="number" min="1" max="60" defaultValue={settings.agent_defaults.reconnect_min_secs}/></label><label>重连最长间隔（秒）<input name="reconnect_max_secs" type="number" min="1" max="300" defaultValue={settings.agent_defaults.reconnect_max_secs}/></label></div><div className="settings-group"><label>日志级别<select name="log_level" defaultValue={settings.agent_defaults.log_level}><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select></label></div><div className="modal-actions"><button className="primary" type="submit"><Check size={16}/>保存设置</button></div></form></section>;
+  return (
+    <section className="panel">
+      <div className="panel-heading"><div><h2>全局设置</h2><p>服务器带宽上限与所有设备继承的默认参数；单台设备可在「运营总览」中单独覆盖。</p></div></div>
+      <form className="settings-form" onSubmit={onSave}>
+        <div className="settings-section">
+          <h3>带宽限速</h3>
+          <p>设置服务器总带宽上限（Mbps）。接近上限时所有隧道公平降速，连接保持不断开。</p>
+          <div className="bandwidth-row">
+            <label className="check"><input name="enabled" type="checkbox" defaultChecked={settings.bandwidth_limit_mbps > 0}/><span>启用带宽限速</span></label>
+            <label className="mbps">带宽上限<input name="mbps" type="number" min="1" max="10000" defaultValue={settings.bandwidth_limit_mbps || 3}/><small>Mbps</small></label>
+          </div>
+        </div>
+        <div className="settings-section">
+          <h3>代理默认设置</h3>
+          <p>所有设备继承这些默认值；修改会立即推送给在线代理，重连类设置（服务器地址、数据通道数）由代理自动重连生效。</p>
+          <div className="settings-grid">
+            <label>服务器地址<input name="server_url" spellCheck={false} placeholder="ws://公网IP:端口/control（留空表示不修改）" defaultValue={settings.agent_defaults.server_url}/></label>
+            <label>数据通道数<input name="data_channels" type="number" min="1" max="8" defaultValue={settings.agent_defaults.data_channels}/></label>
+            <label>心跳间隔（秒）<input name="heartbeat_secs" type="number" min="3" max="60" defaultValue={settings.agent_defaults.heartbeat_secs}/></label>
+            <label>Pong 超时（秒）<input name="pong_timeout_secs" type="number" min="5" max="300" defaultValue={settings.agent_defaults.pong_timeout_secs}/></label>
+            <label>重连最短间隔（秒）<input name="reconnect_min_secs" type="number" min="1" max="60" defaultValue={settings.agent_defaults.reconnect_min_secs}/></label>
+            <label>重连最长间隔（秒）<input name="reconnect_max_secs" type="number" min="1" max="300" defaultValue={settings.agent_defaults.reconnect_max_secs}/></label>
+            <label>日志级别<select name="log_level" defaultValue={settings.agent_defaults.log_level}>{logLevels.map(level => <option key={level} value={level}>{level}</option>)}</select></label>
+          </div>
+        </div>
+        <div className="form-actions"><button className="primary" type="submit"><Check size={16}/>保存设置</button></div>
+      </form>
+    </section>
+  );
 }
+
 function LogsPanel({ logs }: { logs: LogEntry[] }) {
-  return <section className="panel"><div className="panel-heading"><div><h2>操作日志</h2><p>管理端发生的事件记录，仅管理员可见。</p></div></div>{logs.length ? <div className="table logs-table"><div className="row label"><span>时间</span><span>操作者</span><span>事件</span><span>对象</span></div>{logs.map(log => (
-    <div className="row" key={log.id}><span>{formatDate(log.created_at)}</span><span>{log.actor_email ?? "—"}</span><span className={`log-action ${log.action === "auth.login_failed" ? "fail" : ""}`}>{actionLabels[log.action] ?? log.action}</span><span className="log-subject">{log.subject}</span></div>
-  ))}</div> : <div className="device-empty">暂无操作日志。登录、隧道、密钥和带宽设置操作会记录在这里。</div>}</section>;
+  const [query, setQuery] = useState("");
+  const filtered = logs.filter(log =>
+    !query ||
+    log.subject.toLowerCase().includes(query.toLowerCase()) ||
+    (log.actor_email ?? "").toLowerCase().includes(query.toLowerCase()) ||
+    (actionLabels[log.action] ?? log.action).toLowerCase().includes(query.toLowerCase())
+  );
+  return (
+    <section className="panel">
+      <div className="panel-heading"><div><h2>操作日志</h2><p>管理端发生的事件记录，仅管理员可见。</p></div></div>
+      {logs.length ? (
+        <>
+          <input className="search" type="search" placeholder="搜索操作者、事件或对象" value={query} onChange={event => setQuery(event.target.value)}/>
+          <div className="table logs-table">
+            <div className="row label"><span>时间</span><span>操作者</span><span>事件</span><span>对象</span></div>
+            {filtered.map(log => (
+              <div className="row" key={log.id}><span>{formatDate(log.created_at)}</span><span>{log.actor_email ?? "—"}</span><span className={`log-action ${log.action === "auth.login_failed" ? "fail" : ""}`}>{actionLabels[log.action] ?? log.action}</span><span className="log-subject">{log.subject}</span></div>
+            ))}
+            {!filtered.length && <div className="device-empty">没有匹配的记录。</div>}
+          </div>
+        </>
+      ) : <div className="device-empty">暂无操作日志。登录、隧道、密钥和带宽设置操作会记录在这里。</div>}
+    </section>
+  );
 }
-function TunnelForm({ devices, tunnel, onClose, onSubmit }: { devices: Device[]; tunnel?: Tunnel; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+
+function KeyForm({ devices, accessKey, onClose, onSubmit }: {
+  devices: Device[]; accessKey?: AccessKey; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <div className="modal-backdrop"><form className="modal" onSubmit={onSubmit}><div className="modal-head"><div><p className="eyebrow">管理员操作</p><h2>{accessKey ? "编辑接入密钥" : "新建接入密钥"}</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><label>名称<input required name="label" maxLength={100} defaultValue={accessKey?.label} placeholder="例如：研发笔记本"/></label><label>绑定设备<select name="device_id" defaultValue={accessKey?.device_id ?? ""}><option value="">未绑定（首次连接时自动注册设备）</option>{devices.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label><label>有效期<select name="expires_in_days" defaultValue={accessKey ? "keep" : ""}>{accessKey && <option value="keep">保持当前设置</option>}<option value="">不过期</option><option value="7">7 天</option><option value="30">30 天</option><option value="90">90 天</option><option value="365">365 天</option></select></label><div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button className="primary" type="submit">{accessKey ? "保存修改" : "创建密钥"}</button></div></form></div>
+  );
+}
+
+function KeyCreatedModal({ token, onClose }: { token: string; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => { try { await navigator.clipboard.writeText(token); setCopied(true); } catch { /* clipboard unavailable */ } };
+  return (
+    <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true"><div className="modal-head"><div><p className="eyebrow">密钥已创建</p><h2>请立即保存</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><p className="key-hint">令牌只显示这一次，关闭后将无法再次查看，请先复制并妥善保存。</p><div className="key-token"><code>{token}</code><button type="button" className="text-button" onClick={copy}>{copied ? <Check size={15}/> : <Copy size={15}/>}{copied ? "已复制" : "复制"}</button></div><div className="modal-actions"><button className="primary" type="button" onClick={onClose}>我已完成保存</button></div></div></div>
+  );
+}
+
+function TunnelForm({ devices, tunnel, onClose, onSubmit }: {
+  devices: Device[]; tunnel?: Tunnel; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
   const targetDevices = tunnel ? devices : devices.filter(device => device.status === "online");
-  return <div className="modal-backdrop"><form className="modal" onSubmit={onSubmit}><div className="modal-head"><div><p className="eyebrow">管理员操作</p><h2>{tunnel ? "编辑隧道" : "新建隧道"}</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><label>名称<input required name="name" maxLength={100} defaultValue={tunnel?.name} placeholder="例如：研发远程桌面"/></label><div className="two"><label>类型<select name="kind" defaultValue={tunnel?.kind ?? "tcp"}><option value="tcp">TCP</option><option value="http">HTTP</option><option value="udp">UDP</option></select></label><label>公网端口<input name="public_port" required type="number" min="1" max="65535" defaultValue={tunnel?.public_port} placeholder="10001"/></label></div><label>目标设备<select required name="device_id" defaultValue={tunnel?.device_id ?? ""}><option value="">选择设备</option>{targetDevices.map(device => <option key={device.id} value={device.id}>{device.name}{device.status === "offline" ? "（离线）" : ""}</option>)}</select></label><div className="two"><label>本地地址<input name="local_host" required defaultValue={tunnel?.local_host ?? "127.0.0.1"}/></label><label>本地端口<input name="local_port" required type="number" min="1" max="65535" defaultValue={tunnel?.local_port} placeholder="3389"/></label></div><label>最大并发<input name="max_connections" type="number" min="1" max="1000" defaultValue={tunnel?.max_connections ?? 100}/></label><div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button className="primary" type="submit">{tunnel ? "保存修改" : "创建隧道"}</button></div></form></div>;
+  return (
+    <div className="modal-backdrop"><form className="modal" onSubmit={onSubmit}><div className="modal-head"><div><p className="eyebrow">管理员操作</p><h2>{tunnel ? "编辑隧道" : "新建隧道"}</h2></div><button type="button" className="text-button" onClick={onClose}>关闭</button></div><label>名称<input required name="name" maxLength={100} defaultValue={tunnel?.name} placeholder="例如：研发远程桌面"/></label><div className="two"><label>类型<select name="kind" defaultValue={tunnel?.kind ?? "tcp"}><option value="tcp">TCP</option><option value="http">HTTP</option><option value="udp">UDP</option></select></label><label>公网端口<input name="public_port" required type="number" min="1" max="65535" defaultValue={tunnel?.public_port} placeholder="10001"/></label></div><label>目标设备<select required name="device_id" defaultValue={tunnel?.device_id ?? ""}><option value="">选择设备</option>{targetDevices.map(device => <option key={device.id} value={device.id}>{device.name}{device.status === "offline" ? "（离线）" : ""}</option>)}</select></label><div className="two"><label>本地地址<input name="local_host" required defaultValue={tunnel?.local_host ?? "127.0.0.1"}/></label><label>本地端口<input name="local_port" required type="number" min="1" max="65535" defaultValue={tunnel?.local_port} placeholder="3389"/></label></div><label>最大并发<input name="max_connections" type="number" min="1" max="1000" defaultValue={tunnel?.max_connections ?? 100}/></label><div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button className="primary" type="submit">{tunnel ? "保存修改" : "创建隧道"}</button></div></form></div>
+  );
 }
+
 createRoot(document.getElementById("root")!).render(<App/>);
