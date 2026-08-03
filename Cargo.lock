@@ -2212,6 +2212,7 @@ name = "tunnel-agent"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "socket2 0.6.5",

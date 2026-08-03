@@ -32,7 +32,7 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, UdpSocket},
-    sync::{Mutex, RwLock, mpsc, oneshot},
+    sync::{Mutex, Notify, RwLock, mpsc, oneshot},
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tunnel_protocol::{
@@ -97,7 +97,7 @@ enum EnrollmentDecision {
 /// In-memory data-plane state shared by the control socket and every data
 /// socket. Kept separate from AppState so routing and cleanup logic can be
 /// unit tested without a database.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct DataPlane {
     sessions: Arc<RwLock<HashMap<Uuid, SessionEntry>>>,
     streams: Arc<RwLock<HashMap<u128, StreamEntry>>>,
@@ -105,6 +105,27 @@ struct DataPlane {
     data_channels: Arc<RwLock<HashMap<Uuid, HashMap<u16, DataChannel>>>>,
     data_socket_tasks: Arc<Mutex<HashMap<(Uuid, u16), tokio::task::JoinHandle<()>>>>,
     heartbeats: Arc<RwLock<HashMap<Uuid, HeartbeatEntry>>>,
+    /// Wakes bridge tasks waiting for a data channel whenever a device's
+    /// channel set changes (bind, drop, or teardown).
+    data_channel_signal: Arc<Notify>,
+    /// Wakes bridge tasks waiting for a data channel whenever a control
+    /// session is inserted or removed.
+    session_signal: Arc<Notify>,
+}
+
+impl Default for DataPlane {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            streams: Arc::new(RwLock::new(HashMap::new())),
+            udp_sessions: Arc::new(RwLock::new(HashMap::new())),
+            data_channels: Arc::new(RwLock::new(HashMap::new())),
+            data_socket_tasks: Arc::new(Mutex::new(HashMap::new())),
+            heartbeats: Arc::new(RwLock::new(HashMap::new())),
+            data_channel_signal: Arc::new(Notify::new()),
+            session_signal: Arc::new(Notify::new()),
+        }
+    }
 }
 
 /// One live control session for a device. The connection id lets a stale
@@ -175,6 +196,11 @@ enum RouteOutcome {
 /// stream) turns queue pressure into TCP backpressure; the cap only exists so
 /// a wedged peer cannot stall the data channel indefinitely.
 const TCP_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+/// How long a public TCP connection waits for a data channel after the
+/// device's control session registered. Bounded so a reconnect window cannot
+/// pile waiting connections up indefinitely.
+const DATA_CHANNEL_WAIT: StdDuration = StdDuration::from_secs(3);
 
 /// Removes a session entry only when it still belongs to `connection_id`, so a
 /// stale control loop can never delete the session of a newer connection.
@@ -314,9 +340,9 @@ async fn send_control(state: &AppState, device_id: Uuid, message: &ControlMessag
 }
 
 /// Number of live streams currently assigned to one data channel.
-async fn data_channel_load(state: &AppState, device_id: Uuid, channel_id: u16) -> usize {
-    let streams = state.plane.streams.read().await;
-    let udp = state.plane.udp_sessions.read().await;
+async fn data_channel_load(plane: &DataPlane, device_id: Uuid, channel_id: u16) -> usize {
+    let streams = plane.streams.read().await;
+    let udp = plane.udp_sessions.read().await;
     streams
         .values()
         .filter(|entry| entry.device_id == device_id && entry.data_channel == channel_id)
@@ -328,13 +354,25 @@ async fn data_channel_load(state: &AppState, device_id: Uuid, channel_id: u16) -
 }
 
 /// Picks the data channel with the fewest active streams, preferring the
-/// lowest channel id on ties. Returns None while the device has no bound
-/// channel (for example during a reconnect); callers drop the connection.
-async fn pick_data_channel(state: &AppState, device_id: Uuid) -> Option<u16> {
+/// lowest channel id on ties. Only channels bound to the device's current
+/// control session are eligible, so a stale channel left over from a fast
+/// reconnect is never handed out. Returns None while the device has no
+/// control session or no bound channel (for example during a reconnect).
+async fn pick_data_channel(plane: &DataPlane, device_id: Uuid) -> Option<u16> {
+    let current_connection_id = {
+        let sessions = plane.sessions.read().await;
+        sessions.get(&device_id).map(|entry| entry.connection_id)
+    };
     let channels: Vec<u16> = {
-        let pool = state.plane.data_channels.read().await;
+        let pool = plane.data_channels.read().await;
         pool.get(&device_id)
-            .map(|channels| channels.keys().copied().collect())
+            .map(|channels| {
+                channels
+                    .iter()
+                    .filter(|(_, channel)| Some(channel.connection_id) == current_connection_id)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     if channels.is_empty() {
@@ -342,12 +380,45 @@ async fn pick_data_channel(state: &AppState, device_id: Uuid) -> Option<u16> {
     }
     let mut best: Option<(usize, u16)> = None;
     for channel_id in channels {
-        let load = data_channel_load(state, device_id, channel_id).await;
+        let load = data_channel_load(plane, device_id, channel_id).await;
         if best.map(|(best_load, _)| load < best_load).unwrap_or(true) {
             best = Some((load, channel_id));
         }
     }
     best.map(|(_, channel_id)| channel_id)
+}
+
+/// Waits up to `DATA_CHANNEL_WAIT` for the device's current control session to
+/// gain at least one data channel. Returns None on timeout or when the
+/// control session disappears while waiting.
+async fn wait_for_data_channel(plane: &DataPlane, device_id: Uuid) -> Option<u16> {
+    wait_for_data_channel_with_timeout(plane, device_id, DATA_CHANNEL_WAIT).await
+}
+
+async fn wait_for_data_channel_with_timeout(
+    plane: &DataPlane,
+    device_id: Uuid,
+    timeout: StdDuration,
+) -> Option<u16> {
+    if let Some(channel_id) = pick_data_channel(plane, device_id).await {
+        return Some(channel_id);
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let channel_signal = plane.data_channel_signal.notified();
+        let session_signal = plane.session_signal.notified();
+        tokio::select! {
+            _ = channel_signal => {}
+            _ = session_signal => {}
+            _ = tokio::time::sleep_until(deadline) => return None,
+        }
+        if plane.sessions.read().await.get(&device_id).is_none() {
+            return None;
+        }
+        if let Some(channel_id) = pick_data_channel(plane, device_id).await {
+            return Some(channel_id);
+        }
+    }
 }
 
 /// Removes every stream and UDP session assigned to one data channel and
@@ -394,7 +465,9 @@ async fn teardown_device_data_channels(state: &AppState, device_id: Uuid, connec
             })
             .unwrap_or_default()
     };
+    let mut removed_any = false;
     for channel_id in channels {
+        removed_any = true;
         let removed = close_channel_streams(&state.plane, device_id, channel_id).await;
         for id in removed {
             send_control(
@@ -423,6 +496,9 @@ async fn teardown_device_data_channels(state: &AppState, device_id: Uuid, connec
         {
             task.abort();
         }
+    }
+    if removed_any {
+        state.plane.data_channel_signal.notify_waiters();
     }
     if state
         .plane
@@ -593,6 +669,158 @@ mod tests {
             new_connection
         ));
         assert!(!heartbeats.contains_key(&device));
+    }
+
+    #[tokio::test]
+    async fn wait_for_data_channel_returns_existing_channel() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let connection = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: connection,
+                tx: session_tx,
+            },
+        );
+        let (channel_tx, _channel_rx) = mpsc::channel::<Message>(8);
+        plane.data_channels.write().await.insert(
+            device,
+            HashMap::from([(
+                1,
+                DataChannel {
+                    connection_id: connection,
+                    tx: channel_tx,
+                },
+            )]),
+        );
+        assert_eq!(wait_for_data_channel(&plane, device).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn wait_for_data_channel_waits_for_bind() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let connection = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: connection,
+                tx: session_tx,
+            },
+        );
+        let bind_plane = plane.clone();
+        let bind = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            let (channel_tx, _channel_rx) = mpsc::channel::<Message>(8);
+            bind_plane.data_channels.write().await.insert(
+                device,
+                HashMap::from([(
+                    1,
+                    DataChannel {
+                        connection_id: connection,
+                        tx: channel_tx,
+                    },
+                )]),
+            );
+            bind_plane.data_channel_signal.notify_waiters();
+        });
+        let picked = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            wait_for_data_channel(&plane, device),
+        )
+        .await
+        .expect("wait should return once a channel binds");
+        assert_eq!(picked, Some(1));
+        bind.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_data_channel_aborts_when_session_vanishes() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: Uuid::new_v4(),
+                tx: session_tx,
+            },
+        );
+        let drop_plane = plane.clone();
+        let drop = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            drop_plane.sessions.write().await.remove(&device);
+            drop_plane.session_signal.notify_waiters();
+        });
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            wait_for_data_channel(&plane, device),
+        )
+        .await
+        .expect("wait should abort when the control session disappears");
+        assert_eq!(result, None);
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        drop.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_data_channel_times_out_without_channel() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: Uuid::new_v4(),
+                tx: session_tx,
+            },
+        );
+        let started = Instant::now();
+        let result =
+            wait_for_data_channel_with_timeout(&plane, device, StdDuration::from_millis(50)).await;
+        assert_eq!(result, None);
+        assert!(started.elapsed() >= StdDuration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn pick_data_channel_ignores_stale_channels() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        let stale = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: current,
+                tx: session_tx,
+            },
+        );
+        let (channel_tx, _channel_rx) = mpsc::channel::<Message>(8);
+        plane.data_channels.write().await.insert(
+            device,
+            HashMap::from([
+                (
+                    1,
+                    DataChannel {
+                        connection_id: stale,
+                        tx: channel_tx.clone(),
+                    },
+                ),
+                (
+                    2,
+                    DataChannel {
+                        connection_id: current,
+                        tx: channel_tx,
+                    },
+                ),
+            ]),
+        );
+        assert_eq!(pick_data_channel(&plane, device).await, Some(2));
     }
 
     #[tokio::test]
@@ -1589,7 +1817,10 @@ async fn delete_device(
         teardown_device_data_channels(&state, id, session.connection_id).await;
         drop_invalid_udp_sessions(&state, id, session.connection_id).await;
         let mut sessions = state.plane.sessions.write().await;
-        remove_session_if_owned(&mut sessions, id, session.connection_id);
+        let removed = remove_session_if_owned(&mut sessions, id, session.connection_id);
+        if removed {
+            state.plane.session_signal.notify_waiters();
+        }
     }
     let mut tx = state.db.begin().await.map_err(|_| {
         (
@@ -2859,6 +3090,7 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             tx: out_tx.clone(),
         },
     );
+    state.plane.session_signal.notify_waiters();
     let tunnels = load_specs(&state.db, device_id).await;
     let _ = out_tx
         .send(Message::Text(
@@ -2945,7 +3177,10 @@ async fn control_loop(socket: WebSocket, state: AppState) {
     writer.abort();
     {
         let mut sessions = state.plane.sessions.write().await;
-        remove_session_if_owned(&mut sessions, device_id, connection_id);
+        let removed = remove_session_if_owned(&mut sessions, device_id, connection_id);
+        if removed {
+            state.plane.session_signal.notify_waiters();
+        }
     }
     {
         let mut heartbeats = state.plane.heartbeats.write().await;
@@ -3142,6 +3377,7 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
         );
         channel_id
     };
+    state.plane.data_channel_signal.notify_waiters();
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             if sink.send(message).await.is_err() {
@@ -3233,13 +3469,16 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
             )
             .await;
         }
-        reader_state
+        let removed_channel = reader_state
             .plane
             .data_channels
             .write()
             .await
             .get_mut(&device_id)
             .map(|channels| channels.remove(&channel_id));
+        if removed_channel.is_some() {
+            reader_state.plane.data_channel_signal.notify_waiters();
+        }
         reader_state
             .plane
             .data_socket_tasks
@@ -3395,6 +3634,13 @@ async fn bridge_public_connection(
     if !state.accepting.load(Ordering::Relaxed) {
         return;
     }
+    // The control session can be registered while the agent's data channels
+    // are still binding (every reconnect). Wait briefly for a channel instead
+    // of rejecting the connection; the wait is bounded and aborts early if
+    // the control session disappears.
+    let Some(channel_id) = wait_for_data_channel(&state.plane, tunnel.device_id).await else {
+        return;
+    };
     let Some(session) = state
         .plane
         .sessions
@@ -3405,9 +3651,6 @@ async fn bridge_public_connection(
     else {
         return;
     };
-    let Some(channel_id) = pick_data_channel(&state, tunnel.device_id).await else {
-        return;
-    };
     let Some(channel) = state
         .plane
         .data_channels
@@ -3415,6 +3658,7 @@ async fn bridge_public_connection(
         .await
         .get(&tunnel.device_id)
         .and_then(|channels| channels.get(&channel_id))
+        .filter(|channel| channel.connection_id == session.connection_id)
         .cloned()
     else {
         return;
@@ -3602,7 +3846,8 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                         else {
                             continue;
                         };
-                        let Some(channel_id) = pick_data_channel(&state, tunnel.device_id).await
+                        let Some(channel_id) =
+                            pick_data_channel(&state.plane, tunnel.device_id).await
                         else {
                             continue;
                         };

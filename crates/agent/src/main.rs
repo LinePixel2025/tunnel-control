@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use std::{
     collections::HashMap,
     env,
@@ -22,8 +23,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, reload};
 use tunnel_protocol::{
-    AgentSettings, ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode,
-    decode_stream_data, encode, encode_stream_data,
+    AgentSettings, ControlMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION, TunnelKind, TunnelSpec,
+    decode, decode_stream_data, encode, encode_stream_data,
 };
 use url::Url;
 
@@ -47,19 +48,28 @@ type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 type ConnectionMap = Arc<RwLock<HashMap<u128, ConnectionInfo>>>;
 type DataSenderMap = Arc<RwLock<HashMap<u16, mpsc::Sender<Message>>>>;
 type TaskMap = Arc<tokio::sync::Mutex<HashMap<u128, tokio::task::JoinHandle<()>>>>;
-type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>)>>>;
+/// Pending pre-`StreamOpen` frames: first-arrival time, frames in arrival
+/// order, and the total buffered byte count.
+type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>, usize)>>>;
 
-/// Upper bound on frames buffered for one stream that has not been registered
-/// yet. `StreamOpen` travels on the control socket while data frames use data
-/// sockets, so the first frames can arrive first; the race window is a few
-/// milliseconds, so this cap is never approached in practice.
-const PENDING_STREAM_FRAMES: usize = 64;
+/// Byte budget for frames buffered before a stream's `StreamOpen` arrives
+/// (control and data sockets have no ordering guarantee). Four protocol
+/// frames cover the realistic cross-socket race; if traffic keeps arriving
+/// the buffer grows with a warning instead of dropping TCP bytes, and the
+/// 10s pending expiry still bounds memory.
+const PENDING_STREAM_BYTES: usize = 4 * MAX_FRAME_BYTES;
 
 /// Upper bound on how long routing waits for one TCP frame to enter a
 /// stream's bounded queue before closing the stream. Waiting (instead of
 /// dropping or closing) turns queue pressure into TCP backpressure; the cap
 /// prevents a wedged local service from stalling the data channel forever.
 const TCP_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Data-channel reconnect backoff: start at 1s, double per failed attempt,
+/// and cap at 60s so a down server does not produce a reconnect storm. This
+/// is independent from the control-channel backoff configured by the server.
+const DATA_CHANNEL_RETRY_MIN: Duration = Duration::from_secs(1);
+const DATA_CHANNEL_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Shared runtime state for the agent process. `settings` holds the latest
 /// server-pushed effective configuration; local bootstrap values only apply
@@ -251,6 +261,17 @@ fn reconnect_delay(attempt: u32, min_secs: u64, max_secs: u64, jitter: f64) -> D
     let growth = 2_f64.powi(attempt.min(5) as i32);
     let base = (min_secs as f64 * growth).min(max_secs as f64);
     Duration::from_secs_f64((base * jitter).max(0.1))
+}
+
+/// Backoff before the next data-channel reconnect attempt: exponential
+/// growth from `DATA_CHANNEL_RETRY_MIN`, capped at `DATA_CHANNEL_RETRY_MAX`,
+/// with random 0.7..=1.3 jitter.
+fn data_channel_backoff(attempt: u32) -> Duration {
+    let growth = 2_f64.powi(attempt.min(5) as i32);
+    let base =
+        (DATA_CHANNEL_RETRY_MIN.as_secs_f64() * growth).min(DATA_CHANNEL_RETRY_MAX.as_secs_f64());
+    let fraction = rand::thread_rng().gen_range(0.7..=1.3);
+    Duration::from_secs_f64((base * fraction).max(0.1))
 }
 
 /// Shared token bucket that throttles the agent's outbound (agent -> server)
@@ -1088,7 +1109,6 @@ fn run_agent_forever() {
         .expect("failed to build tokio runtime");
     runtime.block_on(async move {
         let mut attempt = 0_u32;
-        let mut jitter = 0_u64;
         loop {
             // Re-read the config every session so enrollment and pushed
             // settings (persisted to the credentials file) take effect on the
@@ -1110,8 +1130,7 @@ fn run_agent_forever() {
                     tracing::warn!(%error, "agent disconnected; retrying");
                 }
             }
-            jitter = jitter.wrapping_add(17).wrapping_mul(31);
-            let fraction = 0.7 + (jitter % 61) as f64 / 100.0;
+            let fraction = rand::thread_rng().gen_range(0.7..=1.3);
             let delay = reconnect_delay(
                 attempt,
                 config.reconnect_min_secs,
@@ -1574,7 +1593,7 @@ async fn run(
                             .write()
                             .await
                             .remove(&id)
-                            .map(|(_, frames)| frames)
+                            .map(|(_, frames, _)| frames)
                             .unwrap_or_default();
                         for frame in buffered {
                             if tx.send(frame).await.is_err() {
@@ -1680,7 +1699,7 @@ async fn run(
         pending
             .write()
             .await
-            .retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(10));
+            .retain(|_, (at, _, _)| now.duration_since(*at) < Duration::from_secs(10));
         // After wake-from-sleep the TCP connection may be dead while the OS
         // keeps retransmitting; require a fresh pong or reconnect promptly.
         let pong_timeout_secs = status.settings.read().await.pong_timeout_secs;
@@ -1801,8 +1820,9 @@ fn enable_tcp_keepalive(
 }
 
 /// One data WebSocket: binds to the control session with `DataBind`, waits for
-/// `DataBound`, then relays binary frames until the socket drops. On failure it
-/// retries with a short pause; the task is aborted when the control run ends.
+/// `DataBound`, then relays binary frames until the socket drops. On failure
+/// it retries with exponential backoff and jitter; the counter resets once a
+/// channel binds. The task is aborted when the control run ends.
 async fn data_channel_task(
     config: AgentConfig,
     status: AgentStatus,
@@ -1811,6 +1831,7 @@ async fn data_channel_task(
     control: mpsc::Sender<Message>,
     pending: PendingMap,
 ) {
+    let mut attempt = 0_u32;
     loop {
         match connect_async(&config.data_server).await {
             Ok((socket, _)) => {
@@ -1820,7 +1841,9 @@ async fn data_channel_task(
                     token: config.token.clone(),
                 };
                 let Ok(payload) = encode(&bind) else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let delay = data_channel_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(delay).await;
                     continue;
                 };
                 if sink
@@ -1830,7 +1853,9 @@ async fn data_channel_task(
                     .await
                     .is_err()
                 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let delay = data_channel_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 let bound = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1851,9 +1876,12 @@ async fn data_channel_task(
                 let Some(channel_id) = bound else {
                     // The server may reject us while the control session is not
                     // ready yet; retry shortly.
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let delay = data_channel_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(delay).await;
                     continue;
                 };
+                attempt = 0;
                 let (tx, mut rx) = mpsc::channel::<Message>(512);
                 status
                     .data_channels
@@ -1915,11 +1943,15 @@ async fn data_channel_task(
                 keepalive.abort();
                 status.data_channels.write().await.remove(&channel_id);
                 tracing::warn!(channel_id, "data channel lost; reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let delay = data_channel_backoff(attempt);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
             }
             Err(error) => {
                 tracing::warn!(%error, "data channel connect failed; retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let delay = data_channel_backoff(attempt);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -1948,6 +1980,27 @@ async fn route_agent_binary(
     .await
 }
 
+/// Buffers one frame that arrived before its `StreamOpen` (cross-socket
+/// ordering is not guaranteed). The byte budget is a warning threshold, not a
+/// drop point: TCP must never lose bytes before registration, so once the
+/// budget is crossed the buffer grows and we warn once. The 10s pending
+/// expiry reclaims entries whose `StreamOpen` never arrives.
+async fn buffer_pending_frame(pending: &PendingMap, id: u128, data: &[u8], byte_budget: usize) {
+    let mut guard = pending.write().await;
+    let entry = guard
+        .entry(id)
+        .or_insert_with(|| (Instant::now(), Vec::new(), 0));
+    if entry.2 < byte_budget && entry.2 + data.len() >= byte_budget {
+        tracing::warn!(
+            stream_id = %id,
+            buffered_bytes = entry.2 + data.len(),
+            "pending stream buffer exceeded {byte_budget} bytes; growing instead of dropping"
+        );
+    }
+    entry.1.push(data.to_vec());
+    entry.2 += data.len();
+}
+
 async fn route_agent_binary_with_timeout(
     streams: &StreamMap,
     connections: &ConnectionMap,
@@ -1965,14 +2018,10 @@ async fn route_agent_binary_with_timeout(
         // `StreamOpen` travels on the control socket while data frames arrive
         // on data sockets; the first frames can beat the registration. Buffer
         // them briefly so the StreamOpen handler can flush them once the
-        // stream exists, instead of silently dropping the first bytes.
-        let mut guard = pending.write().await;
-        let entry = guard
-            .entry(id)
-            .or_insert_with(|| (Instant::now(), Vec::new()));
-        if entry.1.len() < PENDING_STREAM_FRAMES {
-            entry.1.push(data.to_vec());
-        }
+        // stream exists. The stream kind is unknown before registration, so
+        // every frame is buffered (dropping would corrupt TCP byte order);
+        // past the budget the buffer grows with a warning instead.
+        buffer_pending_frame(pending, id, data, PENDING_STREAM_BYTES).await;
         return;
     };
     let is_udp = connections
@@ -2491,6 +2540,28 @@ mod tests {
         assert!(streams.read().await.contains_key(&id));
     }
 
+    #[tokio::test]
+    async fn pending_buffer_grows_past_byte_budget_without_dropping() {
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let id: u128 = 91;
+        for _ in 0..10 {
+            buffer_pending_frame(&pending, id, &[0xAB; 4], 16).await;
+        }
+        let (_, frames, total) = pending
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending entry must exist");
+        assert_eq!(
+            frames.len(),
+            10,
+            "no frame may be dropped before StreamOpen"
+        );
+        assert_eq!(total, 40, "buffered byte count must be exact");
+        assert!(frames.iter().all(|frame| frame == &vec![0xAB; 4]));
+    }
+
     #[test]
     fn reconnect_delay_grows_and_stays_bounded() {
         let min = 1;
@@ -2503,6 +2574,27 @@ mod tests {
         assert!(low < base && base < high);
         let extreme = reconnect_delay(10, min, max, 1.3);
         assert!(extreme.as_secs_f64() <= max as f64 * 1.3 + 1e-9);
+    }
+
+    #[test]
+    fn data_channel_backoff_grows_and_stays_bounded() {
+        for _ in 0..50 {
+            let first = data_channel_backoff(0);
+            let second = data_channel_backoff(1);
+            assert!(
+                (0.7 - 1e-9..=1.3 + 1e-9).contains(&first.as_secs_f64()),
+                "first backoff out of jitter range"
+            );
+            assert!(
+                (1.4 - 1e-9..=2.6 + 1e-9).contains(&second.as_secs_f64()),
+                "second backoff out of jitter range"
+            );
+            let capped = data_channel_backoff(20);
+            assert!(
+                capped.as_secs_f64() <= 60.0 * 1.3 + 1e-9,
+                "backoff must stay bounded"
+            );
+        }
     }
 
     #[test]
