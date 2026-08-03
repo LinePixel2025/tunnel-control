@@ -4,9 +4,8 @@
 
 - `crates/protocol`: versioned control protocol, frame encoding, and unit tests.
 - `crates/server`: Axum management API, WebSocket control channel, and TCP/HTTP forwarding.
-- `crates/agent`: Windows agent; supports console mode (`--agent`) and a real Windows service (`--service`).
+- `crates/agent`: Windows agent; supports console mode (`--agent`), a real Windows service (`--service`), device-code enrollment, and the `logs` CLI.
 - `apps/admin`: React admin console served by Nginx.
-- `apps/client`: Tauri + React Windows GUI.
 - `deploy/`: Docker Compose files, Dockerfiles, Nginx config, SQL migrations, and Windows installers.
 
 Database migrations live in `deploy/migrations/`; do not duplicate schema definitions elsewhere.
@@ -24,8 +23,6 @@ Frontend builds:
 
 ```bash
 cd apps/admin && npm install && npm run build
-cd apps/client && npm install && npm run build
-cd apps/client && npm run tauri -- build --no-bundle
 ```
 
 Server deployment:
@@ -51,10 +48,10 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
 
 ## Commit & Pull Request Guidelines
 
-- Use short, imperative commit messages based on repository history, for example `Fix GUI save_config argument names` or `Add one-click service installer`.
+- Use short, imperative commit messages based on repository history, for example `Add device-code enrollment` or `Push agent settings from admin`.
 - Scope each commit to one logical change.
 - Pull requests should describe the user-visible behavior, deployment impact, and verification steps.
-- Include screenshots for GUI changes and paste key test output for protocol or service changes.
+- Include screenshots for admin console changes and paste key test output for protocol or service changes.
 - Flag security-relevant changes such as credential handling, port exposure, or TLS decisions.
 
 ## Security & Configuration Tips

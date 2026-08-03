@@ -3,8 +3,23 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Runtime parameters the server pushes to an agent. The server is the source
+/// of truth: local bootstrap values only cover the first connection, after
+/// which `SettingsSync` replaces them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSettings {
+    pub device_name: String,
+    pub server_url: String,
+    pub data_channels: u16,
+    pub heartbeat_secs: u64,
+    pub pong_timeout_secs: u64,
+    pub reconnect_min_secs: u64,
+    pub reconnect_max_secs: u64,
+    pub log_level: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -22,8 +37,32 @@ pub enum ControlMessage {
         version: u16,
         latency_ms: u32,
     },
+    /// Pre-registration pairing request: the agent shows an 8-character code
+    /// on its console; the admin enters it in the management console to prove
+    /// physical access before the server issues a device token.
+    Enroll {
+        code: String,
+        device_name: String,
+    },
+    /// Server -> agent reply to a successful enrollment. The agent persists
+    /// the token locally, disconnects, and re-registers through `Register`.
+    Enrolled {
+        token: String,
+        device_id: String,
+    },
     SyncTunnels {
         tunnels: Vec<TunnelSpec>,
+    },
+    /// Server pushes the device's effective settings (global defaults merged
+    /// with per-device overrides). The agent applies live where possible and
+    /// reconnects for fields that require it (server_url, data_channels).
+    SettingsSync {
+        settings: AgentSettings,
+    },
+    /// Server rotates the device's access token; the agent persists it and
+    /// reconnects. Old tokens are already revoked server-side.
+    TokenRotate {
+        token: String,
     },
     StreamOpen {
         stream_id: String,
@@ -166,6 +205,52 @@ mod tests {
             decode(br#"{"type":"heartbeat","version":1,"latency_ms":1}"#),
             Err(ProtocolError::UnsupportedVersion(1))
         );
+    }
+    #[test]
+    fn rejects_v3_heartbeat() {
+        assert_eq!(
+            decode(br#"{"type":"heartbeat","version":3,"latency_ms":1}"#),
+            Err(ProtocolError::UnsupportedVersion(3))
+        );
+    }
+    #[test]
+    fn enroll_round_trip() {
+        let input = ControlMessage::Enroll {
+            code: "AB12CD34".into(),
+            device_name: "DESKTOP-01".into(),
+        };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
+    }
+    #[test]
+    fn enrolled_round_trip() {
+        let input = ControlMessage::Enrolled {
+            token: "abc123".into(),
+            device_id: "device-1".into(),
+        };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
+    }
+    #[test]
+    fn settings_sync_round_trip() {
+        let input = ControlMessage::SettingsSync {
+            settings: AgentSettings {
+                device_name: "DESKTOP-01".into(),
+                server_url: "ws://203.0.113.10:18080/control".into(),
+                data_channels: 4,
+                heartbeat_secs: 10,
+                pong_timeout_secs: 25,
+                reconnect_min_secs: 1,
+                reconnect_max_secs: 10,
+                log_level: "debug".into(),
+            },
+        };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
+    }
+    #[test]
+    fn token_rotate_round_trip() {
+        let input = ControlMessage::TokenRotate {
+            token: "new-token".into(),
+        };
+        assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
     }
     #[test]
     fn udp_tunnel_spec_round_trip() {

@@ -36,10 +36,17 @@ use tokio::{
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tunnel_protocol::{
-    ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode, decode_stream_data, encode,
-    encode_stream_data,
+    AgentSettings, ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode,
+    decode_stream_data, encode, encode_stream_data,
 };
 use uuid::Uuid;
+
+/// Enrollment pairing: the agent shows an 8-character code drawn from an
+/// unambiguous alphabet; the admin enters it in the management console. The
+/// server only stores the SHA-256 hash and keeps the code single-use.
+const ENROLL_CODE_LEN: usize = 8;
+const ENROLL_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const ENROLL_TTL_MINUTES: i64 = 15;
 
 #[derive(Clone)]
 struct AppState {
@@ -58,6 +65,21 @@ struct AppState {
     shutdown_drain_secs: u64,
     accepting: Arc<std::sync::atomic::AtomicBool>,
     plane: DataPlane,
+    pending_enrollments: Arc<RwLock<HashMap<Uuid, PendingEnrollment>>>,
+}
+
+/// In-memory half of a pending enrollment: the live control socket that showed
+/// the code, waiting for the admin's approve/deny decision.
+struct PendingEnrollment {
+    code_hash: String,
+    expires_at: chrono::DateTime<Utc>,
+    tx: oneshot::Sender<EnrollmentDecision>,
+}
+
+enum EnrollmentDecision {
+    Approved { token: String, device_id: Uuid },
+    Denied,
+    Expired,
 }
 
 /// In-memory data-plane state shared by the control socket and every data
@@ -567,6 +589,57 @@ mod tests {
             .expect("channel closed");
         assert!(received.is_empty());
     }
+
+    #[test]
+    fn agent_defaults_validation_rejects_out_of_range_values() {
+        let ok = AgentDefaults {
+            data_channels: 4,
+            ..AgentDefaults::default()
+        };
+        assert!(ok.validate(16).is_ok());
+        let too_many = AgentDefaults {
+            data_channels: 9,
+            ..AgentDefaults::default()
+        };
+        assert!(too_many.validate(16).is_err());
+        let above_cap = AgentDefaults {
+            data_channels: 6,
+            ..AgentDefaults::default()
+        };
+        assert!(above_cap.validate(4).is_err());
+        let inverted_reconnect = AgentDefaults {
+            reconnect_min_secs: 30,
+            reconnect_max_secs: 10,
+            ..AgentDefaults::default()
+        };
+        assert!(inverted_reconnect.validate(16).is_err());
+        let bad_level = AgentDefaults {
+            log_level: "verbose".into(),
+            ..AgentDefaults::default()
+        };
+        assert!(bad_level.validate(16).is_err());
+    }
+
+    #[test]
+    fn device_overrides_validation_checks_present_fields_only() {
+        let overrides = DeviceOverrides {
+            data_channels: Some(3),
+            ..DeviceOverrides::default()
+        };
+        assert!(overrides.validate(16).is_ok());
+        let bad = DeviceOverrides {
+            pong_timeout_secs: Some(1),
+            ..DeviceOverrides::default()
+        };
+        assert!(bad.validate(16).is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        assert!(!constant_time_eq("abc123", "abc12"));
+    }
 }
 #[derive(Serialize, FromRow)]
 struct Device {
@@ -595,9 +668,150 @@ struct Login {
     email: String,
     password: String,
 }
+/// Global agent defaults. Every field is optional server-wide: stored values
+/// fall back to the constants below, and per-device overrides layer on top.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct AgentDefaults {
+    server_url: String,
+    data_channels: u16,
+    heartbeat_secs: u64,
+    pong_timeout_secs: u64,
+    reconnect_min_secs: u64,
+    reconnect_max_secs: u64,
+    log_level: String,
+}
+
+impl Default for AgentDefaults {
+    fn default() -> Self {
+        Self {
+            server_url: String::new(),
+            data_channels: 2,
+            heartbeat_secs: 10,
+            pong_timeout_secs: 25,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 10,
+            log_level: "info".into(),
+        }
+    }
+}
+
+impl AgentDefaults {
+    /// Validates ranges and shape. `max_channels` is the server's own
+    /// DATA_CHANNELS_MAX cap so the agent never opens more than the server
+    /// will accept.
+    fn validate(&self, max_channels: u16) -> Result<(), String> {
+        if !(1..=8).contains(&self.data_channels) {
+            return Err("data_channels must be between 1 and 8".into());
+        }
+        if self.data_channels > max_channels {
+            return Err(format!(
+                "data_channels must not exceed the server cap {max_channels}"
+            ));
+        }
+        if !(3..=60).contains(&self.heartbeat_secs) {
+            return Err("heartbeat_secs must be between 3 and 60".into());
+        }
+        if !(5..=300).contains(&self.pong_timeout_secs) {
+            return Err("pong_timeout_secs must be between 5 and 300".into());
+        }
+        if !(1..=60).contains(&self.reconnect_min_secs) {
+            return Err("reconnect_min_secs must be between 1 and 60".into());
+        }
+        if !(1..=300).contains(&self.reconnect_max_secs) {
+            return Err("reconnect_max_secs must be between 1 and 300".into());
+        }
+        if self.reconnect_max_secs < self.reconnect_min_secs {
+            return Err("reconnect_max_secs must be >= reconnect_min_secs".into());
+        }
+        if !matches!(
+            self.log_level.as_str(),
+            "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            return Err("log_level must be one of error/warn/info/debug/trace".into());
+        }
+        if !self.server_url.is_empty()
+            && !(self.server_url.starts_with("ws://") || self.server_url.starts_with("wss://"))
+        {
+            return Err("server_url must start with ws:// or wss://".into());
+        }
+        Ok(())
+    }
+
+    fn to_agent_settings(&self, device_name: String) -> AgentSettings {
+        AgentSettings {
+            device_name,
+            server_url: self.server_url.clone(),
+            data_channels: self.data_channels,
+            heartbeat_secs: self.heartbeat_secs,
+            pong_timeout_secs: self.pong_timeout_secs,
+            reconnect_min_secs: self.reconnect_min_secs,
+            reconnect_max_secs: self.reconnect_max_secs,
+            log_level: self.log_level.clone(),
+        }
+    }
+}
+
+/// Per-device overrides; NULL means "inherit the global default".
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct DeviceOverrides {
+    server_url: Option<String>,
+    data_channels: Option<u16>,
+    heartbeat_secs: Option<u64>,
+    pong_timeout_secs: Option<u64>,
+    reconnect_min_secs: Option<u64>,
+    reconnect_max_secs: Option<u64>,
+    log_level: Option<String>,
+}
+
+impl DeviceOverrides {
+    fn validate(&self, max_channels: u16) -> Result<(), String> {
+        AgentDefaults {
+            server_url: self.server_url.clone().unwrap_or_default(),
+            data_channels: self.data_channels.unwrap_or(2),
+            heartbeat_secs: self.heartbeat_secs.unwrap_or(10),
+            pong_timeout_secs: self.pong_timeout_secs.unwrap_or(25),
+            reconnect_min_secs: self.reconnect_min_secs.unwrap_or(1),
+            reconnect_max_secs: self.reconnect_max_secs.unwrap_or(10),
+            log_level: self.log_level.clone().unwrap_or_else(|| "info".into()),
+        }
+        .validate(max_channels)
+    }
+}
+
+#[derive(Serialize)]
+struct DeviceSettingsView {
+    device_name: String,
+    /// Effective settings after merging global defaults with overrides.
+    settings: AgentSettings,
+    overrides: DeviceOverrides,
+}
+
+#[derive(Deserialize)]
+struct UpdateDeviceSettings {
+    device_name: Option<String>,
+    /// Full replacement of this device's overrides; null fields inherit the
+    /// global default.
+    overrides: DeviceOverrides,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Settings {
     bandwidth_limit_mbps: u64,
+    agent_defaults: AgentDefaults,
+}
+
+#[derive(Serialize, FromRow)]
+struct EnrollmentRow {
+    id: Uuid,
+    device_name: String,
+    status: String,
+    created_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct ApproveEnrollment {
+    code: String,
 }
 #[derive(Deserialize)]
 struct CreateTunnel {
@@ -737,6 +951,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_drain_secs,
         accepting: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         plane: DataPlane::default(),
+        pending_enrollments: Arc::new(RwLock::new(HashMap::new())),
     };
     for id in sqlx::query_scalar::<_, Uuid>("SELECT id FROM tunnels WHERE enabled")
         .fetch_all(&state.db)
@@ -753,6 +968,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/settings", get(get_settings).put(update_settings))
         .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/devices", get(list_devices))
+        .route(
+            "/api/v1/devices/{id}/settings",
+            get(get_device_settings).put(update_device_settings),
+        )
+        .route(
+            "/api/v1/devices/{id}/rotate-token",
+            post(rotate_device_token),
+        )
+        .route("/api/v1/enrollments", get(list_enrollments))
+        .route("/api/v1/enrollments/{id}/approve", post(approve_enrollment))
+        .route("/api/v1/enrollments/{id}/deny", post(deny_enrollment))
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
         .route(
             "/api/v1/tunnels/{id}",
@@ -986,6 +1212,7 @@ async fn get_settings(
     .and_then(|value| value.parse().ok());
     Ok(Json(Settings {
         bandwidth_limit_mbps: stored.unwrap_or_else(|| state.bandwidth.current_mbps()),
+        agent_defaults: load_agent_defaults(&state.db).await.unwrap_or_default(),
     }))
 }
 async fn update_settings(
@@ -1002,12 +1229,15 @@ async fn update_settings(
             "bandwidth_limit_mbps must be at most 10000".into(),
         ));
     }
-    sqlx::query(
-        "INSERT INTO settings(key, value) VALUES('bandwidth_limit_mbps', $1) \
-         ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+    input
+        .agent_defaults
+        .validate(state.data_channels_max)
+        .map_err(|message| (StatusCode::UNPROCESSABLE_ENTITY, message))?;
+    set_setting(
+        &state.db,
+        "bandwidth_limit_mbps",
+        &input.bandwidth_limit_mbps.to_string(),
     )
-    .bind(input.bandwidth_limit_mbps.to_string())
-    .execute(&state.db)
     .await
     .map_err(|_| {
         (
@@ -1015,6 +1245,14 @@ async fn update_settings(
             "Could not save settings".into(),
         )
     })?;
+    save_agent_defaults(&state.db, &input.agent_defaults)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not save agent defaults".into(),
+            )
+        })?;
     state.bandwidth.set_mbps(input.bandwidth_limit_mbps);
     // Reconfigure every online agent so its source-side throttle tracks the
     // server cap. This keeps the agent -> server direction from saturating
@@ -1028,11 +1266,31 @@ async fn update_settings(
             let _ = entry.tx.try_send(message.clone());
         }
     }
+    // Recompute and push the effective settings of every online device so
+    // global default changes propagate immediately.
+    for device_id in state
+        .plane
+        .sessions
+        .read()
+        .await
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        send_effective_settings(&state, device_id).await;
+    }
     audit(
         &state.db,
         Some(actor.id),
         "settings.bandwidth_updated",
         &input.bandwidth_limit_mbps.to_string(),
+    )
+    .await;
+    audit(
+        &state.db,
+        Some(actor.id),
+        "settings.agent_defaults_updated",
+        "agent defaults",
     )
     .await;
     Ok(Json(input))
@@ -1292,6 +1550,320 @@ async fn probe_tunnel(
     }
 }
 
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn list_enrollments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EnrollmentRow>>, StatusCode> {
+    admin(&headers, &state).await?;
+    let rows = sqlx::query_as::<_, EnrollmentRow>(
+        "SELECT id, device_name, status, created_at, expires_at FROM enrollments \
+         WHERE status = 'pending' AND expires_at > now() ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows))
+}
+
+async fn approve_enrollment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<ApproveEnrollment>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let code = input.code.trim().to_uppercase();
+    if code.len() != ENROLL_CODE_LEN
+        || !code
+            .bytes()
+            .all(|byte| ENROLL_CODE_ALPHABET.contains(&byte))
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enrollment code must be 8 characters from the pairing alphabet".into(),
+        ));
+    }
+    let row: Option<(String, String, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT code_hash, device_name, expires_at FROM enrollments \
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let Some((code_hash, device_name, expires_at)) = row else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Enrollment not found or already resolved".into(),
+        ));
+    };
+    if expires_at <= Utc::now() {
+        let _ = sqlx::query("UPDATE enrollments SET status='expired' WHERE id=$1")
+            .bind(id)
+            .execute(&state.db)
+            .await;
+        return Err((StatusCode::GONE, "Enrollment code expired".into()));
+    }
+    if !constant_time_eq(&code_hash, &hash_token(&code)) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enrollment code does not match".into(),
+        ));
+    }
+    let Some(entry) = state.pending_enrollments.write().await.remove(&id) else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Enrollment connection is no longer online".into(),
+        ));
+    };
+    if entry.code_hash != code_hash || entry.expires_at <= Utc::now() {
+        return Err((StatusCode::GONE, "Enrollment expired".into()));
+    }
+    let (device_id, token) = create_enrolled_device(&state.db, &device_name)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not create device".into(),
+            )
+        })?;
+    let _ = sqlx::query(
+        "UPDATE enrollments SET status='approved', approved_by=$1, approved_at=now(), \
+         device_id=$2 WHERE id=$3 AND status='pending'",
+    )
+    .bind(actor.id)
+    .bind(device_id)
+    .bind(id)
+    .execute(&state.db)
+    .await;
+    let _ = entry
+        .tx
+        .send(EnrollmentDecision::Approved { token, device_id });
+    audit(
+        &state.db,
+        Some(actor.id),
+        "enrollment.approved",
+        &device_name,
+    )
+    .await;
+    Ok(Json(
+        serde_json::json!({"approved": true, "device_id": device_id}),
+    ))
+}
+
+async fn deny_enrollment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let device_name: Option<String> =
+        sqlx::query_scalar("SELECT device_name FROM enrollments WHERE id=$1 AND status='pending'")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let Some(device_name) = device_name else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Enrollment not found or already resolved".into(),
+        ));
+    };
+    let _ = sqlx::query("UPDATE enrollments SET status='denied' WHERE id=$1 AND status='pending'")
+        .bind(id)
+        .execute(&state.db)
+        .await;
+    if let Some(entry) = state.pending_enrollments.write().await.remove(&id) {
+        let _ = entry.tx.send(EnrollmentDecision::Denied);
+    }
+    audit(&state.db, Some(actor.id), "enrollment.denied", &device_name).await;
+    Ok(Json(serde_json::json!({"denied": true})))
+}
+
+async fn get_device_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<DeviceSettingsView>, (StatusCode, String)> {
+    admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    if !device_exists(&state.db, id).await {
+        return Err((StatusCode::NOT_FOUND, "Device not found".into()));
+    }
+    let settings = load_effective_settings(&state.db, id)
+        .await
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let overrides = load_device_overrides(&state.db, id)
+        .await
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    Ok(Json(DeviceSettingsView {
+        device_name: settings.device_name.clone(),
+        settings,
+        overrides,
+    }))
+}
+
+async fn update_device_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<UpdateDeviceSettings>,
+) -> Result<Json<DeviceSettingsView>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let current_name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let Some(mut effective_name) = current_name else {
+        return Err((StatusCode::NOT_FOUND, "Device not found".into()));
+    };
+    if let Some(name) = input.device_name {
+        let name = name.trim().to_string();
+        if name.is_empty() || name.chars().count() > 100 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Device name must be between 1 and 100 characters".into(),
+            ));
+        }
+        sqlx::query("UPDATE devices SET name=$1 WHERE id=$2")
+            .bind(&name)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not rename device".into(),
+                )
+            })?;
+        effective_name = name;
+    }
+    input
+        .overrides
+        .validate(state.data_channels_max)
+        .map_err(|message| (StatusCode::UNPROCESSABLE_ENTITY, message))?;
+    save_device_overrides(&state.db, id, &input.overrides)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not save device settings".into(),
+            )
+        })?;
+    send_effective_settings(&state, id).await;
+    audit(
+        &state.db,
+        Some(actor.id),
+        "device.settings_updated",
+        &effective_name,
+    )
+    .await;
+    let settings = load_effective_settings(&state.db, id)
+        .await
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let overrides = load_device_overrides(&state.db, id)
+        .await
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    Ok(Json(DeviceSettingsView {
+        device_name: settings.device_name.clone(),
+        settings,
+        overrides,
+    }))
+}
+
+async fn rotate_device_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let device_name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let Some(device_name) = device_name else {
+        return Err((StatusCode::NOT_FOUND, "Device not found".into()));
+    };
+    if !state.plane.sessions.read().await.contains_key(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Device must be online to rotate its token".into(),
+        ));
+    }
+    let token = new_device_token();
+    let token_hash = hash_token(&token);
+    let created = sqlx::query(
+        "INSERT INTO access_tokens(id, device_id, label, token_hash) \
+         VALUES($1,$2,'rotate',$3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(id)
+    .bind(&token_hash)
+    .execute(&state.db)
+    .await;
+    if created.is_err() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not create replacement token".into(),
+        ));
+    }
+    let pushed = send_control(
+        &state,
+        id,
+        &ControlMessage::TokenRotate {
+            token: token.clone(),
+        },
+    )
+    .await;
+    if !pushed {
+        let _ = sqlx::query("DELETE FROM access_tokens WHERE token_hash=$1")
+            .bind(&token_hash)
+            .execute(&state.db)
+            .await;
+        return Err((
+            StatusCode::CONFLICT,
+            "Device went offline; token was not rotated".into(),
+        ));
+    }
+    // Old tokens are now invalid; the fresh one remains active.
+    let _ = sqlx::query(
+        "UPDATE access_tokens SET revoked_at=now() WHERE device_id=$1 AND revoked_at IS NULL \
+         AND token_hash <> $2",
+    )
+    .bind(id)
+    .bind(&token_hash)
+    .execute(&state.db)
+    .await;
+    audit(
+        &state.db,
+        Some(actor.id),
+        "device.token_rotated",
+        &device_name,
+    )
+    .await;
+    Ok(Json(serde_json::json!({"rotated": true})))
+}
+
 async fn list_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1517,6 +2089,240 @@ async fn sync_device_tunnels(state: &AppState, device_id: Uuid) {
     };
     send_control(&state, device_id, &message).await;
 }
+fn hash_token(token: &str) -> String {
+    format!("{:x}", sha2::Sha256::digest(token.as_bytes()))
+}
+fn new_device_token() -> String {
+    let mut bytes = [0_u8; 32];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+async fn set_setting(db: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO settings(key, value) VALUES($1, $2) \
+         ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+async fn load_agent_defaults(db: &PgPool) -> Option<AgentDefaults> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM settings WHERE key LIKE 'agent.%'")
+            .fetch_all(db)
+            .await
+            .ok()?;
+    let map: HashMap<String, String> = rows.into_iter().collect();
+    let defaults = AgentDefaults::default();
+    Some(AgentDefaults {
+        server_url: map
+            .get("agent.server_url")
+            .cloned()
+            .unwrap_or(defaults.server_url),
+        data_channels: map
+            .get("agent.data_channels")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=8).contains(n))
+            .unwrap_or(defaults.data_channels),
+        heartbeat_secs: map
+            .get("agent.heartbeat_secs")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (3..=60).contains(n))
+            .unwrap_or(defaults.heartbeat_secs),
+        pong_timeout_secs: map
+            .get("agent.pong_timeout_secs")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (5..=300).contains(n))
+            .unwrap_or(defaults.pong_timeout_secs),
+        reconnect_min_secs: map
+            .get("agent.reconnect_min_secs")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=60).contains(n))
+            .unwrap_or(defaults.reconnect_min_secs),
+        reconnect_max_secs: map
+            .get("agent.reconnect_max_secs")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=300).contains(n))
+            .unwrap_or(defaults.reconnect_max_secs),
+        log_level: map
+            .get("agent.log_level")
+            .filter(|v| matches!(v.as_str(), "error" | "warn" | "info" | "debug" | "trace"))
+            .cloned()
+            .unwrap_or(defaults.log_level),
+    })
+}
+async fn save_agent_defaults(db: &PgPool, values: &AgentDefaults) -> Result<(), sqlx::Error> {
+    set_setting(db, "agent.server_url", &values.server_url).await?;
+    set_setting(db, "agent.data_channels", &values.data_channels.to_string()).await?;
+    set_setting(
+        db,
+        "agent.heartbeat_secs",
+        &values.heartbeat_secs.to_string(),
+    )
+    .await?;
+    set_setting(
+        db,
+        "agent.pong_timeout_secs",
+        &values.pong_timeout_secs.to_string(),
+    )
+    .await?;
+    set_setting(
+        db,
+        "agent.reconnect_min_secs",
+        &values.reconnect_min_secs.to_string(),
+    )
+    .await?;
+    set_setting(
+        db,
+        "agent.reconnect_max_secs",
+        &values.reconnect_max_secs.to_string(),
+    )
+    .await?;
+    set_setting(db, "agent.log_level", &values.log_level).await?;
+    Ok(())
+}
+async fn load_device_overrides(db: &PgPool, device_id: Uuid) -> Option<DeviceOverrides> {
+    let row: Option<(
+        Option<String>,
+        Option<i16>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT server_url, data_channels, heartbeat_secs, pong_timeout_secs, \
+             reconnect_min_secs, reconnect_max_secs, log_level \
+             FROM device_settings WHERE device_id = $1",
+    )
+    .bind(device_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    Some(match row {
+        Some((server_url, data_channels, heartbeat, pong, min, max, log_level)) => {
+            DeviceOverrides {
+                server_url,
+                data_channels: data_channels.map(|v| v as u16),
+                heartbeat_secs: heartbeat.map(|v| v as u64),
+                pong_timeout_secs: pong.map(|v| v as u64),
+                reconnect_min_secs: min.map(|v| v as u64),
+                reconnect_max_secs: max.map(|v| v as u64),
+                log_level,
+            }
+        }
+        None => DeviceOverrides::default(),
+    })
+}
+async fn save_device_overrides(
+    db: &PgPool,
+    device_id: Uuid,
+    overrides: &DeviceOverrides,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO device_settings(device_id, server_url, data_channels, heartbeat_secs, \
+         pong_timeout_secs, reconnect_min_secs, reconnect_max_secs, log_level, updated_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()) \
+         ON CONFLICT(device_id) DO UPDATE SET \
+         server_url=EXCLUDED.server_url, data_channels=EXCLUDED.data_channels, \
+         heartbeat_secs=EXCLUDED.heartbeat_secs, pong_timeout_secs=EXCLUDED.pong_timeout_secs, \
+         reconnect_min_secs=EXCLUDED.reconnect_min_secs, \
+         reconnect_max_secs=EXCLUDED.reconnect_max_secs, log_level=EXCLUDED.log_level, \
+         updated_at=now()",
+    )
+    .bind(device_id)
+    .bind(&overrides.server_url)
+    .bind(overrides.data_channels.map(|v| v as i16))
+    .bind(overrides.heartbeat_secs.map(|v| v as i64))
+    .bind(overrides.pong_timeout_secs.map(|v| v as i64))
+    .bind(overrides.reconnect_min_secs.map(|v| v as i64))
+    .bind(overrides.reconnect_max_secs.map(|v| v as i64))
+    .bind(&overrides.log_level)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+/// Merges global defaults with per-device overrides and the authoritative
+/// device name. Returns None when the device does not exist.
+async fn load_effective_settings(db: &PgPool, device_id: Uuid) -> Option<AgentSettings> {
+    let defaults = load_agent_defaults(db).await?;
+    let overrides = load_device_overrides(db, device_id).await?;
+    let device_name: String = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
+        .bind(device_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()?;
+    Some(
+        AgentDefaults {
+            server_url: overrides.server_url.clone().unwrap_or(defaults.server_url),
+            data_channels: overrides.data_channels.unwrap_or(defaults.data_channels),
+            heartbeat_secs: overrides.heartbeat_secs.unwrap_or(defaults.heartbeat_secs),
+            pong_timeout_secs: overrides
+                .pong_timeout_secs
+                .unwrap_or(defaults.pong_timeout_secs),
+            reconnect_min_secs: overrides
+                .reconnect_min_secs
+                .unwrap_or(defaults.reconnect_min_secs),
+            reconnect_max_secs: overrides
+                .reconnect_max_secs
+                .unwrap_or(defaults.reconnect_max_secs),
+            log_level: overrides.log_level.clone().unwrap_or(defaults.log_level),
+        }
+        .to_agent_settings(device_name),
+    )
+}
+/// Pushes the device's effective settings to its online control session.
+async fn send_effective_settings(state: &AppState, device_id: Uuid) {
+    if let Some(settings) = load_effective_settings(&state.db, device_id).await {
+        send_control(state, device_id, &ControlMessage::SettingsSync { settings }).await;
+    }
+}
+/// Creates the device and a fresh token inside one transaction for an
+/// approved enrollment; returns (device_id, plaintext token).
+async fn create_enrolled_device(
+    db: &PgPool,
+    device_name: &str,
+) -> Result<(Uuid, String), sqlx::Error> {
+    let workspace =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM workspaces ORDER BY created_at LIMIT 1")
+            .fetch_one(db)
+            .await?;
+    let device_id = Uuid::new_v4();
+    let token = new_device_token();
+    let token_hash = hash_token(&token);
+    let mut tx = db.begin().await?;
+    sqlx::query("INSERT INTO devices(id, workspace_id, name) VALUES($1,$2,$3)")
+        .bind(device_id)
+        .bind(workspace)
+        .bind(device_name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens(id, device_id, label, token_hash, last_used_at) \
+         VALUES($1,$2,'enroll',$3,now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(device_id)
+    .bind(&token_hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::info!(%device_id, "enrollment approved, device created");
+    Ok((device_id, token))
+}
+async fn device_exists(db: &PgPool, device_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM devices WHERE id=$1")
+        .bind(device_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
 async fn get_tunnel(db: &PgPool, id: Uuid) -> Result<TunnelRecord, sqlx::Error> {
     sqlx::query_as::<_,TunnelRecord>("SELECT t.id,t.name,t.kind,t.public_port,t.local_host,t.local_port,t.enabled,t.max_connections,t.device_id,CASE WHEN d.status='online' THEN 'ready' ELSE 'offline' END status,0::bigint connections FROM tunnels t JOIN devices d ON d.id=t.device_id WHERE t.id=$1").bind(id).fetch_one(db).await
 }
@@ -1561,16 +2367,23 @@ async fn control_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
     ws.on_upgrade(move |socket| control_loop(socket, state))
 }
 async fn control_loop(socket: WebSocket, state: AppState) {
-    let (mut sink, mut source) = socket.split();
-    let Some(Ok(Message::Text(first))) = source.next().await else {
+    let mut socket = socket;
+    let Some(Ok(Message::Text(first))) = socket.next().await else {
         return;
     };
-    let Ok(ControlMessage::Register {
+    let Ok(message) = decode(first.as_bytes()) else {
+        return;
+    };
+    let ControlMessage::Register {
         token, device_name, ..
-    }) = decode(first.as_bytes())
+    } = message
     else {
+        if let ControlMessage::Enroll { code, device_name } = message {
+            enroll_loop(socket, state, code, device_name).await;
+        }
         return;
     };
+    let (mut sink, mut source) = socket.split();
     let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
     let token_row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT id, device_id FROM access_tokens WHERE token_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())",
@@ -1666,6 +2479,17 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             ))
             .await;
     }
+    // Push the effective settings (global defaults merged with per-device
+    // overrides) so the agent never relies on stale local values.
+    if let Some(settings) = load_effective_settings(&state.db, device_id).await {
+        if let Ok(payload) = encode(&ControlMessage::SettingsSync { settings }) {
+            let _ = out_tx
+                .send(Message::Text(
+                    String::from_utf8_lossy(&payload).into_owned().into(),
+                ))
+                .await;
+        }
+    }
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             if sink.send(message).await.is_err() {
@@ -1724,6 +2548,129 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         .bind(device_id)
         .execute(&state.db)
         .await;
+}
+
+/// Pre-registration pairing loop: the agent showed a one-time code and waits
+/// on this socket until an admin approves/denies it (or it expires). The
+/// server issues the token on approval and hands it back over this socket.
+async fn enroll_loop(socket: WebSocket, state: AppState, code: String, device_name: String) {
+    let (mut sink, mut source) = socket.split();
+    let code = code.trim().to_uppercase();
+    if code.len() != ENROLL_CODE_LEN
+        || !code
+            .bytes()
+            .all(|byte| ENROLL_CODE_ALPHABET.contains(&byte))
+    {
+        let _ = sink
+            .send(Message::Text(
+                String::from_utf8_lossy(
+                    &encode(&ControlMessage::Error {
+                        code: "invalid_enroll_code".into(),
+                        message: "Enrollment code must be 8 characters".into(),
+                    })
+                    .unwrap_or_default(),
+                )
+                .into_owned()
+                .into(),
+            ))
+            .await;
+        return;
+    }
+    let code_hash = hash_token(&code);
+    let already_pending = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM enrollments WHERE code_hash=$1 AND status='pending'",
+    )
+    .bind(&code_hash)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+    if already_pending > 0 {
+        tracing::warn!("duplicate enrollment code rejected");
+        return;
+    }
+    let enrollment_id = Uuid::new_v4();
+    let expires_at = Utc::now() + Duration::minutes(ENROLL_TTL_MINUTES);
+    let _ = sqlx::query(
+        "INSERT INTO enrollments(id, code_hash, device_name, status, expires_at) \
+         VALUES($1,$2,$3,'pending',$4)",
+    )
+    .bind(enrollment_id)
+    .bind(&code_hash)
+    .bind(&device_name)
+    .bind(expires_at)
+    .execute(&state.db)
+    .await;
+    let (tx, rx) = oneshot::channel::<EnrollmentDecision>();
+    state.pending_enrollments.write().await.insert(
+        enrollment_id,
+        PendingEnrollment {
+            code_hash,
+            expires_at,
+            tx,
+        },
+    );
+    tracing::info!(%enrollment_id, device_name, "agent waiting for enrollment approval");
+    let ttl = (expires_at - Utc::now()).to_std().unwrap_or_default();
+    let decision = tokio::select! {
+        // Socket closed before a decision; the pending row stays until expiry.
+        _ = source.next() => {
+            state.pending_enrollments.write().await.remove(&enrollment_id);
+            return;
+        }
+        _ = tokio::time::sleep(ttl) => {
+            state.pending_enrollments.write().await.remove(&enrollment_id);
+            let _ = sqlx::query("UPDATE enrollments SET status='expired' WHERE id=$1 AND status='pending'")
+                .bind(enrollment_id)
+                .execute(&state.db)
+                .await;
+            EnrollmentDecision::Expired
+        }
+        decision = rx => decision.unwrap_or(EnrollmentDecision::Expired),
+    };
+    match decision {
+        EnrollmentDecision::Approved { token, device_id } => {
+            if let Ok(payload) = encode(&ControlMessage::Enrolled {
+                token,
+                device_id: device_id.to_string(),
+            }) {
+                let _ = sink
+                    .send(Message::Text(
+                        String::from_utf8_lossy(&payload).into_owned().into(),
+                    ))
+                    .await;
+            }
+        }
+        EnrollmentDecision::Denied => {
+            let _ = sink
+                .send(Message::Text(
+                    String::from_utf8_lossy(
+                        &encode(&ControlMessage::Error {
+                            code: "enroll_denied".into(),
+                            message: "Enrollment rejected by administrator".into(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                    .into_owned()
+                    .into(),
+                ))
+                .await;
+        }
+        EnrollmentDecision::Expired => {
+            let _ = sink
+                .send(Message::Text(
+                    String::from_utf8_lossy(
+                        &encode(&ControlMessage::Error {
+                            code: "enroll_expired".into(),
+                            message: "Enrollment code expired".into(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                    .into_owned()
+                    .into(),
+                ))
+                .await;
+        }
+    }
 }
 
 async fn data_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {

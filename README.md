@@ -8,8 +8,9 @@
 - `crates/server`：Axum 管理 API、设备注册、令牌验证、隧道配置及内存状态机。
 - `crates/agent`：可作为 Windows 后台服务运行的控制信道代理与自动重连循环。
 - `apps/admin`：管理控制台前端。
-- `apps/client`：Windows Tauri 壳内使用的客户端界面。
 - `deploy`：Docker Compose、Caddy TLS 代理和 PostgreSQL 初始表结构。
+
+客户端没有独立 GUI：`tunnel-agent.exe` 是唯一的设备端程序，通过命令行安装和查看日志，全部运行参数由管理端下发。
 
 ## 本地开发
 
@@ -21,18 +22,16 @@ cd apps/admin
 npm.cmd install
 npm.cmd run dev
 
-cd ../client
-npm.cmd install
-npm.cmd run dev
 ```
 
-管理 API 默认是 `http://127.0.0.1:18080`；演示代理使用默认令牌 `change-me-agent-token`：
+管理 API 默认是 `http://127.0.0.1:18080`；本地演示代理直接以前台模式运行：
 
 ```powershell
 $env:TUNNEL_SERVER_URL = "ws://127.0.0.1:18080/control"
-$env:TUNNEL_TOKEN = "change-me-agent-token"
-cargo run -p tunnel-agent
+cargo run -p tunnel-agent -- --agent
 ```
+
+不带令牌启动时，代理进入设备码注册模式：控制台打印一次性注册码，管理员在管理端「设备注册」页批准后，服务器生成令牌并直接下发。
 
 ## Linux Docker 部署
 
@@ -56,12 +55,20 @@ cargo run -p tunnel-agent
 - 整链路断网时，在途 TCP 连接会被切断（裸 TCP 字节流无法透明续传），恢复语义为"新连接快速可用"；数据库连接池、HTTP 客户端等长连接应用应自行重试。UDP 会话在重连后由下一个客户端报文自动重建。
 - UDP 隧道把每个公网客户端视为一个会话，空闲超过 `UDP_SESSION_IDLE_SECS`（默认 120 秒）后自动回收；零长度 UDP 报文也会被正常转发。
 
-当前不支持 TLS 透传、自动 HTTPS 或自定义域名。协议 v3 与旧版代理/服务端不兼容，升级时需要同时发布两侧。
+当前不支持 TLS 透传、自动 HTTPS 或自定义域名。协议 v4 与旧版代理/服务端不兼容，升级时需要同时发布两侧。
 
 ### 可调环境变量
 
 服务端：`DATA_CHANNELS_MAX`（1–16）、`SHUTDOWN_DRAIN_SECS`（优雅停机排水秒数，默认 10）、`BANDWIDTH_LIMIT_MBPS`、`UDP_SESSION_IDLE_SECS`。
 
-代理端：`DATA_CHANNELS`（1–8）、`AGENT_HEARTBEAT_SECS`（默认 10）、`AGENT_PONG_TIMEOUT_SECS`（默认 25）、`AGENT_RECONNECT_MIN_SECS`（默认 1）、`AGENT_RECONNECT_MAX_SECS`（默认 10）。可通过环境变量或 `agent.env` 设置。
+代理端运行参数（数据通道数、心跳、超时、重连退避、日志级别、服务器地址）由管理端在「系统设置」或「Windows 设备」页统一控制，改动即时推送到在线代理；重连类参数由代理自动重连生效。本地环境变量与 `agent.env` 仅作首次连接引导（`DATA_CHANNELS`、`AGENT_HEARTBEAT_SECS`、`AGENT_PONG_TIMEOUT_SECS`、`AGENT_RECONNECT_MIN_SECS`、`AGENT_RECONNECT_MAX_SECS` 等仍可作为兜底）。
 
-Windows 打包接入建议使用 Tauri v2：将 `tunnel-agent` 编译为 Windows Service，GUI 通过命名管道调用服务，而不要把访问令牌交给 WebView 或写入配置文件。
+Windows 安装与日志：
+
+```powershell
+tunnel-agent.exe --install --server ws://公网IP:18080/control   # 管理员权限：安装并启动服务
+tunnel-agent.exe logs -f                                        # 跟踪服务日志（首次会显示注册码）
+tunnel-agent.exe --uninstall
+```
+
+设备端凭据（服务器下发的令牌）保存在 `%PROGRAMDATA%\TunnelControl\credentials`，仅 SYSTEM/管理员可读写，用户全程不接触令牌。

@@ -1,9 +1,0 @@
-{
-  "name": "tunnel-desktop",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": { "dev": "vite", "build": "tsc --noEmit && vite build", "tauri": "tauri" },
-  "dependencies": { "@vitejs/plugin-react": "latest", "lucide-react": "latest", "react": "latest", "react-dom": "latest", "vite": "latest" },
-  "devDependencies": { "@tauri-apps/cli": "latest", "@types/react": "latest", "@types/react-dom": "latest", "typescript": "latest" }
-}
