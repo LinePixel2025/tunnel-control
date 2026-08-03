@@ -8,23 +8,34 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     sync::{Mutex, RwLock, mpsc},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, reload};
 use tunnel_protocol::{
-    ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode, decode_stream_data, encode,
-    encode_stream_data,
+    AgentSettings, ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode,
+    decode_stream_data, encode, encode_stream_data,
 };
 use url::Url;
+
+/// Enrollment pairing code alphabet and length; the same constants live in the
+/// server so both sides agree on what a valid code looks like.
+const ENROLL_CODE_LEN: usize = 8;
+const ENROLL_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// Runtime hook for the tracing filter so `SettingsSync` can change the log
+/// level without restarting the process. The concrete reload handle is hidden
+/// inside the closure to avoid naming the full subscriber type.
+static LOG_FILTER: OnceLock<Arc<dyn Fn(&str) + Send + Sync>> = OnceLock::new();
 
 type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
 type ConnectionMap = Arc<RwLock<HashMap<u128, ConnectionInfo>>>;
@@ -38,30 +49,39 @@ type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>)>>>;
 /// milliseconds, so this cap is never approached in practice.
 const PENDING_STREAM_FRAMES: usize = 64;
 
-/// Shared runtime state exposed to the local GUI through the status server.
-#[derive(Clone, Default)]
+/// Shared runtime state for the agent process. `settings` holds the latest
+/// server-pushed effective configuration; local bootstrap values only apply
+/// until the first `SettingsSync`.
+#[derive(Clone)]
 struct AgentStatus {
-    connected: Arc<AtomicBool>,
     specs: Arc<RwLock<HashMap<String, TunnelSpec>>>,
     connections: ConnectionMap,
     data_channels: DataSenderMap,
     bandwidth: BandwidthLimiter,
+    settings: Arc<RwLock<AgentSettings>>,
+}
+
+impl AgentStatus {
+    fn new(config: &AgentConfig) -> Self {
+        Self {
+            specs: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            data_channels: Arc::new(RwLock::new(HashMap::new())),
+            bandwidth: BandwidthLimiter::default(),
+            settings: Arc::new(RwLock::new(config.to_agent_settings())),
+        }
+    }
 }
 
 #[derive(Clone)]
 struct ConnectionInfo {
-    stream_id: String,
-    tunnel_id: String,
     kind: String,
-    public_port: u16,
-    local_host: String,
-    local_port: u16,
-    data_channel: u16,
-    opened_at: u64,
 }
 
 /// Connection parameters for one agent run. Values come from environment
-/// variables with safe defaults, so recovery timing is tunable per deploy.
+/// variables, the bootstrap `agent.env`, and the credentials file with safe
+/// defaults. Once the server pushes `SettingsSync`, the credentials file
+/// becomes authoritative for the next session.
 #[derive(Clone)]
 struct AgentConfig {
     server: String,
@@ -73,35 +93,76 @@ struct AgentConfig {
     pong_timeout_secs: u64,
     reconnect_min_secs: u64,
     reconnect_max_secs: u64,
+    log_level: String,
 }
 
 impl AgentConfig {
     fn from_env() -> Self {
+        let file = load_file_config();
+        let credentials = load_credentials();
         let server = env::var("TUNNEL_SERVER_URL")
             .ok()
-            .or_else(|| load_file_config().get("TUNNEL_SERVER_URL").cloned())
+            .or_else(|| credentials.get("SERVER_URL").cloned())
+            .or_else(|| file.get("TUNNEL_SERVER_URL").cloned())
             .unwrap_or_else(|| "ws://127.0.0.1:18080/control".into());
         let token = env::var("TUNNEL_TOKEN")
             .ok()
-            .or_else(|| load_file_config().get("TUNNEL_TOKEN").cloned())
-            .unwrap_or_else(|| "change-me-agent-token".into());
-        let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows agent".into());
+            .or_else(|| credentials.get("TOKEN").cloned())
+            .or_else(|| file.get("TUNNEL_TOKEN").cloned())
+            .unwrap_or_default();
+        let name = credentials
+            .get("DEVICE_NAME")
+            .cloned()
+            .or_else(|| env::var("COMPUTERNAME").ok())
+            .unwrap_or_else(|| "Windows agent".into());
         let data_server = Url::parse(&server)
             .map(|mut url| {
                 url.set_path("/data");
                 url.to_string()
             })
             .unwrap_or_else(|_| format!("{}/data", server.trim_end_matches('/')));
-        let data_channels = env::var("DATA_CHANNELS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|channels| (1..=8).contains(channels))
-            .unwrap_or(2);
-        let heartbeat_secs = env_secs("AGENT_HEARTBEAT_SECS", 10, 3, 60);
-        let pong_timeout_secs = env_secs("AGENT_PONG_TIMEOUT_SECS", 25, 5, 300);
-        let reconnect_min_secs = env_secs("AGENT_RECONNECT_MIN_SECS", 1, 1, 60);
-        let reconnect_max_secs =
-            env_secs("AGENT_RECONNECT_MAX_SECS", 10, 1, 300).max(reconnect_min_secs);
+        let data_channels = pick_num(&["DATA_CHANNELS"], &[&credentials, &file], 2, 1, 8) as u16;
+        let heartbeat_secs = pick_num(
+            &["HEARTBEAT_SECS", "AGENT_HEARTBEAT_SECS"],
+            &[&credentials, &file],
+            10,
+            3,
+            60,
+        );
+        let pong_timeout_secs = pick_num(
+            &["PONG_TIMEOUT_SECS", "AGENT_PONG_TIMEOUT_SECS"],
+            &[&credentials, &file],
+            25,
+            5,
+            300,
+        );
+        let reconnect_min_secs = pick_num(
+            &["RECONNECT_MIN_SECS", "AGENT_RECONNECT_MIN_SECS"],
+            &[&credentials, &file],
+            1,
+            1,
+            60,
+        );
+        let reconnect_max_secs = pick_num(
+            &["RECONNECT_MAX_SECS", "AGENT_RECONNECT_MAX_SECS"],
+            &[&credentials, &file],
+            10,
+            1,
+            300,
+        )
+        .max(reconnect_min_secs);
+        let log_level = credentials
+            .get("LOG_LEVEL")
+            .cloned()
+            .or_else(|| file.get("LOG_LEVEL").cloned())
+            .or_else(|| env::var("AGENT_LOG_LEVEL").ok())
+            .filter(|level| {
+                matches!(
+                    level.as_str(),
+                    "error" | "warn" | "info" | "debug" | "trace"
+                )
+            })
+            .unwrap_or_else(|| "info".into());
         Self {
             server,
             data_server,
@@ -112,16 +173,57 @@ impl AgentConfig {
             pong_timeout_secs,
             reconnect_min_secs,
             reconnect_max_secs,
+            log_level,
+        }
+    }
+
+    fn to_agent_settings(&self) -> AgentSettings {
+        AgentSettings {
+            device_name: self.name.clone(),
+            server_url: self.server.clone(),
+            data_channels: self.data_channels,
+            heartbeat_secs: self.heartbeat_secs,
+            pong_timeout_secs: self.pong_timeout_secs,
+            reconnect_min_secs: self.reconnect_min_secs,
+            reconnect_max_secs: self.reconnect_max_secs,
+            log_level: self.log_level.clone(),
         }
     }
 }
 
-fn env_secs(key: &str, default: u64, min: u64, max: u64) -> u64 {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|secs| *secs >= min && *secs <= max)
-        .unwrap_or(default)
+/// Picks the first valid number from `keys` across `sources` (credentials
+/// first, then the bootstrap file), falling back to `default`.
+fn pick_num(
+    keys: &[&str],
+    sources: &[&HashMap<String, String>],
+    default: u64,
+    min: u64,
+    max: u64,
+) -> u64 {
+    for key in keys {
+        for source in sources {
+            if let Some(value) = source
+                .get(*key)
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value >= min && *value <= max)
+            {
+                return value;
+            }
+        }
+    }
+    default
+}
+
+fn generate_enroll_code() -> String {
+    let bytes = uuid::Uuid::new_v4();
+    bytes
+        .as_bytes()
+        .iter()
+        .take(ENROLL_CODE_LEN)
+        .map(|byte| {
+            ENROLL_CODE_ALPHABET[(byte % ENROLL_CODE_ALPHABET.len() as u8) as usize] as char
+        })
+        .collect()
 }
 
 /// Backoff before the next reconnect attempt: exponential growth from `min` up
@@ -204,94 +306,97 @@ fn kind_str(kind: &TunnelKind) -> &'static str {
     }
 }
 
-/// Serves `GET http://127.0.0.1:17890/status` for the local GUI. The service
-/// binds only to loopback and exposes no secrets, so a plain CORS-enabled
-/// JSON endpoint is sufficient.
-async fn status_server(status: AgentStatus) {
-    let Ok(listener) = TcpListener::bind("127.0.0.1:17890").await else {
-        tracing::warn!("local status server could not bind 127.0.0.1:17890");
-        return;
-    };
-    loop {
-        let Ok((socket, _)) = listener.accept().await else {
-            continue;
-        };
-        let status = status.clone();
-        tokio::spawn(async move {
-            handle_status_request(socket, status).await;
-        });
+/// Server-issued credentials and pushed settings live in a single key/value
+/// file so the agent can reconnect unattended. The operator never sees or
+/// types the token; on Windows the file is locked down to SYSTEM/Administrators.
+fn credentials_path() -> PathBuf {
+    if let Some(path) = env::var_os("TUNNEL_CREDENTIALS_FILE") {
+        return PathBuf::from(path);
     }
+    #[cfg(windows)]
+    {
+        if let Some(root) = env::var_os("PROGRAMDATA") {
+            return PathBuf::from(root)
+                .join("TunnelControl")
+                .join("credentials");
+        }
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("credentials")))
+        .unwrap_or_else(|| PathBuf::from("credentials"))
 }
 
-async fn handle_status_request(mut socket: TcpStream, status: AgentStatus) {
-    let mut buffer = [0_u8; 1024];
-    let Ok(size) = socket.read(&mut buffer).await else {
-        return;
-    };
-    let request = String::from_utf8_lossy(&buffer[..size]);
-    let path = request.split_whitespace().nth(1).unwrap_or("/");
-    let (code, body) = if path == "/status" {
-        ("200 OK", build_status_json(&status).await)
-    } else {
-        ("404 Not Found", r#"{"error":"not found"}"#.to_string())
-    };
-    let response = format!(
-        "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = socket.write_all(response.as_bytes()).await;
+fn parse_key_value(content: &str) -> HashMap<String, String> {
+    content
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect()
 }
 
-async fn build_status_json(status: &AgentStatus) -> String {
-    let connected = status.connected.load(Ordering::Relaxed);
-    let tunnels: Vec<serde_json::Value> = status
-        .specs
-        .read()
-        .await
-        .values()
-        .map(|tunnel| {
-            serde_json::json!({
-                "id": tunnel.id,
-                "name": tunnel.name,
-                "kind": kind_str(&tunnel.kind),
-                "public_port": tunnel.public_port,
-                "local_host": tunnel.local_host,
-                "local_port": tunnel.local_port,
-                "enabled": tunnel.enabled,
-                "max_connections": tunnel.max_connections,
-            })
-        })
-        .collect();
-    let connections: Vec<serde_json::Value> = status
-        .connections
-        .read()
-        .await
-        .values()
-        .map(|connection| {
-            serde_json::json!({
-                "stream_id": connection.stream_id,
-                "tunnel_id": connection.tunnel_id,
-                "kind": connection.kind,
-                "public_port": connection.public_port,
-                "local_host": connection.local_host,
-                "local_port": connection.local_port,
-                "data_channel": connection.data_channel,
-                "opened_at": connection.opened_at,
-            })
-        })
-        .collect();
-    let data_channels: Vec<u16> = {
-        let mut channels: Vec<u16> = status.data_channels.read().await.keys().copied().collect();
-        channels.sort_unstable();
-        channels
-    };
-    serde_json::json!({
-        "connected": connected,
-        "data_channels": data_channels,
-        "tunnels": tunnels,
-        "connections": connections,
-    })
-    .to_string()
+fn load_credentials() -> HashMap<String, String> {
+    fs::read_to_string(credentials_path())
+        .map(|content| parse_key_value(&content))
+        .unwrap_or_default()
+}
+
+/// Merges `updates` into the credentials file. Empty values remove the key so
+/// e.g. a consumed enrollment code is cleared, not stored as blank.
+fn save_credentials(updates: &HashMap<String, String>) -> io::Result<()> {
+    let path = credentials_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut map = load_credentials();
+    for (key, value) in updates {
+        if value.is_empty() {
+            map.remove(key);
+        } else {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    let mut content = String::new();
+    for (key, value) in map {
+        content.push_str(&format!("{key}={value}\n"));
+    }
+    fs::write(&path, content)?;
+    restrict_credentials(&path);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_credentials(path: &Path) {
+    // SYSTEM + Administrators cover the Windows service; the interactive user
+    // keeps access so console mode can still re-read the file after saving.
+    let current_user = Command::new("whoami")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|user| !user.is_empty());
+    let mut args: Vec<String> = vec![
+        "/inheritance:r".into(),
+        "/grant:r".into(),
+        "SYSTEM:(F)".into(),
+        "/grant:r".into(),
+        "Administrators:(F)".into(),
+    ];
+    if let Some(user) = current_user {
+        args.push("/grant:r".into());
+        args.push(format!("{user}:(F)"));
+    }
+    let _ = Command::new("icacls").arg(path).args(&args).status();
+}
+
+#[cfg(not(windows))]
+fn restrict_credentials(_path: &Path) {}
+
+/// Applies a pushed log level to the running filter; failures are ignored so
+/// a bad value never takes the agent down.
+fn apply_log_level(level: &str) {
+    if let Some(handle) = LOG_FILTER.get() {
+        handle(level);
+    }
 }
 
 #[cfg(windows)]
@@ -309,9 +414,8 @@ define_windows_service!(ffi_service_main, service_main);
 
 fn main() {
     let arguments: Vec<String> = env::args().collect();
-    let service_mode = arguments.iter().any(|argument| argument == "--service");
-    setup_logging(!service_mode);
-    if service_mode {
+    if arguments.iter().any(|argument| argument == "--service") {
+        setup_logging(false);
         #[cfg(windows)]
         {
             if let Err(error) =
@@ -329,8 +433,44 @@ fn main() {
             std::process::exit(1);
         }
     }
+    if arguments.iter().any(|argument| argument == "--uninstall") {
+        setup_logging(false);
+        if let Err(error) = uninstall_service() {
+            eprintln!("Uninstall failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if arguments.iter().any(|argument| argument == "--install") {
+        setup_logging(true);
+        let server = arguments
+            .iter()
+            .position(|argument| argument == "--server")
+            .and_then(|index| arguments.get(index + 1))
+            .cloned();
+        if let Err(error) = install_service(server.as_deref()) {
+            eprintln!("Installation failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if arguments.get(1).map(String::as_str) == Some("logs") {
+        let follow = arguments
+            .iter()
+            .any(|argument| argument == "-f" || argument == "--follow");
+        let lines = arguments
+            .iter()
+            .position(|argument| argument == "-n")
+            .and_then(|index| arguments.get(index + 1))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 2000);
+        main_logs(follow, lines);
+        return;
+    }
+    setup_logging(true);
     if !arguments.iter().any(|argument| argument == "--agent") {
-        if let Err(error) = install_service() {
+        if let Err(error) = install_service(None) {
             eprintln!("Installation failed: {error}");
             std::process::exit(1);
         }
@@ -341,18 +481,32 @@ fn main() {
 
 /// Initializes tracing. Console mode keeps stdout output and mirrors it into
 /// the rotating file; service mode writes only to the file. When the log
-/// directory is unusable, logging falls back to console output alone.
+/// directory is unusable, logging falls back to console output alone. The
+/// filter layer is reloadable so `SettingsSync` can change the level live.
 fn setup_logging(console: bool) {
+    let initial_level = load_credentials()
+        .get("LOG_LEVEL")
+        .cloned()
+        .unwrap_or_else(|| "info".into());
+    let (filter_layer, filter_handle) = reload::Layer::new(
+        EnvFilter::try_new(&initial_level).unwrap_or_else(|_| EnvFilter::new("info")),
+    );
     let file_layer = create_file_writer().map(|writer| {
         tracing_subscriber::fmt::layer()
             .with_writer(writer)
             .with_ansi(false)
     });
     let stdout_layer = console.then(|| tracing_subscriber::fmt::layer().with_ansi(true));
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(stdout_layer)
         .with(file_layer)
-        .init();
+        .with(filter_layer);
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    let _ = LOG_FILTER.set(Arc::new(move |level: &str| {
+        if let Ok(filter) = EnvFilter::try_new(level) {
+            let _ = filter_handle.modify(|current| *current = filter);
+        }
+    }));
 }
 
 /// Resolves the rotating log directory: `TUNNEL_LOG_DIR` overrides the default
@@ -451,22 +605,33 @@ fn service_main(_arguments: Vec<OsString>) {
 }
 
 fn run_agent_forever() {
-    let config = AgentConfig::from_env();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
     runtime.block_on(async move {
-        let status = AgentStatus::default();
-        let status_server_status = status.clone();
-        tokio::spawn(async move {
-            status_server(status_server_status).await;
-        });
         let mut attempt = 0_u32;
         let mut jitter = 0_u64;
         loop {
-            if let Err(error) = run(&config, &status).await {
-                tracing::warn!(%error, "agent disconnected; retrying");
+            // Re-read the config every session so enrollment and pushed
+            // settings (persisted to the credentials file) take effect on the
+            // next connect without a process restart.
+            let config = AgentConfig::from_env();
+            let status = AgentStatus::new(&config);
+            let outcome = run(&config, &status).await;
+            match outcome {
+                // Enrollment approved or settings require a reconnect:
+                // connect again immediately with the fresh config.
+                Ok(RunOutcome::ReconnectNow) => {
+                    attempt = 0;
+                    continue;
+                }
+                Ok(RunOutcome::Disconnected) => {
+                    tracing::info!("control connection closed; backing off");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "agent disconnected; retrying");
+                }
             }
             jitter = jitter.wrapping_add(17).wrapping_mul(31);
             let fraction = 0.7 + (jitter % 61) as f64 / 100.0;
@@ -483,32 +648,118 @@ fn run_agent_forever() {
     });
 }
 
-fn install_service() -> Result<(), Box<dyn std::error::Error>> {
+/// `logs` CLI: prints recent agent log lines and optionally follows the
+/// newest file. This is the replacement for the removed GUI log panel.
+fn main_logs(follow: bool, lines: usize) {
+    let Some(dir) = log_dir() else {
+        eprintln!("No agent log directory is configured for this machine.");
+        std::process::exit(1);
+    };
+    let mut printed: HashMap<PathBuf, usize> = HashMap::new();
+    loop {
+        let files = sorted_log_files(&dir);
+        let Some(newest) = files.first() else {
+            eprintln!("No agent.log files found under {dir:?}");
+            if !follow {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if !printed.contains_key(newest) {
+            // First pass: print the tail of the newest few files, newest last
+            // so the output reads chronologically.
+            let mut combined: Vec<String> = Vec::new();
+            for path in files.iter().rev().take(3) {
+                if let Ok(content) = fs::read_to_string(path) {
+                    combined.extend(content.lines().map(|line| line.to_string()));
+                }
+            }
+            let start = combined.len().saturating_sub(lines);
+            for line in combined.into_iter().skip(start) {
+                println!("{line}");
+            }
+            printed.insert(
+                newest.clone(),
+                fs::read_to_string(newest)
+                    .map(|content| content.lines().count())
+                    .unwrap_or(0),
+            );
+        } else if let Ok(content) = fs::read_to_string(newest) {
+            let count = content.lines().count();
+            let previous = printed.get(newest).copied().unwrap_or(0);
+            if count > previous {
+                for line in content.lines().skip(previous) {
+                    println!("{line}");
+                }
+                printed.insert(newest.clone(), count);
+            }
+        }
+        if !follow {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn sorted_log_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|read_dir| {
+            read_dir
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("agent.log"))
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
+    });
+    files.reverse();
+    files
+}
+
+/// Installs the Windows service. `server` may come from `--server` or an
+/// interactive prompt; a token is deliberately NOT requested because the
+/// device-code enrollment flow issues one after the admin approves the agent.
+fn install_service(server: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(windows))]
     return Err("The installer is only supported on Windows".into());
 
     #[cfg(windows)]
     {
-        let mut server_url = String::new();
-        let mut token = String::new();
-        print!("Server WebSocket URL (example: ws://203.0.113.10:18080/control): ");
-        io::stdout().flush()?;
-        io::stdin().read_line(&mut server_url)?;
-        print!("Device token: ");
-        io::stdout().flush()?;
-        io::stdin().read_line(&mut token)?;
-        let server_url = server_url.trim();
-        let token = token.trim();
-        if server_url.is_empty() || token.is_empty() {
-            return Err("Server URL and device token are required".into());
+        let server_url = match server {
+            Some(value) => value.trim().to_string(),
+            None => {
+                let mut input = String::new();
+                print!("Server WebSocket URL (example: ws://203.0.113.10:18080/control): ");
+                io::stdout().flush()?;
+                io::stdin().read_line(&mut input)?;
+                input.trim().to_string()
+            }
+        };
+        if server_url.is_empty() {
+            return Err("Server URL is required".into());
         }
         let install_root = PathBuf::from(env::var("ProgramFiles")?).join("TunnelControl");
         fs::create_dir_all(&install_root)?;
         let agent_path = install_root.join("tunnel-agent.exe");
         fs::copy(env::current_exe()?, &agent_path)?;
+        // Preserve a legacy TUNNEL_TOKEN if one exists; otherwise the agent
+        // starts in device-code enrollment mode.
+        let legacy = load_file_config();
+        let legacy_token = legacy
+            .get("TUNNEL_TOKEN")
+            .map(|token| format!("TUNNEL_TOKEN={token}\n"))
+            .unwrap_or_default();
         fs::write(
             install_root.join("agent.env"),
-            format!("TUNNEL_SERVER_URL={server_url}\nTUNNEL_TOKEN={token}\n"),
+            format!("TUNNEL_SERVER_URL={server_url}\n{legacy_token}"),
         )?;
         let service = "TunnelAgent";
         let _ = Command::new("sc.exe").args(["stop", service]).status();
@@ -548,6 +799,28 @@ fn install_service() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         println!("TunnelAgent service installed and started.");
+        println!("Run 'tunnel-agent.exe logs' to follow the service log.");
+        Ok(())
+    }
+}
+
+/// Stops and removes the Windows service and clears machine-level bootstrap
+/// environment variables. Local credentials are kept so a reinstall reuses
+/// the issued token.
+fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(windows))]
+    return Err("Service uninstall is only supported on Windows".into());
+
+    #[cfg(windows)]
+    {
+        let service = "TunnelAgent";
+        let _ = Command::new("sc.exe").args(["stop", service]).status();
+        let _ = Command::new("sc.exe").args(["delete", service]).status();
+        let _ = Command::new("setx")
+            .args(["TUNNEL_SERVER_URL", ""])
+            .status();
+        let _ = Command::new("setx").args(["TUNNEL_TOKEN", ""]).status();
+        println!("TunnelAgent service removed.");
         Ok(())
     }
 }
@@ -565,10 +838,25 @@ fn load_file_config() -> HashMap<String, String> {
         .collect()
 }
 
-async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn std::error::Error>> {
+enum RunOutcome {
+    /// Enrollment approved or settings changed in a way that needs a new
+    /// control session (server_url / data_channels / token); reconnect now
+    /// without backoff.
+    ReconnectNow,
+    /// The control channel closed or errored; the outer loop applies backoff.
+    Disconnected,
+}
+
+async fn run(
+    config: &AgentConfig,
+    status: &AgentStatus,
+) -> Result<RunOutcome, Box<dyn std::error::Error>> {
+    if config.token.is_empty() {
+        run_enroll(config).await?;
+        return Ok(RunOutcome::ReconnectNow);
+    }
     let (socket, _) = connect_async(&config.server).await?;
     enable_tcp_keepalive(&socket);
-    status.connected.store(true, Ordering::Relaxed);
     tracing::info!(server = %config.server, "control connection established");
     let (mut write, mut read) = socket.split();
     // Control messages (register, heartbeat, ping, probe results, close) use a
@@ -586,6 +874,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
     let reader_done = Arc::new(tokio::sync::Notify::new());
+    let settings_changed = Arc::new(tokio::sync::Notify::new());
 
     let register = ControlMessage::Register {
         version: PROTOCOL_VERSION,
@@ -618,6 +907,7 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
     let reader_status = status.clone();
     let reader_data_tasks = data_tasks.clone();
     let reader_done_notify = reader_done.clone();
+    let reader_settings_changed = settings_changed.clone();
     let reader_task = tokio::spawn(async move {
         let mut data_channels_opened = false;
         while let Some(Ok(message)) = read.next().await {
@@ -655,6 +945,56 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                         reader_bandwidth.set_mbps(mbps);
                         tracing::info!(mbps, "server bandwidth limit applied");
                     }
+                    Ok(ControlMessage::SettingsSync { settings }) => {
+                        let current = reader_status.settings.read().await.clone();
+                        // Fields that cannot change live require a reconnect;
+                        // everything else applies immediately.
+                        let reconnect_required = settings.server_url != current.server_url
+                            || settings.data_channels != current.data_channels;
+                        let mut updates = HashMap::new();
+                        updates.insert("SERVER_URL".to_string(), settings.server_url.clone());
+                        updates.insert("DEVICE_NAME".to_string(), settings.device_name.clone());
+                        updates.insert(
+                            "DATA_CHANNELS".to_string(),
+                            settings.data_channels.to_string(),
+                        );
+                        updates.insert(
+                            "HEARTBEAT_SECS".to_string(),
+                            settings.heartbeat_secs.to_string(),
+                        );
+                        updates.insert(
+                            "PONG_TIMEOUT_SECS".to_string(),
+                            settings.pong_timeout_secs.to_string(),
+                        );
+                        updates.insert(
+                            "RECONNECT_MIN_SECS".to_string(),
+                            settings.reconnect_min_secs.to_string(),
+                        );
+                        updates.insert(
+                            "RECONNECT_MAX_SECS".to_string(),
+                            settings.reconnect_max_secs.to_string(),
+                        );
+                        updates.insert("LOG_LEVEL".to_string(), settings.log_level.clone());
+                        if save_credentials(&updates).is_err() {
+                            tracing::warn!("could not persist pushed settings");
+                        }
+                        apply_log_level(&settings.log_level);
+                        *reader_status.settings.write().await = settings;
+                        tracing::info!("server settings applied");
+                        if reconnect_required {
+                            reader_settings_changed.notify_one();
+                        }
+                    }
+                    Ok(ControlMessage::TokenRotate { token }) => {
+                        let mut updates = HashMap::new();
+                        updates.insert("TOKEN".to_string(), token);
+                        updates.insert("ENROLL_CODE".to_string(), String::new());
+                        if save_credentials(&updates).is_err() {
+                            tracing::warn!("could not persist rotated token");
+                        }
+                        tracing::info!("device token rotated; reconnecting");
+                        reader_settings_changed.notify_one();
+                    }
                     Ok(ControlMessage::StreamOpen {
                         stream_id,
                         tunnel_id,
@@ -685,21 +1025,10 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
                         // Register the stream before spawning the bridge so the
                         // first data frame following StreamOpen is never dropped.
                         reader_streams.write().await.insert(id, tx.clone());
-                        let opened_at = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|duration| duration.as_secs())
-                            .unwrap_or(0);
                         reader_connections.write().await.insert(
                             id,
                             ConnectionInfo {
-                                stream_id: id.to_string(),
-                                tunnel_id: tunnel_id.clone(),
                                 kind: kind_str(&spec.kind).to_string(),
-                                public_port: spec.public_port,
-                                local_host: spec.local_host.clone(),
-                                local_port: spec.local_port,
-                                data_channel,
-                                opened_at,
                             },
                         );
                         tracing::info!(
@@ -807,10 +1136,16 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
         reader_done_notify.notify_one();
     });
 
+    let mut reconnect = false;
     loop {
+        let heartbeat_secs = status.settings.read().await.heartbeat_secs;
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(config.heartbeat_secs)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(heartbeat_secs)) => {}
             _ = reader_done.notified() => break,
+            _ = settings_changed.notified() => {
+                reconnect = true;
+                break;
+            }
         }
         let now = Instant::now();
         pending
@@ -819,7 +1154,8 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
             .retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(10));
         // After wake-from-sleep the TCP connection may be dead while the OS
         // keeps retransmitting; require a fresh pong or reconnect promptly.
-        if last_pong.lock().unwrap().elapsed() > Duration::from_secs(config.pong_timeout_secs) {
+        let pong_timeout_secs = status.settings.read().await.pong_timeout_secs;
+        if last_pong.lock().unwrap().elapsed() > Duration::from_secs(pong_timeout_secs) {
             break;
         }
         let heartbeat = ControlMessage::Heartbeat {
@@ -834,7 +1170,6 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
         }
         let _ = control_tx.try_send(Message::Ping(Vec::new().into()));
     }
-    status.connected.store(false, Ordering::Relaxed);
     status.connections.write().await.clear();
     for task in data_tasks.lock().await.drain(..) {
         task.abort();
@@ -847,7 +1182,77 @@ async fn run(config: &AgentConfig, status: &AgentStatus) -> Result<(), Box<dyn s
     pending.write().await.clear();
     writer_task.abort();
     reader_task.abort();
-    Err("control channel closed; reconnecting".into())
+    if reconnect {
+        Ok(RunOutcome::ReconnectNow)
+    } else {
+        Ok(RunOutcome::Disconnected)
+    }
+}
+
+/// Device-code enrollment: connects without a token, prints a one-time code
+/// for the administrator, and waits for the server to issue a token. On
+/// approval the token is persisted and the caller reconnects through the
+/// normal `Register` path.
+async fn run_enroll(config: &AgentConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let (socket, _) = connect_async(&config.server).await?;
+    enable_tcp_keepalive(&socket);
+    tracing::info!(server = %config.server, "connecting for device enrollment");
+    let (mut sink, mut source) = socket.split();
+    let credentials = load_credentials();
+    let code = match credentials.get("ENROLL_CODE") {
+        Some(code) if code.len() == ENROLL_CODE_LEN => code.clone(),
+        _ => {
+            let code = generate_enroll_code();
+            let mut updates = HashMap::new();
+            updates.insert("ENROLL_CODE".to_string(), code.clone());
+            save_credentials(&updates)?;
+            code
+        }
+    };
+    println!("==============================================");
+    println!("Device enrollment required.");
+    println!("Enrollment code: {code}");
+    println!("Give this one-time code to the administrator; it expires in 15 minutes.");
+    println!("==============================================");
+    tracing::info!(
+        code,
+        "device enrollment code; waiting for administrator approval"
+    );
+    let enroll = ControlMessage::Enroll {
+        code: code.clone(),
+        device_name: config.name.clone(),
+    };
+    sink.send(Message::Text(String::from_utf8(encode(&enroll)?)?.into()))
+        .await?;
+    loop {
+        let Some(Ok(message)) = source.next().await else {
+            return Err("enrollment socket closed before approval".into());
+        };
+        if let Message::Text(text) = message {
+            if let Ok(ControlMessage::Enrolled { token, device_id }) = decode(text.as_bytes()) {
+                tracing::info!(%device_id, "enrollment approved; persisting issued token");
+                let mut updates = HashMap::new();
+                updates.insert("TOKEN".to_string(), token);
+                updates.insert("ENROLL_CODE".to_string(), String::new());
+                save_credentials(&updates)?;
+                println!("Enrollment approved. Reconnecting with the issued token.");
+                return Ok(());
+            }
+            if let Ok(ControlMessage::Error {
+                code: error_code,
+                message,
+            }) = decode(text.as_bytes())
+            {
+                tracing::warn!(code = %error_code, message, "enrollment rejected");
+                // Consume the code so the next attempt shows a fresh one.
+                let mut updates = HashMap::new();
+                updates.insert("ENROLL_CODE".to_string(), String::new());
+                let _ = save_credentials(&updates);
+                println!("Enrollment {error_code}: {message}. A new code will be generated.");
+                return Err("enrollment rejected".into());
+            }
+        }
+    }
 }
 
 /// Sets an aggressive TCP keepalive so a half-open link (router reboot, NAT
@@ -1025,7 +1430,10 @@ async fn route_agent_binary(
         .read()
         .await
         .get(&id)
-        .map(|connection| connection.kind == "udp")
+        .map(|connection| {
+            let kind = &connection.kind;
+            kind == "udp"
+        })
         .unwrap_or(false);
     if is_udp {
         // UDP tolerates loss; drop the datagram and keep the session alive.
@@ -1197,6 +1605,7 @@ fn send_close(control: &mpsc::Sender<Message>, stream_id: String, reason: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn agent_limiter_paces_outbound_at_cap() {
@@ -1414,5 +1823,55 @@ mod tests {
         assert!(low < base && base < high);
         let extreme = reconnect_delay(10, min, max, 1.3);
         assert!(extreme.as_secs_f64() <= max as f64 * 1.3 + 1e-9);
+    }
+
+    #[test]
+    fn enroll_code_uses_alphabet_and_length() {
+        for _ in 0..20 {
+            let code = generate_enroll_code();
+            assert_eq!(code.len(), ENROLL_CODE_LEN);
+            assert!(
+                code.bytes()
+                    .all(|byte| ENROLL_CODE_ALPHABET.contains(&byte))
+            );
+        }
+    }
+
+    #[test]
+    fn pick_num_prefers_first_valid_source() {
+        let credentials = HashMap::from([("DATA_CHANNELS".to_string(), "6".to_string())]);
+        let file = HashMap::from([("DATA_CHANNELS".to_string(), "3".to_string())]);
+        assert_eq!(
+            pick_num(&["DATA_CHANNELS"], &[&credentials, &file], 2, 1, 8),
+            6
+        );
+        // Out-of-range values are skipped in favor of the next source/default.
+        let bad = HashMap::from([("DATA_CHANNELS".to_string(), "99".to_string())]);
+        assert_eq!(pick_num(&["DATA_CHANNELS"], &[&bad, &file], 2, 1, 8), 3);
+        assert_eq!(pick_num(&["MISSING"], &[&bad, &file], 2, 1, 8), 2);
+    }
+
+    #[test]
+    fn credentials_round_trip_clears_empty_keys() {
+        let dir = std::env::temp_dir().join(format!("tunnel-agent-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Test-only env mutation; tests are single-threaded here.
+        unsafe { std::env::set_var("TUNNEL_CREDENTIALS_FILE", dir.join("credentials")) };
+        let mut first = HashMap::new();
+        first.insert("TOKEN".to_string(), "abc".to_string());
+        first.insert("ENROLL_CODE".to_string(), "XYZ12345".to_string());
+        save_credentials(&first).unwrap();
+        assert_eq!(
+            load_credentials().get("TOKEN").map(String::as_str),
+            Some("abc")
+        );
+        let mut second = HashMap::new();
+        second.insert("ENROLL_CODE".to_string(), String::new());
+        save_credentials(&second).unwrap();
+        let after = load_credentials();
+        assert!(after.get("ENROLL_CODE").is_none());
+        assert_eq!(after.get("TOKEN").map(String::as_str), Some("abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::remove_var("TUNNEL_CREDENTIALS_FILE") };
     }
 }
