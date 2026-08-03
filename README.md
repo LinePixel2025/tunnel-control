@@ -72,3 +72,18 @@ tunnel-agent.exe --uninstall
 ```
 
 设备端凭据（服务器下发的令牌）保存在 `%PROGRAMDATA%\TunnelControl\credentials`，仅 SYSTEM/管理员可读写，用户全程不接触令牌。
+
+### 一键启动脚本（脚本模式，无需管理员）
+
+把 `tunnel-client.cmd` / `tunnel-client.ps1` 与 `tunnel-agent.exe` 放在同一目录，双击 `tunnel-client.cmd` 即自动启动代理并进入交互命令行：
+
+```text
+start      启动代理（未运行时）
+stop       终止代理
+restart    终止并重新启动
+status     查看进程、服务与凭据状态
+logs       查看最近日志（首次可看到注册码）
+exit       退出脚本（代理保持后台运行）
+```
+
+脚本模式使用 `%LOCALAPPDATA%\TunnelControl` 下的独立凭据与日志，不触碰 Windows 服务的 `%PROGRAMDATA%` 文件，普通用户即可运行；若检测到 TunnelAgent 服务正在运行，脚本会提示先停止服务，避免两个代理抢占同一设备会话。
