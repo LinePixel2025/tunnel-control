@@ -27,10 +27,16 @@ use tunnel_protocol::{
 };
 use url::Url;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 /// Enrollment pairing code alphabet and length; the same constants live in the
 /// server so both sides agree on what a valid code looks like.
 const ENROLL_CODE_LEN: usize = 8;
 const ENROLL_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// Preset server offered on first start in the client console.
+const OFFICIAL_SERVER_URL: &str = "ws://123.207.8.77:18080/control";
 
 /// Runtime hook for the tracing filter so `SettingsSync` can change the log
 /// level without restarting the process. The concrete reload handle is hidden
@@ -102,11 +108,18 @@ impl AgentConfig {
         let credentials = load_credentials();
         let server = env::var("TUNNEL_SERVER_URL")
             .ok()
-            .or_else(|| credentials.get("SERVER_URL").cloned())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                credentials
+                    .get("SERVER_URL")
+                    .cloned()
+                    .filter(|value| !value.trim().is_empty())
+            })
             .or_else(|| file.get("TUNNEL_SERVER_URL").cloned())
             .unwrap_or_else(|| "ws://127.0.0.1:18080/control".into());
         let token = env::var("TUNNEL_TOKEN")
             .ok()
+            .filter(|value| !value.trim().is_empty())
             .or_else(|| credentials.get("TOKEN").cloned())
             .or_else(|| file.get("TUNNEL_TOKEN").cloned())
             .unwrap_or_default();
@@ -412,8 +425,136 @@ use windows_service::{
 #[cfg(windows)]
 define_windows_service!(ffi_service_main, service_main);
 
+/// Quotes one Windows command-line argument the way CommandLineToArgvW parses
+/// it: wrapped in double quotes when it contains spaces or quotes, with
+/// embedded quotes escaped by backslashes.
+fn quote_win_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte == b'"')
+    {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    for byte in arg.bytes() {
+        if byte == b'"' {
+            out.push('\\');
+        }
+        out.push(byte as char);
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+mod elevation {
+    use super::quote_win_arg;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        UI::Shell::ShellExecuteW,
+    };
+
+    pub fn is_elevated() -> bool {
+        unsafe {
+            let mut token: HANDLE = 0;
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut size = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut _ as *mut core::ffi::c_void,
+                core::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut size,
+            );
+            CloseHandle(token);
+            ok != 0 && elevation.TokenIsElevated != 0
+        }
+    }
+
+    /// Relaunches the current executable with the UAC "run as administrator"
+    /// verb, forwarding the original arguments. Returns true when the elevated
+    /// process was started (the caller should exit).
+    pub fn relaunch_elevated(arguments: &[String]) -> bool {
+        let Some(exe) = std::env::current_exe().ok() else {
+            return false;
+        };
+        let exe_wide: Vec<u16> = exe
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let parameters = arguments
+            .iter()
+            .map(|argument| quote_win_arg(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parameters_wide: Vec<u16> = parameters.encode_utf16().chain(Some(0)).collect();
+        let runas: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                0, // HWND (isize): no parent window
+                runas.as_ptr(),
+                exe_wide.as_ptr(),
+                parameters_wide.as_ptr(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            )
+        };
+        (result as isize) > 32
+    }
+}
+
+/// Returns true when the process should stop because an elevated relaunch was
+/// started. Console, install, uninstall, and reset all require elevation;
+/// service/agent workers and the read-only logs command never prompt. Set
+/// TUNNEL_SKIP_ELEVATION=1 to bypass (useful for scripting/testing).
+fn maybe_self_elevate(arguments: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        if std::env::var_os("TUNNEL_SKIP_ELEVATION").is_some() {
+            return false;
+        }
+        if arguments
+            .iter()
+            .any(|argument| argument == "--service" || argument == "--agent")
+        {
+            return false;
+        }
+        if arguments.get(1).map(String::as_str) == Some("logs") {
+            return false;
+        }
+        if elevation::is_elevated() {
+            return false;
+        }
+        println!("当前不是管理员，正在请求管理员权限…");
+        if elevation::relaunch_elevated(arguments) {
+            println!("已请求管理员权限，请在弹出的 UAC 窗口中确认；本窗口即将退出。");
+            true
+        } else {
+            println!("自动提权失败（可能已被取消）。继续以当前权限运行，部分操作可能失败。");
+            false
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = arguments;
+        false
+    }
+}
+
 fn main() {
     let arguments: Vec<String> = env::args().collect();
+    if maybe_self_elevate(&arguments) {
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--service") {
         setup_logging(false);
         #[cfg(windows)]
@@ -476,15 +617,337 @@ fn main() {
         main_logs(follow, lines);
         return;
     }
-    setup_logging(true);
-    if !arguments.iter().any(|argument| argument == "--agent") {
-        if let Err(error) = install_service(None) {
-            eprintln!("Installation failed: {error}");
-            std::process::exit(1);
-        }
+    if arguments.iter().any(|argument| argument == "--agent") {
+        setup_logging(true);
+        run_agent_forever();
         return;
     }
-    run_agent_forever();
+    run_console();
+}
+
+/// Per-user state for the client console. The console points the credential
+/// and log helpers at this directory so a non-elevated user can run it
+/// without touching the Windows service files under %PROGRAMDATA%.
+fn console_state_dir() -> PathBuf {
+    let root = env::var_os("LOCALAPPDATA").unwrap_or_else(|| env::temp_dir().into_os_string());
+    PathBuf::from(root).join("TunnelControl")
+}
+
+fn console_credentials_file() -> PathBuf {
+    console_state_dir().join("credentials")
+}
+
+fn console_log_dir() -> PathBuf {
+    console_state_dir().join("logs")
+}
+
+fn console_pid_file() -> PathBuf {
+    console_state_dir().join("agent.pid")
+}
+
+fn validate_server_url(url: &str) -> bool {
+    url.starts_with("ws://") || url.starts_with("wss://")
+}
+
+/// Decides whether a pushed SettingsSync requires a reconnect. An empty
+/// server_url means "not configured" and must never trigger a reconnect or
+/// replace the local bootstrap address; a changed data_channels count always
+/// requires reopening the data channels.
+fn settings_reconnect_decision(current: &AgentSettings, incoming: &AgentSettings) -> bool {
+    let server_url_changed =
+        !incoming.server_url.is_empty() && incoming.server_url != current.server_url;
+    server_url_changed || incoming.data_channels != current.data_channels
+}
+
+fn read_prompt(label: &str) -> Option<String> {
+    print!("{label}> ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.trim().to_string()),
+    }
+}
+
+fn parse_pid_file(content: &str) -> Option<u32> {
+    let value = content.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn read_console_pid() -> Option<u32> {
+    fs::read_to_string(console_pid_file())
+        .ok()
+        .and_then(|content| parse_pid_file(&content))
+}
+
+fn write_console_pid(pid: u32) -> io::Result<()> {
+    if let Some(parent) = console_pid_file().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(console_pid_file(), pid.to_string())
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).ProcessName"),
+        ])
+        .output();
+    output
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("tunnel-agent"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn process_is_running(_pid: u32) -> bool {
+    false
+}
+
+fn stop_process(pid: u32) {
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Stop-Process -Id {pid} -Force"),
+        ])
+        .status();
+}
+
+fn service_is_running() -> bool {
+    #[cfg(windows)]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-Service TunnelAgent -ErrorAction SilentlyContinue).Status -eq 'Running'",
+            ])
+            .output();
+        return output
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("True"))
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// First-run server selection: the operator picks the preset LineWeb server
+/// or types a custom ws:// / wss:// address. The choice is persisted in the
+/// per-user credentials file so later starts skip the prompt.
+fn ensure_server_url() -> Option<String> {
+    if let Some(url) = load_credentials().get("SERVER_URL").cloned() {
+        return Some(url);
+    }
+    loop {
+        println!();
+        println!("首次启动：请选择服务器");
+        println!("  1. LineWeb 官方 ({OFFICIAL_SERVER_URL})");
+        println!("  2. 自定义服务器地址");
+        let Some(choice) = read_prompt("选择 (1/2)") else {
+            return None;
+        };
+        match choice.as_str() {
+            "1" => {
+                let _ = save_credentials(&HashMap::from([(
+                    "SERVER_URL".to_string(),
+                    OFFICIAL_SERVER_URL.to_string(),
+                )]));
+                println!("已选择 LineWeb 官方服务器。");
+                return Some(OFFICIAL_SERVER_URL.to_string());
+            }
+            "2" => loop {
+                let Some(url) = read_prompt("服务器地址 (ws:// 或 wss:// 开头)") else {
+                    return None;
+                };
+                if validate_server_url(&url) {
+                    let _ =
+                        save_credentials(&HashMap::from([("SERVER_URL".to_string(), url.clone())]));
+                    return Some(url);
+                }
+                println!("地址必须以 ws:// 或 wss:// 开头，请重新输入。");
+            },
+            _ => println!("请输入 1 或 2。"),
+        }
+    }
+}
+
+/// Returns the enrollment code the worker will present, generating and
+/// persisting a fresh one when needed. The console prints it so the operator
+/// sees it immediately instead of hunting through logs.
+fn ensure_enrollment_code() -> String {
+    let credentials = load_credentials();
+    if let Some(code) = credentials.get("ENROLL_CODE") {
+        if code.len() == ENROLL_CODE_LEN {
+            return code.clone();
+        }
+    }
+    let code = generate_enroll_code();
+    let _ = save_credentials(&HashMap::from([("ENROLL_CODE".to_string(), code.clone())]));
+    code
+}
+
+#[cfg(windows)]
+fn start_agent_process() -> Option<u32> {
+    if let Some(pid) = read_console_pid() {
+        if process_is_running(pid) {
+            println!("Agent is already running (PID {pid}).");
+            return None;
+        }
+    }
+    if service_is_running() {
+        println!("WARNING: the TunnelAgent Windows service is running.");
+        println!("Console mode and service mode would fight over the same device session.");
+        println!(
+            "Stop it first with:  sc.exe stop TunnelAgent   (or: tunnel-agent.exe --uninstall)"
+        );
+        return None;
+    }
+    let _server = ensure_server_url()?;
+    // Env-var bootstrap values may be stale (legacy machine-level installs);
+    // the worker must use only the per-user credentials the console manages.
+    let pending_enrollment = load_credentials().get("TOKEN").is_none();
+    let enrollment_code = pending_enrollment.then(ensure_enrollment_code);
+    let exe = env::current_exe().ok()?;
+    let stdout = fs::File::create(console_state_dir().join("console.log")).ok()?;
+    let stderr = fs::File::create(console_state_dir().join("console.err.log")).ok()?;
+    let child = Command::new(exe)
+        .arg("--agent")
+        .env_remove("TUNNEL_TOKEN")
+        .env_remove("TUNNEL_SERVER_URL")
+        .stdout(stdout)
+        .stderr(stderr)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: hidden background worker
+        .spawn()
+        .ok()?;
+    let pid = child.id();
+    let _ = write_console_pid(pid);
+    println!("Agent started (PID {pid}).");
+    if let Some(code) = enrollment_code {
+        println!("==============================================");
+        println!("设备尚未注册，注册码：{code}");
+        println!("请管理员在管理端「设备注册」页输入该注册码批准，批准后自动接入。");
+        println!("==============================================");
+    }
+    Some(pid)
+}
+
+#[cfg(not(windows))]
+fn start_agent_process() -> Option<u32> {
+    println!("Client console is supported on Windows only.");
+    None
+}
+
+fn console_stop() {
+    match read_console_pid() {
+        Some(pid) if process_is_running(pid) => {
+            stop_process(pid);
+            let _ = fs::remove_file(console_pid_file());
+            println!("Agent stopped.");
+        }
+        _ => {
+            let _ = fs::remove_file(console_pid_file());
+            println!("Agent is not running.");
+        }
+    }
+}
+
+fn console_status() {
+    match read_console_pid() {
+        Some(pid) if process_is_running(pid) => println!("Agent process: RUNNING (PID {pid})"),
+        _ => println!("Agent process: stopped"),
+    }
+    let credentials = load_credentials();
+    match credentials.get("SERVER_URL") {
+        Some(url) => println!("Server       : {url}"),
+        None => println!("Server       : not configured (first start will ask)"),
+    }
+    match credentials.get("TOKEN") {
+        Some(_) => println!("Credentials  : token issued (enrolled)"),
+        None => println!("Credentials  : pending enrollment"),
+    }
+    println!(
+        "Service      : {}",
+        if service_is_running() {
+            "running (TunnelAgent)"
+        } else {
+            "not running"
+        }
+    );
+}
+
+fn console_help() {
+    println!("Commands:");
+    println!("  start     start the agent if it is not running");
+    println!("  stop      terminate the agent");
+    println!("  restart   terminate and start again");
+    println!("  reset     stop the agent and delete ALL local data (re-enroll on next start)");
+    println!("  status    show process/service/credential state");
+    println!("  logs      print the latest agent log lines");
+    println!("  exit      leave the console (the agent keeps running)");
+    println!("  help      show this help");
+}
+
+fn console_reset() {
+    console_stop();
+    if let Err(error) = reset_local_data() {
+        println!("Reset failed: {error}");
+    } else {
+        println!("Local agent data has been reset. Type 'start' to choose a server and re-enroll.");
+    }
+}
+
+/// Client console: one-click entry point. First start prompts for the server
+/// (official LineWeb or custom), then starts the agent as a hidden background
+/// process and keeps an interactive command prompt.
+fn run_console() {
+    setup_logging(true);
+    let _ = fs::create_dir_all(console_log_dir());
+    // Point every credential/log helper at the per-user console state so no
+    // elevation is needed. Set once, single-threaded, before any helper runs.
+    unsafe {
+        env::set_var("TUNNEL_CREDENTIALS_FILE", console_credentials_file());
+        env::set_var("TUNNEL_LOG_DIR", console_log_dir());
+    }
+    println!("==============================================");
+    println!("  Tunnel Control Client");
+    println!("==============================================");
+    console_help();
+    start_agent_process();
+    loop {
+        let Some(line) = read_prompt("tunnel-client") else {
+            break;
+        };
+        match line.as_str() {
+            "start" => {
+                start_agent_process();
+            }
+            "stop" => console_stop(),
+            "restart" => {
+                console_stop();
+                std::thread::sleep(Duration::from_millis(300));
+                start_agent_process();
+            }
+            "reset" => console_reset(),
+            "status" => console_status(),
+            "logs" => main_logs(false, 60),
+            "exit" => {
+                println!(
+                    "Exiting. The agent keeps running in the background; type 'stop' to terminate it next time."
+                );
+                break;
+            }
+            "help" => console_help(),
+            "" => {}
+            _ => println!("Unknown command '{line}'. Type 'help'."),
+        }
+    }
 }
 
 /// Initializes tracing. Console mode keeps stdout output and mirrors it into
@@ -1006,10 +1469,13 @@ async fn run(
                         let current = reader_status.settings.read().await.clone();
                         // Fields that cannot change live require a reconnect;
                         // everything else applies immediately.
-                        let reconnect_required = settings.server_url != current.server_url
-                            || settings.data_channels != current.data_channels;
+                        let reconnect_required = settings_reconnect_decision(&current, &settings);
                         let mut updates = HashMap::new();
-                        updates.insert("SERVER_URL".to_string(), settings.server_url.clone());
+                        // Empty server_url means "not configured"; keep the
+                        // local bootstrap address instead of wiping it.
+                        if !settings.server_url.is_empty() {
+                            updates.insert("SERVER_URL".to_string(), settings.server_url.clone());
+                        }
                         updates.insert("DEVICE_NAME".to_string(), settings.device_name.clone());
                         updates.insert(
                             "DATA_CHANNELS".to_string(),
@@ -1930,5 +2396,64 @@ mod tests {
         assert_eq!(after.get("TOKEN").map(String::as_str), Some("abc"));
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::remove_var("TUNNEL_CREDENTIALS_FILE") };
+    }
+
+    #[test]
+    fn server_url_validation_accepts_ws_and_wss_only() {
+        assert!(validate_server_url("ws://123.207.8.77:18080/control"));
+        assert!(validate_server_url("wss://tunnel.example.com/control"));
+        assert!(!validate_server_url("http://example.com"));
+        assert!(!validate_server_url(""));
+        assert!(!validate_server_url("tcp://example.com"));
+    }
+
+    #[test]
+    fn pid_file_parsing_accepts_digits_only() {
+        assert_eq!(parse_pid_file("12345\n"), Some(12345));
+        assert_eq!(parse_pid_file(" 42 "), Some(42));
+        assert_eq!(parse_pid_file(""), None);
+        assert_eq!(parse_pid_file("abc"), None);
+        assert_eq!(parse_pid_file("12x"), None);
+    }
+
+    #[test]
+    fn win_arg_quoting_matches_shell_parsing() {
+        assert_eq!(quote_win_arg("abc"), "abc");
+        assert_eq!(quote_win_arg(""), "\"\"");
+        assert_eq!(quote_win_arg("a b"), "\"a b\"");
+        assert_eq!(quote_win_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_win_arg("--server"), "--server");
+    }
+
+    #[test]
+    fn settings_reconnect_ignores_empty_server_url() {
+        let current = AgentSettings {
+            device_name: "pc".into(),
+            server_url: "ws://123.207.8.77:18080/control".into(),
+            data_channels: 2,
+            heartbeat_secs: 10,
+            pong_timeout_secs: 25,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 10,
+            log_level: "info".into(),
+        };
+        // The server default sends an empty server_url; it must NOT force a
+        // reconnect that would wipe the local bootstrap address.
+        let incoming = AgentSettings {
+            server_url: String::new(),
+            ..current.clone()
+        };
+        assert!(!settings_reconnect_decision(&current, &incoming));
+        // A real address change and a data-channels change still reconnect.
+        let moved = AgentSettings {
+            server_url: "ws://other.example.com/control".into(),
+            ..current.clone()
+        };
+        assert!(settings_reconnect_decision(&current, &moved));
+        let more_channels = AgentSettings {
+            data_channels: 4,
+            ..current.clone()
+        };
+        assert!(settings_reconnect_decision(&current, &more_channels));
     }
 }

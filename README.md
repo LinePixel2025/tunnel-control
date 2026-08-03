@@ -74,9 +74,9 @@ tunnel-agent.exe --uninstall
 
 设备端凭据（服务器下发的令牌）保存在 `%PROGRAMDATA%\TunnelControl\credentials`，仅 SYSTEM/管理员可读写，用户全程不接触令牌。
 
-### 一键启动脚本（脚本模式，无需管理员）
+### 客户端控制台（单文件，无需管理员）
 
-把 `tunnel-client.cmd` / `tunnel-client.ps1` 与 `tunnel-agent.exe` 放在同一目录，双击 `tunnel-client.cmd` 即自动启动代理并进入交互命令行：
+客户端就是单个 `tunnel-agent.exe`。无参数运行（或双击）即进入客户端控制台：首次启动会询问服务器（`1. LineWeb 官方（ws://123.207.8.77:18080/control）` 或 `2. 自定义`），然后自动后台启动代理并进入交互命令行。非管理员运行时控制台、安装、卸载和重置操作会自动弹出 UAC 请求管理员权限（`--agent`、`--service`、`logs` 不弹窗；可用 `TUNNEL_SKIP_ELEVATION=1` 跳过）：
 
 ```text
 start      启动代理（未运行时）
@@ -86,6 +86,7 @@ reset      停止并清除全部本地数据（重新注册）
 status     查看进程、服务与凭据状态
 logs       查看最近日志（首次可看到注册码）
 exit       退出脚本（代理保持后台运行）
+help       显示命令帮助
 ```
 
-脚本模式使用 `%LOCALAPPDATA%\TunnelControl` 下的独立凭据与日志，不触碰 Windows 服务的 `%PROGRAMDATA%` 文件，普通用户即可运行；若检测到 TunnelAgent 服务正在运行，脚本会提示先停止服务，避免两个代理抢占同一设备会话。
+控制台模式使用 `%LOCALAPPDATA%\TunnelControl` 下的独立凭据与日志，不触碰 Windows 服务的 `%PROGRAMDATA%` 文件，普通用户即可运行；若检测到 TunnelAgent 服务正在运行，控制台会提示先停止服务，避免两个代理抢占同一设备会话。

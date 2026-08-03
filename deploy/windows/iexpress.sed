@@ -22,11 +22,7 @@ UserQuietInstCmd=
 SourceFiles=0
 [Strings]
 FILE0="target\release\tunnel-agent.exe"
-FILE1="deploy\windows\tunnel-client.cmd"
-FILE2="deploy\windows\tunnel-client.ps1"
 [SourceFiles]
 SourceFiles0=.
 [SourceFiles0]
 %FILE0%=
-%FILE1%=
-%FILE2%=
