@@ -9,6 +9,8 @@
       start     start the agent if it is not running
       stop      terminate the agent
       restart   terminate and start again
+      reset     stop the agent and delete ALL local data (token, enrollment
+                code, logs, bootstrap config); the next start re-enrolls
       status    show process/service/credential state
       logs      print the latest agent log lines
       exit      leave the prompt (the agent keeps running)
@@ -111,6 +113,18 @@ function Restart-AgentProcess {
     Start-AgentProcess
 }
 
+function Reset-AgentProcess {
+    Stop-AgentProcess
+    # The agent's own reset stops the Windows service, removes the issued
+    # token, enrollment code, bootstrap config, and every log file.
+    & $Agent reset
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Reset failed. Run 'tunnel-client.ps1 reset' as Administrator if the agent is installed under Program Files." -ForegroundColor Yellow
+        return
+    }
+    Write-Host "Local agent data has been reset. Type 'start' to re-enroll."
+}
+
 function Show-Status {
     $running = Get-RunningAgent
     $service = Get-TunnelService
@@ -146,6 +160,7 @@ function Show-Help {
     Write-Host "  start     start the agent if it is not running"
     Write-Host "  stop      terminate the agent"
     Write-Host "  restart   terminate and start again"
+    Write-Host "  reset     stop the agent and delete ALL local data (re-enroll on next start)"
     Write-Host "  status    show process/service/credential state"
     Write-Host "  logs      print the latest agent log lines"
     Write-Host "  exit      leave the prompt (the agent keeps running)"
@@ -162,6 +177,7 @@ function Enter-Interactive {
             "start"   { Start-AgentProcess }
             "stop"    { Stop-AgentProcess }
             "restart" { Restart-AgentProcess }
+            "reset"   { Reset-AgentProcess }
             "status"  { Show-Status }
             "logs"    { Show-Logs }
             "help"    { Show-Help }
@@ -176,10 +192,11 @@ if ($Command) {
         "start"   { Start-AgentProcess }
         "stop"    { Stop-AgentProcess }
         "restart" { Restart-AgentProcess }
+        "reset"   { Reset-AgentProcess }
         "status"  { Show-Status }
         "logs"    { Show-Logs }
         "help"    { Show-Help }
-        default   { throw "Unknown command '$Command'. Use start|stop|restart|status|logs|help" }
+        default   { throw "Unknown command '$Command'. Use start|stop|restart|reset|status|logs|help" }
     }
 } else {
     Enter-Interactive

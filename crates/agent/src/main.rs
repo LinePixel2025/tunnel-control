@@ -454,6 +454,14 @@ fn main() {
         }
         return;
     }
+    if arguments.get(1).map(String::as_str) == Some("reset") {
+        setup_logging(false);
+        if let Err(error) = reset_local_data() {
+            eprintln!("Reset failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if arguments.get(1).map(String::as_str) == Some("logs") {
         let follow = arguments
             .iter()
@@ -823,6 +831,55 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
         println!("TunnelAgent service removed.");
         Ok(())
     }
+}
+
+/// Resets every piece of local agent data: issued token, pending enrollment
+/// code, bootstrap `agent.env`, service logs, and the one-click script state
+/// under %LOCALAPPDATA%. Running agent instances (Windows service or script
+/// mode) are stopped first so file handles are released; the service itself
+/// is kept so `--install` can simply restart it. Run as Administrator when
+/// the agent was installed under Program Files.
+fn reset_local_data() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("sc.exe")
+            .args(["stop", "TunnelAgent"])
+            .status();
+        std::thread::sleep(Duration::from_secs(1));
+        // Stop other agent instances (one-click script mode) but never this
+        // reset process itself.
+        let own_pid = std::process::id();
+        let script = format!(
+            "Get-Process tunnel-agent -ErrorAction SilentlyContinue | \
+             Where-Object {{ $_.Id -ne {own_pid} }} | Stop-Process -Force"
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // One-click script mode state: credentials, logs, pid file, console logs.
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        let _ = fs::remove_dir_all(PathBuf::from(local).join("TunnelControl"));
+    }
+    // Service-mode credentials (PROGRAMDATA by default, or the override env).
+    let credentials = credentials_path();
+    if credentials.exists() {
+        fs::remove_file(&credentials)?;
+    }
+    // Bootstrap config next to the binary (server URL / legacy token).
+    let bootstrap = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("agent.env")))
+        .unwrap_or_else(|| PathBuf::from("agent.env"));
+    let _ = fs::remove_file(&bootstrap);
+    // Rotating service logs.
+    if let Some(dir) = log_dir() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    println!("Local agent data has been reset.");
+    println!("The next start will require device-code enrollment again.");
+    Ok(())
 }
 
 fn load_file_config() -> HashMap<String, String> {

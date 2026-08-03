@@ -68,6 +68,7 @@ Windows 安装与日志：
 ```powershell
 tunnel-agent.exe --install --server ws://公网IP:18080/control   # 管理员权限：安装并启动服务
 tunnel-agent.exe logs -f                                        # 跟踪服务日志（首次会显示注册码）
+tunnel-agent.exe reset                                          # 停止并清除全部本地数据（令牌/注册码/日志/引导配置），下次启动重新注册
 tunnel-agent.exe --uninstall
 ```
 
@@ -81,6 +82,7 @@ tunnel-agent.exe --uninstall
 start      启动代理（未运行时）
 stop       终止代理
 restart    终止并重新启动
+reset      停止并清除全部本地数据（重新注册）
 status     查看进程、服务与凭据状态
 logs       查看最近日志（首次可看到注册码）
 exit       退出脚本（代理保持后台运行）
