@@ -55,6 +55,12 @@ type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>)>>>;
 /// milliseconds, so this cap is never approached in practice.
 const PENDING_STREAM_FRAMES: usize = 64;
 
+/// Upper bound on how long routing waits for one TCP frame to enter a
+/// stream's bounded queue before closing the stream. Waiting (instead of
+/// dropping or closing) turns queue pressure into TCP backpressure; the cap
+/// prevents a wedged local service from stalling the data channel forever.
+const TCP_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Shared runtime state for the agent process. `settings` holds the latest
 /// server-pushed effective configuration; local bootstrap values only apply
 /// until the first `SettingsSync`.
@@ -1787,6 +1793,7 @@ fn enable_tcp_keepalive(
     >,
 ) {
     if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+        let _ = tcp.set_nodelay(true);
         let socket_ref = socket2::SockRef::from(tcp);
         let _ = socket_ref
             .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)));
@@ -1919,7 +1926,8 @@ async fn data_channel_task(
 }
 
 /// Routes one binary frame arriving on a data socket to its stream. TCP
-/// streams are closed when saturated; UDP datagrams are dropped instead.
+/// frames wait in the stream's bounded queue so backpressure reaches the
+/// remote peer; UDP datagrams are dropped when the queue is full.
 async fn route_agent_binary(
     streams: &StreamMap,
     connections: &ConnectionMap,
@@ -1927,6 +1935,27 @@ async fn route_agent_binary(
     pending: &PendingMap,
     id: u128,
     data: &[u8],
+) {
+    route_agent_binary_with_timeout(
+        streams,
+        connections,
+        control,
+        pending,
+        id,
+        data,
+        TCP_SEND_TIMEOUT,
+    )
+    .await
+}
+
+async fn route_agent_binary_with_timeout(
+    streams: &StreamMap,
+    connections: &ConnectionMap,
+    control: &mpsc::Sender<Message>,
+    pending: &PendingMap,
+    id: u128,
+    data: &[u8],
+    timeout: Duration,
 ) {
     let tx = {
         let map = streams.read().await;
@@ -1946,9 +1975,6 @@ async fn route_agent_binary(
         }
         return;
     };
-    if tx.try_send(data.to_vec()).is_ok() {
-        return;
-    }
     let is_udp = connections
         .read()
         .await
@@ -1960,12 +1986,24 @@ async fn route_agent_binary(
         .unwrap_or(false);
     if is_udp {
         // UDP tolerates loss; drop the datagram and keep the session alive.
+        let _ = tx.try_send(data.to_vec());
         return;
     }
-    // Never block a data channel on one saturated TCP stream; close it so the
-    // client can reconnect.
-    drop_stream(&streams, &connections, id, "local_saturated").await;
-    send_close(control, id.to_string(), Some("local_saturated".into()));
+    match tokio::time::timeout(timeout, tx.send(data.to_vec())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // The local bridge went away while enqueuing; close the stream.
+            drop_stream(streams, connections, id, "local_channel_closed").await;
+            send_close(control, id.to_string(), Some("local_channel_closed".into()));
+        }
+        Err(_) => {
+            // The local service is too slow to drain its bounded queue; close
+            // after the timeout instead of dropping bytes or stalling the
+            // shared data channel forever.
+            drop_stream(streams, connections, id, "local_send_timeout").await;
+            send_close(control, id.to_string(), Some("local_send_timeout".into()));
+        }
+    }
 }
 
 /// Verifies the agent can reach the tunnel's local service. TCP/HTTP attempt a
@@ -2017,6 +2055,9 @@ async fn bridge_local(
         );
         return;
     };
+    // Small interactive packets (SSH, HTTP, RDP) are latency-sensitive; never
+    // let Nagle delay them on the local service socket.
+    let _ = socket.set_nodelay(true);
     let (mut reader, mut writer) = socket.into_split();
     let write_task = tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
@@ -2332,6 +2373,122 @@ mod tests {
             "bridge task must terminate after StreamClose abort"
         );
         accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_route_waits_when_local_queue_is_full() {
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let (control, _control_rx) = mpsc::channel::<Message>(8);
+        let id: u128 = 88;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        streams.write().await.insert(id, tx);
+        connections
+            .write()
+            .await
+            .insert(id, ConnectionInfo { kind: "tcp".into() });
+        route_agent_binary(&streams, &connections, &control, &pending, id, b"first").await;
+        // The local queue is now full; routing must wait (backpressure)
+        // instead of dropping the frame or closing the stream.
+        let routing = tokio::spawn({
+            let streams = streams.clone();
+            let connections = connections.clone();
+            let control = control.clone();
+            let pending = pending.clone();
+            async move {
+                route_agent_binary(&streams, &connections, &control, &pending, id, b"second").await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            streams.read().await.contains_key(&id),
+            "saturated TCP stream must stay registered while backpressure applies"
+        );
+        // Draining the local queue lets the waiting frame through, in order.
+        assert_eq!(rx.recv().await.as_deref(), Some(b"first".as_slice()));
+        routing.await.unwrap();
+        assert_eq!(rx.recv().await.as_deref(), Some(b"second".as_slice()));
+        assert!(streams.read().await.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn tcp_route_times_out_and_closes_stream() {
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let (control, mut control_rx) = mpsc::channel::<Message>(8);
+        let id: u128 = 89;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        streams.write().await.insert(id, tx);
+        connections
+            .write()
+            .await
+            .insert(id, ConnectionInfo { kind: "tcp".into() });
+        route_agent_binary_with_timeout(
+            &streams,
+            &connections,
+            &control,
+            &pending,
+            id,
+            b"first",
+            Duration::from_secs(1),
+        )
+        .await;
+        // A local queue that never drains must hit the bounded timeout; only
+        // then is the stream closed and the peer notified.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            route_agent_binary_with_timeout(
+                &streams,
+                &connections,
+                &control,
+                &pending,
+                id,
+                b"second",
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("routing must return after its bounded timeout");
+        assert!(!streams.read().await.contains_key(&id));
+        assert!(!connections.read().await.contains_key(&id));
+        let message = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("timeout waiting for StreamClose")
+            .expect("control channel closed");
+        let Message::Text(text) = message else {
+            panic!("expected text control message");
+        };
+        let Ok(ControlMessage::StreamClose { stream_id, reason }) = decode(text.as_bytes()) else {
+            panic!("expected StreamClose");
+        };
+        assert_eq!(stream_id, "89");
+        assert_eq!(reason.as_deref(), Some("local_send_timeout"));
+    }
+
+    #[tokio::test]
+    async fn udp_route_drops_when_queue_is_full_and_keeps_session() {
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let (control, _control_rx) = mpsc::channel::<Message>(8);
+        let id: u128 = 90;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        streams.write().await.insert(id, tx);
+        connections
+            .write()
+            .await
+            .insert(id, ConnectionInfo { kind: "udp".into() });
+        route_agent_binary(&streams, &connections, &control, &pending, id, b"first").await;
+        // An overflowing UDP datagram is dropped without touching the session.
+        route_agent_binary(&streams, &connections, &control, &pending, id, b"dropped").await;
+        assert_eq!(rx.recv().await.as_deref(), Some(b"first".as_slice()));
+        assert!(
+            rx.try_recv().is_err(),
+            "overflowing UDP datagram must be dropped"
+        );
+        assert!(streams.read().await.contains_key(&id));
     }
 
     #[test]

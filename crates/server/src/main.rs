@@ -48,10 +48,22 @@ const ENROLL_CODE_LEN: usize = 8;
 const ENROLL_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const ENROLL_TTL_MINUTES: i64 = 15;
 
+/// Interval at which the background task persists in-memory heartbeats to the
+/// database and refreshes the Redis online markers. Kept short enough that
+/// online status never drifts more than a couple of minutes.
+const HEARTBEAT_FLUSH_SECS: u64 = 30;
+/// Entries older than this are pruned from the in-memory heartbeat map. Agent
+/// heartbeats can be configured up to 60s apart, so this is three missed
+/// heartbeats; pruning only stops refreshes, it never touches live sessions.
+const HEARTBEAT_STALE_SECS: u64 = 180;
+
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
     redis: redis::Client,
+    /// Reused Redis connection for the heartbeat flusher. `None` while Redis
+    /// is unavailable; the flusher retries on the next tick.
+    redis_conn: Arc<Mutex<Option<redis::aio::MultiplexedConnection>>>,
     jwt_secret: Arc<String>,
     admin_token_ttl_hours: i64,
     bootstrap_agent_token_hash: Option<String>,
@@ -92,6 +104,7 @@ struct DataPlane {
     udp_sessions: Arc<RwLock<HashMap<u128, UdpSession>>>,
     data_channels: Arc<RwLock<HashMap<Uuid, HashMap<u16, DataChannel>>>>,
     data_socket_tasks: Arc<Mutex<HashMap<(Uuid, u16), tokio::task::JoinHandle<()>>>>,
+    heartbeats: Arc<RwLock<HashMap<Uuid, HeartbeatEntry>>>,
 }
 
 /// One live control session for a device. The connection id lets a stale
@@ -101,6 +114,16 @@ struct DataPlane {
 struct SessionEntry {
     connection_id: Uuid,
     tx: mpsc::Sender<Message>,
+}
+
+/// Latest heartbeat seen on a control session, kept in memory so the control
+/// read loop never performs database/Redis IO. A background flusher persists
+/// it in batches; the connection id guards cleanup after a fast reconnect.
+#[derive(Clone)]
+struct HeartbeatEntry {
+    connection_id: Uuid,
+    latency_ms: i32,
+    last_seen: Instant,
 }
 
 /// A data WebSocket bound to a device's current control session. `tx` is the
@@ -116,6 +139,7 @@ struct DataChannel {
 #[derive(Clone)]
 struct StreamEntry {
     device_id: Uuid,
+    tunnel_id: Uuid,
     data_channel: u16,
     tx: mpsc::Sender<Vec<u8>>,
 }
@@ -137,11 +161,20 @@ enum RouteOutcome {
     Ok,
     /// UDP queue full; the datagram is dropped (UDP tolerates loss).
     Dropped,
-    /// TCP stream queue saturated; the caller must close the stream.
-    StreamSaturated(u128),
+    /// TCP stream queue stayed full past the send timeout; the stream must be
+    /// closed so a wedged peer cannot stall the data channel forever.
+    StreamSendTimeout(u128),
+    /// TCP stream queue closed while enqueuing; the stream must be closed.
+    StreamChannelClosed(u128),
     /// UDP session outbox was closed; the session entry is gone.
     UdpSessionGone(u128),
 }
+
+/// Upper bound on how long routing waits for one TCP frame to enter a
+/// stream's bounded queue. Waiting (instead of dropping or closing the
+/// stream) turns queue pressure into TCP backpressure; the cap only exists so
+/// a wedged peer cannot stall the data channel indefinitely.
+const TCP_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// Removes a session entry only when it still belongs to `connection_id`, so a
 /// stale control loop can never delete the session of a newer connection.
@@ -159,9 +192,69 @@ fn remove_session_if_owned(
     }
 }
 
+/// Removes a heartbeat entry only when it still belongs to `connection_id`,
+/// mirroring the session cleanup so a stale control loop can never drop the
+/// heartbeat state of a newer connection.
+fn remove_heartbeat_if_owned(
+    heartbeats: &mut HashMap<Uuid, HeartbeatEntry>,
+    device_id: Uuid,
+    connection_id: Uuid,
+) -> bool {
+    match heartbeats.get(&device_id) {
+        Some(entry) if entry.connection_id == connection_id => {
+            heartbeats.remove(&device_id);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Routes one incoming data frame (from any data socket) to its destination.
-/// TCP streams are closed when saturated; UDP datagrams are dropped instead.
+/// TCP frames wait in the stream's bounded queue so backpressure reaches the
+/// sender; UDP datagrams are dropped when their queue is full instead.
 async fn route_stream_data(plane: &DataPlane, id: u128, data: &[u8]) -> RouteOutcome {
+    route_stream_data_with_timeout(plane, id, data, TCP_SEND_TIMEOUT).await
+}
+
+/// Atomically counts the active TCP streams for one tunnel and registers a
+/// new stream when the tunnel still has capacity. Returns false (and inserts
+/// nothing) once `max_connections` streams are active; callers then reject
+/// the public connection without sending `StreamOpen`.
+async fn try_register_stream(
+    plane: &DataPlane,
+    id: u128,
+    device_id: Uuid,
+    tunnel_id: Uuid,
+    data_channel: u16,
+    tx: mpsc::Sender<Vec<u8>>,
+    max_connections: usize,
+) -> bool {
+    let mut streams = plane.streams.write().await;
+    let active = streams
+        .values()
+        .filter(|entry| entry.device_id == device_id && entry.tunnel_id == tunnel_id)
+        .count();
+    if active >= max_connections {
+        return false;
+    }
+    streams.insert(
+        id,
+        StreamEntry {
+            device_id,
+            tunnel_id,
+            data_channel,
+            tx,
+        },
+    );
+    true
+}
+
+async fn route_stream_data_with_timeout(
+    plane: &DataPlane,
+    id: u128,
+    data: &[u8],
+    timeout: StdDuration,
+) -> RouteOutcome {
     let outbox = {
         let sessions = plane.udp_sessions.read().await;
         sessions.get(&id).map(|session| session.outbox.clone())
@@ -186,11 +279,17 @@ async fn route_stream_data(plane: &DataPlane, id: u128, data: &[u8]) -> RouteOut
             streams.get(&id).map(|entry| entry.tx.clone())
         };
         match tx {
-            Some(tx) if tx.try_send(data.to_vec()).is_ok() => RouteOutcome::Ok,
-            Some(_) => {
-                plane.streams.write().await.remove(&id);
-                RouteOutcome::StreamSaturated(id)
-            }
+            Some(tx) => match tokio::time::timeout(timeout, tx.send(data.to_vec())).await {
+                Ok(Ok(())) => RouteOutcome::Ok,
+                Ok(Err(_)) => {
+                    plane.streams.write().await.remove(&id);
+                    RouteOutcome::StreamChannelClosed(id)
+                }
+                Err(_) => {
+                    plane.streams.write().await.remove(&id);
+                    RouteOutcome::StreamSendTimeout(id)
+                }
+            },
             None => RouteOutcome::Ok,
         }
     }
@@ -467,6 +566,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_control_cleanup_keeps_new_heartbeat() {
+        let device = Uuid::new_v4();
+        let old_connection = Uuid::new_v4();
+        let new_connection = Uuid::new_v4();
+        let mut heartbeats = HashMap::new();
+        heartbeats.insert(
+            device,
+            HeartbeatEntry {
+                connection_id: new_connection,
+                latency_ms: 12,
+                last_seen: Instant::now(),
+            },
+        );
+        // A stale control loop finishing after a fast reconnect must not
+        // remove the heartbeat state of the newer connection.
+        assert!(!remove_heartbeat_if_owned(
+            &mut heartbeats,
+            device,
+            old_connection
+        ));
+        assert!(heartbeats.contains_key(&device));
+        assert!(remove_heartbeat_if_owned(
+            &mut heartbeats,
+            device,
+            new_connection
+        ));
+        assert!(!heartbeats.contains_key(&device));
+    }
+
+    #[tokio::test]
     async fn routes_tcp_and_udp_concurrently_without_hanging() {
         let plane = DataPlane::default();
         let device = Uuid::new_v4();
@@ -477,6 +606,7 @@ mod tests {
             tcp_id,
             StreamEntry {
                 device_id: device,
+                tunnel_id: Uuid::new_v4(),
                 data_channel: 1,
                 tx: tcp_tx,
             },
@@ -541,6 +671,7 @@ mod tests {
                 id,
                 StreamEntry {
                     device_id: device,
+                    tunnel_id: Uuid::new_v4(),
                     data_channel: channel,
                     tx,
                 },
@@ -588,6 +719,114 @@ mod tests {
             .expect("empty datagram was not relayed")
             .expect("channel closed");
         assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tcp_queue_full_waits_instead_of_closing_stream() {
+        let plane = DataPlane::default();
+        let tcp_id: u128 = 77;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        plane.streams.write().await.insert(
+            tcp_id,
+            StreamEntry {
+                device_id: Uuid::new_v4(),
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 1,
+                tx,
+            },
+        );
+        assert_eq!(
+            route_stream_data(&plane, tcp_id, b"first").await,
+            RouteOutcome::Ok
+        );
+        // The queue is now full; routing must wait (backpressure) instead of
+        // dropping the frame or removing the stream entry.
+        let routing_plane = plane.clone();
+        let routing =
+            tokio::spawn(async move { route_stream_data(&routing_plane, tcp_id, b"second").await });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert!(
+            plane.streams.read().await.contains_key(&tcp_id),
+            "saturated TCP stream must stay registered while backpressure applies"
+        );
+        // Draining the queue lets the waiting frame through, still in order.
+        assert_eq!(rx.recv().await.as_deref(), Some(b"first".as_slice()));
+        assert_eq!(routing.await.unwrap(), RouteOutcome::Ok);
+        assert_eq!(rx.recv().await.as_deref(), Some(b"second".as_slice()));
+        assert!(plane.streams.read().await.contains_key(&tcp_id));
+    }
+
+    #[tokio::test]
+    async fn tcp_queue_full_times_out_and_closes_stream() {
+        let plane = DataPlane::default();
+        let tcp_id: u128 = 78;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        plane.streams.write().await.insert(
+            tcp_id,
+            StreamEntry {
+                device_id: Uuid::new_v4(),
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 1,
+                tx,
+            },
+        );
+        assert_eq!(
+            route_stream_data(&plane, tcp_id, b"first").await,
+            RouteOutcome::Ok
+        );
+        // A full queue that never drains must hit the bounded timeout instead
+        // of hanging the caller; only then is the stream closed.
+        let outcome = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            route_stream_data_with_timeout(&plane, tcp_id, b"second", StdDuration::from_millis(50)),
+        )
+        .await
+        .expect("routing must return after its bounded timeout");
+        assert_eq!(outcome, RouteOutcome::StreamSendTimeout(tcp_id));
+        assert!(!plane.streams.read().await.contains_key(&tcp_id));
+    }
+
+    #[tokio::test]
+    async fn tcp_stream_channel_closed_removes_entry() {
+        let plane = DataPlane::default();
+        let tcp_id: u128 = 79;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        drop(rx);
+        plane.streams.write().await.insert(
+            tcp_id,
+            StreamEntry {
+                device_id: Uuid::new_v4(),
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 1,
+                tx,
+            },
+        );
+        assert_eq!(
+            route_stream_data(&plane, tcp_id, b"data").await,
+            RouteOutcome::StreamChannelClosed(tcp_id)
+        );
+        assert!(!plane.streams.read().await.contains_key(&tcp_id));
+    }
+
+    #[tokio::test]
+    async fn tunnel_max_connections_limits_concurrent_tcp_streams() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let tunnel_a = Uuid::new_v4();
+        let tunnel_b = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        assert!(try_register_stream(&plane, 1, device, tunnel_a, 1, tx.clone(), 2).await);
+        assert!(try_register_stream(&plane, 2, device, tunnel_a, 1, tx.clone(), 2).await);
+        // Tunnel A is at its limit; the next TCP connection must be rejected
+        // without registering a stream.
+        assert!(!try_register_stream(&plane, 3, device, tunnel_a, 1, tx.clone(), 2).await);
+        assert!(!plane.streams.read().await.contains_key(&3));
+        // Other tunnels or devices are not affected by tunnel A's limit.
+        assert!(try_register_stream(&plane, 4, device, tunnel_b, 1, tx.clone(), 2).await);
+        assert!(try_register_stream(&plane, 5, Uuid::new_v4(), tunnel_a, 1, tx.clone(), 2).await);
+        // Closing one connection frees a slot for the same tunnel.
+        plane.streams.write().await.remove(&1);
+        assert!(try_register_stream(&plane, 6, device, tunnel_a, 1, tx.clone(), 2).await);
     }
 
     #[test]
@@ -931,6 +1170,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         redis: redis::Client::open(redis_url)?,
+        redis_conn: Arc::new(Mutex::new(None)),
         jwt_secret: Arc::new(env::var("JWT_SECRET").expect("JWT_SECRET is required")),
         admin_token_ttl_hours: env::var("ADMIN_TOKEN_TTL_HOURS")
             .ok()
@@ -953,6 +1193,7 @@ async fn main() -> anyhow::Result<()> {
         plane: DataPlane::default(),
         pending_enrollments: Arc::new(RwLock::new(HashMap::new())),
     };
+    tokio::spawn(heartbeat_flusher_loop(state.clone()));
     for id in sqlx::query_scalar::<_, Uuid>("SELECT id FROM tunnels WHERE enabled")
         .fetch_all(&state.db)
         .await?
@@ -1397,7 +1638,21 @@ async fn list_tunnels(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TunnelRecord>>, StatusCode> {
     admin(&headers, &state).await?;
-    let rows = sqlx::query_as::<_, TunnelRecord>("SELECT t.id,t.name,t.kind,t.public_port,t.local_host,t.local_port,t.enabled,t.max_connections,t.device_id,CASE WHEN d.status='online' THEN 'ready' ELSE 'offline' END status,0::bigint connections FROM tunnels t JOIN devices d ON d.id=t.device_id ORDER BY t.public_port").fetch_all(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut rows = sqlx::query_as::<_, TunnelRecord>("SELECT t.id,t.name,t.kind,t.public_port,t.local_host,t.local_port,t.enabled,t.max_connections,t.device_id,CASE WHEN d.status='online' THEN 'ready' ELSE 'offline' END status,0::bigint connections FROM tunnels t JOIN devices d ON d.id=t.device_id ORDER BY t.public_port").fetch_all(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Report real live usage instead of the placeholder zero: TCP/HTTP streams
+    // plus UDP sessions currently active for each tunnel.
+    let streams = state.plane.streams.read().await;
+    let udp = state.plane.udp_sessions.read().await;
+    for row in &mut rows {
+        row.connections = (streams
+            .values()
+            .filter(|entry| entry.device_id == row.device_id && entry.tunnel_id == row.id)
+            .count()
+            + udp
+                .values()
+                .filter(|session| session.tunnel_id == row.id)
+                .count()) as i64;
+    }
     Ok(Json(rows))
 }
 async fn create_tunnel(
@@ -2450,6 +2705,77 @@ async fn list_logs(
 async fn control_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| control_loop(socket, state))
 }
+
+/// Periodically persists in-memory heartbeats to the database and refreshes
+/// the Redis online markers. Runs entirely outside the control read loops:
+/// database/Redis slowness or outages only degrade online-status display,
+/// never message processing or the data plane. Redis uses one reused
+/// connection; a failed connection is dropped and recreated on the next tick.
+async fn heartbeat_flusher_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(StdDuration::from_secs(HEARTBEAT_FLUSH_SECS));
+    ticker.tick().await; // skip the immediate first tick
+    loop {
+        ticker.tick().await;
+        let now = Instant::now();
+        let stale_after = StdDuration::from_secs(HEARTBEAT_STALE_SECS);
+        let heartbeats: Vec<(Uuid, HeartbeatEntry)> = {
+            let mut map = state.plane.heartbeats.write().await;
+            map.retain(|_, entry| now.duration_since(entry.last_seen) <= stale_after);
+            map.iter()
+                .map(|(device_id, entry)| (*device_id, entry.clone()))
+                .collect()
+        };
+        if heartbeats.is_empty() {
+            continue;
+        }
+        for (device_id, entry) in &heartbeats {
+            if let Err(error) = sqlx::query(
+                "UPDATE devices SET latency_ms=$1,last_seen_at=now(),status='online' WHERE id=$2",
+            )
+            .bind(entry.latency_ms)
+            .bind(device_id)
+            .execute(&state.db)
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    device_id = %device_id,
+                    "heartbeat flush to database failed"
+                );
+            }
+        }
+        let mut guard = state.redis_conn.lock().await;
+        if guard.is_none() {
+            match state.redis.get_multiplexed_tokio_connection().await {
+                Ok(conn) => *guard = Some(conn),
+                Err(error) => {
+                    tracing::warn!(%error, "could not open reused Redis connection");
+                    continue;
+                }
+            }
+        }
+        if let Some(conn) = guard.as_mut() {
+            let mut broken = false;
+            for (device_id, _) in &heartbeats {
+                let result: redis::RedisResult<()> =
+                    conn.set_ex(format!("online:{device_id}"), "1", 60).await;
+                if let Err(error) = result {
+                    tracing::warn!(
+                        %error,
+                        device_id = %device_id,
+                        "redis online marker refresh failed"
+                    );
+                    broken = true;
+                    break;
+                }
+            }
+            if broken {
+                *guard = None;
+            }
+        }
+    }
+}
+
 async fn control_loop(socket: WebSocket, state: AppState) {
     let mut socket = socket;
     let Some(Ok(Message::Text(first))) = socket.next().await else {
@@ -2533,9 +2859,6 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             tx: out_tx.clone(),
         },
     );
-    if let Ok(mut redis) = state.redis.get_multiplexed_tokio_connection().await {
-        let _: Result<(), _> = redis.set_ex(format!("online:{device_id}"), "1", 60).await;
-    }
     let tunnels = load_specs(&state.db, device_id).await;
     let _ = out_tx
         .send(Message::Text(
@@ -2585,19 +2908,17 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         match message {
             Message::Text(text) => {
                 if let Ok(ControlMessage::Heartbeat { latency_ms, .. }) = decode(text.as_bytes()) {
-                    let _ = sqlx::query(
-                        "UPDATE devices SET latency_ms=$1,last_seen_at=now(),status='online' WHERE id=$2",
-                    )
-                    .bind(latency_ms as i32)
-                    .bind(device_id)
-                    .execute(&state.db)
-                    .await;
-                    // Refresh the online marker on every heartbeat so a healthy
-                    // device never expires from the Redis view.
-                    if let Ok(mut redis) = state.redis.get_multiplexed_tokio_connection().await {
-                        let _: Result<(), _> =
-                            redis.set_ex(format!("online:{device_id}"), "1", 60).await;
-                    }
+                    // Heartbeats only touch memory here; the background flusher
+                    // batches them into DB/Redis so a slow or unavailable
+                    // datastore can never stall this read loop.
+                    state.plane.heartbeats.write().await.insert(
+                        device_id,
+                        HeartbeatEntry {
+                            connection_id,
+                            latency_ms: latency_ms as i32,
+                            last_seen: Instant::now(),
+                        },
+                    );
                 } else if let Ok(ControlMessage::StreamClose { stream_id, .. }) =
                     decode(text.as_bytes())
                 {
@@ -2625,6 +2946,10 @@ async fn control_loop(socket: WebSocket, state: AppState) {
     {
         let mut sessions = state.plane.sessions.write().await;
         remove_session_if_owned(&mut sessions, device_id, connection_id);
+    }
+    {
+        let mut heartbeats = state.plane.heartbeats.write().await;
+        remove_heartbeat_if_owned(&mut heartbeats, device_id, connection_id);
     }
     drop_invalid_udp_sessions(&state, device_id, connection_id).await;
     teardown_device_data_channels(&state, device_id, connection_id).await;
@@ -2840,13 +3165,24 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
                 Message::Binary(bytes) => {
                     if let Ok((id, data)) = decode_stream_data(&bytes) {
                         match route_stream_data(&reader_state.plane, id, data).await {
-                            RouteOutcome::StreamSaturated(stream_id) => {
+                            RouteOutcome::StreamSendTimeout(stream_id) => {
                                 send_control(
                                     &reader_state,
                                     device_id,
                                     &ControlMessage::StreamClose {
                                         stream_id: stream_id.to_string(),
-                                        reason: Some("stream_saturated".into()),
+                                        reason: Some("stream_send_timeout".into()),
+                                    },
+                                )
+                                .await;
+                            }
+                            RouteOutcome::StreamChannelClosed(stream_id) => {
+                                send_control(
+                                    &reader_state,
+                                    device_id,
+                                    &ControlMessage::StreamClose {
+                                        stream_id: stream_id.to_string(),
+                                        reason: Some("stream_channel_closed".into()),
                                     },
                                 )
                                 .await;
@@ -3053,6 +3389,9 @@ async fn bridge_public_connection(
     tunnel: TunnelRecord,
     socket: tokio::net::TcpStream,
 ) {
+    // Interactive protocols (SSH, HTTP, RDP) suffer from Nagle + delayed ACK
+    // on small packets; disable Nagle on the public socket right away.
+    let _ = socket.set_nodelay(true);
     if !state.accepting.load(Ordering::Relaxed) {
         return;
     }
@@ -3083,14 +3422,22 @@ async fn bridge_public_connection(
     let id = Uuid::new_v4().as_u128();
     let (mut reader, mut writer) = socket.into_split();
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(128);
-    state.plane.streams.write().await.insert(
+    if !try_register_stream(
+        &state.plane,
         id,
-        StreamEntry {
-            device_id: tunnel.device_id,
-            data_channel: channel_id,
-            tx: incoming_tx,
-        },
-    );
+        tunnel.device_id,
+        tunnel.id,
+        channel_id,
+        incoming_tx,
+        tunnel.max_connections as usize,
+    )
+    .await
+    {
+        // The tunnel is at its connection limit; reject the new connection by
+        // dropping the socket without registering a stream or sending
+        // `StreamOpen`.
+        return;
+    }
     if session
         .tx
         .send(Message::Text(
