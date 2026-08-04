@@ -2744,13 +2744,17 @@ async fn get_device_restart(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Option<RestartState>>, StatusCode> {
     admin(&headers, &state).await?;
+    // Snapshot the online flag before taking the restart lock: checking
+    // `sessions` while holding `restarts` would invert the lock order used by
+    // control-session cleanup and can deadlock the whole control plane.
+    let online = state.plane.sessions.read().await.contains_key(&id);
     let mut restarts = state.restarts.write().await;
     let Some(current) = restarts.get_mut(&id) else {
         return Ok(Json(None));
     };
     let elapsed = current.requested_at.elapsed();
     if current.phase == "online" {
-        if state.plane.sessions.read().await.contains_key(&id) {
+        if online {
             current.phase = "done".into();
             current.progress = 100;
             current.message = Some("代理已成功重启并重新上线".into());
@@ -4390,23 +4394,30 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         }
     }
     writer.abort();
-    {
+    let removed = {
         let mut sessions = state.plane.sessions.write().await;
         let removed = remove_session_if_owned(&mut sessions, device_id, connection_id);
         if removed {
             state.plane.session_signal.notify_waiters();
-            // The device is offline: drop its bandwidth bucket so idle devices
-            // do not accumulate memory; a reconnect lazily recreates it.
-            state.bandwidth.remove_device(device_id).await;
-            // A pending remote restart just dropped the control socket; move
-            // the progress bar to "restarting" until the agent reconnects.
-            let mut restarts = state.restarts.write().await;
-            if let Some(current) = restarts.get_mut(&device_id) {
-                if current.phase != "done" && current.phase != "failed" {
-                    current.phase = "restarting".into();
-                    current.progress = 70;
-                    current.message = Some("代理进程已退出,正在等待重新上线".into());
-                }
+        }
+        removed
+    };
+    if removed {
+        // Drop the sessions lock before touching the bandwidth and restart
+        // maps: waiting on those while holding `sessions` would invert the
+        // order used by restart-polling handlers and can deadlock every new
+        // device registration.
+        // The device is offline: drop its bandwidth bucket so idle devices
+        // do not accumulate memory; a reconnect lazily recreates it.
+        state.bandwidth.remove_device(device_id).await;
+        // A pending remote restart just dropped the control socket; move
+        // the progress bar to "restarting" until the agent reconnects.
+        let mut restarts = state.restarts.write().await;
+        if let Some(current) = restarts.get_mut(&device_id) {
+            if current.phase != "done" && current.phase != "failed" {
+                current.phase = "restarting".into();
+                current.progress = 70;
+                current.message = Some("代理进程已退出,正在等待重新上线".into());
             }
         }
     }

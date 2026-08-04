@@ -1,0 +1,4 @@
+# SQL migrations are embedded into the server binary at compile time and
+# SQLx checksums the raw file bytes. Keep them LF everywhere so Windows
+# checkouts produce binaries whose migration checksums match the database.
+deploy/migrations/*.sql text eol=lf
