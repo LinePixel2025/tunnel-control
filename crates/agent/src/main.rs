@@ -849,6 +849,15 @@ fn write_console_pid(pid: u32) -> io::Result<()> {
     fs::write(console_pid_file(), pid.to_string())
 }
 
+/// Windows PowerShell 5.1 writes UTF-16LE to a redirected stdout, so every
+/// ASCII character is followed by a NUL byte. Strip those NULs before text
+/// matching so the same check works with Windows PowerShell and PowerShell 7.
+fn ps_stdout_contains_bytes(stdout: &[u8], needle: &str) -> bool {
+    String::from_utf8_lossy(stdout)
+        .replace('\0', "")
+        .contains(needle)
+}
+
 fn process_is_running(pid: u32) -> bool {
     let output = Command::new("powershell")
         .args([
@@ -859,7 +868,7 @@ fn process_is_running(pid: u32) -> bool {
         .output();
     output
         .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains("tunnel-agent"))
+        .map(|output| ps_stdout_contains_bytes(&output.stdout, "tunnel-agent"))
         .unwrap_or(false)
 }
 
@@ -890,7 +899,7 @@ fn service_is_running() -> bool {
             .output();
         return output
             .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("True"))
+            .map(|output| ps_stdout_contains_bytes(&output.stdout, "True"))
             .unwrap_or(false);
     }
     #[cfg(not(windows))]
@@ -987,6 +996,16 @@ fn start_agent_process() -> Option<u32> {
         .ok()?;
     let pid = child.id();
     let _ = write_console_pid(pid);
+    // Give the worker a short startup window; if it exits immediately (for
+    // example a panic on this machine), say so instead of reporting success.
+    std::thread::sleep(Duration::from_millis(400));
+    if !process_is_running(pid) {
+        println!("WARNING: agent exited right after start (PID {pid}).");
+        println!(
+            "Check the worker logs: {}",
+            console_state_dir().join("console.err.log").display()
+        );
+    }
     println!("Agent started (PID {pid}).");
     if let Some(code) = enrollment_code {
         println!("==============================================");
@@ -2943,6 +2962,16 @@ fn send_close(control: &mpsc::Sender<Message>, stream_id: String, reason: Option
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn ps_output_matching_strips_utf16le_nuls() {
+        // Windows PowerShell 5.1 emits UTF-16LE on a redirected stdout:
+        // "tunnel-agent" becomes t, NUL, u, NUL, n, NUL, ...
+        let utf16le = b"t\0u\0n\0n\0e\0l\0-\0a\0g\0e\0n\0t\0\r\0\n\0";
+        assert!(ps_stdout_contains_bytes(utf16le, "tunnel-agent"));
+        assert!(ps_stdout_contains_bytes(b"True\r\n", "True"));
+        assert!(!ps_stdout_contains_bytes(b"", "tunnel-agent"));
+    }
 
     #[tokio::test]
     async fn agent_limiter_paces_outbound_at_cap() {
