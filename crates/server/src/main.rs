@@ -156,6 +156,24 @@ struct DataChannel {
     tx: mpsc::Sender<Message>,
 }
 
+/// One stream's share of its data channel's shared writer queue. `outstanding`
+/// counts frames queued but not yet forwarded by the channel writer; when it
+/// reaches `STREAM_CHANNEL_QUOTA` the stream's bridge waits, so a single bulk
+/// stream cannot head-of-line block the other streams on the channel.
+struct StreamSlot {
+    outstanding: usize,
+    notify: Arc<Notify>,
+}
+
+impl Default for StreamSlot {
+    fn default() -> Self {
+        Self {
+            outstanding: 0,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
 /// A live TCP stream mapped to the data channel it was assigned to.
 #[derive(Clone)]
 struct StreamEntry {
@@ -163,6 +181,7 @@ struct StreamEntry {
     tunnel_id: Uuid,
     data_channel: u16,
     tx: mpsc::Sender<Vec<u8>>,
+    slot: Arc<Mutex<StreamSlot>>,
 }
 /// A live UDP mapping between one public client (peer) and the agent's local
 /// service. The socket is shared with the tunnel listener that owns it.
@@ -214,6 +233,11 @@ const STREAM_QUEUE_FRAMES: usize = 64;
 /// Frames buffered per data channel; 128 x 64KiB keeps the worst-case shared
 /// queue at 8MiB, matching the old 512 x 16KiB budget.
 const DATA_CHANNEL_QUEUE_FRAMES: usize = 128;
+
+/// Max frames one stream may have waiting in its data channel's shared writer
+/// queue. 16 x 64KiB bounds the head-of-line delay a bulk stream can impose
+/// on other streams sharing the same channel.
+const STREAM_CHANNEL_QUOTA: usize = 16;
 
 /// Removes a session entry only when it still belongs to `connection_id`, so a
 /// stale control loop can never delete the session of a newer connection.
@@ -283,9 +307,61 @@ async fn try_register_stream(
             tunnel_id,
             data_channel,
             tx,
+            slot: Arc::new(Mutex::new(StreamSlot::default())),
         },
     );
     true
+}
+
+/// Waits until the stream has fewer than `STREAM_CHANNEL_QUOTA` frames waiting
+/// in the channel writer queue, then reserves one slot. Returns false if the
+/// stream entry is removed while waiting (the bridge should stop).
+async fn acquire_stream_slot(plane: &DataPlane, slot: &Arc<Mutex<StreamSlot>>, id: u128) -> bool {
+    loop {
+        if plane.streams.read().await.get(&id).is_none() {
+            return false;
+        }
+        let notify = {
+            let mut state = slot.lock().await;
+            if state.outstanding < STREAM_CHANNEL_QUOTA {
+                state.outstanding += 1;
+                return true;
+            }
+            state.notify.clone()
+        };
+        notify.notified().await;
+        if plane.streams.read().await.get(&id).is_none() {
+            return false;
+        }
+    }
+}
+
+/// Releases one reserved slot after the channel writer dequeued the frame and
+/// wakes the stream's bridge so it can enqueue more.
+async fn release_stream_slot(plane: &DataPlane, id: u128) {
+    let slot = {
+        let streams = plane.streams.read().await;
+        streams.get(&id).map(|entry| entry.slot.clone())
+    };
+    if let Some(slot) = slot {
+        let mut state = slot.lock().await;
+        state.outstanding = state.outstanding.saturating_sub(1);
+        state.notify.notify_waiters();
+    }
+}
+
+/// Removes a stream entry and wakes its bridge if it is waiting on the
+/// channel-queue quota, so closing the stream cannot strand the bridge.
+async fn remove_stream_entry(plane: &DataPlane, id: u128) {
+    let slot = {
+        let mut streams = plane.streams.write().await;
+        streams.remove(&id).map(|entry| entry.slot)
+    };
+    if let Some(slot) = slot {
+        let mut state = slot.lock().await;
+        state.outstanding = 0;
+        state.notify.notify_waiters();
+    }
 }
 
 async fn route_stream_data_with_timeout(
@@ -321,11 +397,11 @@ async fn route_stream_data_with_timeout(
             Some(tx) => match tokio::time::timeout(timeout, tx.send(data.to_vec())).await {
                 Ok(Ok(())) => RouteOutcome::Ok,
                 Ok(Err(_)) => {
-                    plane.streams.write().await.remove(&id);
+                    remove_stream_entry(plane, id).await;
                     RouteOutcome::StreamChannelClosed(id)
                 }
                 Err(_) => {
-                    plane.streams.write().await.remove(&id);
+                    remove_stream_entry(plane, id).await;
                     RouteOutcome::StreamSendTimeout(id)
                 }
             },
@@ -465,7 +541,7 @@ async fn close_channel_streams(plane: &DataPlane, device_id: Uuid, channel_id: u
         .map(|(id, _)| *id)
         .collect();
     for id in &tcp {
-        plane.streams.write().await.remove(id);
+        remove_stream_entry(plane, *id).await;
     }
     let udp: Vec<u128> = plane
         .udp_sessions
@@ -976,6 +1052,7 @@ mod tests {
                 tunnel_id: Uuid::new_v4(),
                 data_channel: 1,
                 tx: tcp_tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
             },
         );
         let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(4096);
@@ -1041,6 +1118,7 @@ mod tests {
                     tunnel_id: Uuid::new_v4(),
                     data_channel: channel,
                     tx,
+                    slot: Arc::new(Mutex::new(StreamSlot::default())),
                 },
             );
         }
@@ -1100,6 +1178,7 @@ mod tests {
                 tunnel_id: Uuid::new_v4(),
                 data_channel: 1,
                 tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
             },
         );
         assert_eq!(
@@ -1135,6 +1214,7 @@ mod tests {
                 tunnel_id: Uuid::new_v4(),
                 data_channel: 1,
                 tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
             },
         );
         assert_eq!(
@@ -1166,6 +1246,7 @@ mod tests {
                 tunnel_id: Uuid::new_v4(),
                 data_channel: 1,
                 tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
             },
         );
         assert_eq!(
@@ -1194,6 +1275,154 @@ mod tests {
         // Closing one connection frees a slot for the same tunnel.
         plane.streams.write().await.remove(&1);
         assert!(try_register_stream(&plane, 6, device, tunnel_a, 1, tx.clone(), 2).await);
+    }
+
+    #[tokio::test]
+    async fn stream_slot_quota_blocks_only_that_stream() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let id_a: u128 = 101;
+        let id_b: u128 = 102;
+        let slot_a = Arc::new(Mutex::new(StreamSlot::default()));
+        let slot_b = Arc::new(Mutex::new(StreamSlot::default()));
+        plane.streams.write().await.insert(
+            id_a,
+            StreamEntry {
+                device_id: device,
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 1,
+                tx: tx.clone(),
+                slot: slot_a.clone(),
+            },
+        );
+        plane.streams.write().await.insert(
+            id_b,
+            StreamEntry {
+                device_id: device,
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 1,
+                tx,
+                slot: slot_b.clone(),
+            },
+        );
+        for _ in 0..STREAM_CHANNEL_QUOTA {
+            assert!(acquire_stream_slot(&plane, &slot_a, id_a).await);
+        }
+        // Stream A is at quota; its next slot must wait...
+        let blocked = tokio::spawn({
+            let plane = plane.clone();
+            let slot = slot_a.clone();
+            async move {
+                tokio::time::timeout(
+                    StdDuration::from_millis(100),
+                    acquire_stream_slot(&plane, &slot, id_a),
+                )
+                .await
+            }
+        });
+        // ...while stream B can still reserve a slot immediately.
+        assert!(acquire_stream_slot(&plane, &slot_b, id_b).await);
+        assert!(
+            blocked.await.unwrap().is_err(),
+            "stream A must stay blocked at quota"
+        );
+        // Releasing one forwarded frame unblocks A.
+        release_stream_slot(&plane, id_a).await;
+        let acquired = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            acquire_stream_slot(&plane, &slot_a, id_a),
+        )
+        .await
+        .expect("released quota must unblock the stream");
+        assert!(acquired);
+    }
+
+    #[tokio::test]
+    async fn stream_slot_quota_aborts_when_stream_removed() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let id: u128 = 103;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let slot = Arc::new(Mutex::new(StreamSlot::default()));
+        plane.streams.write().await.insert(
+            id,
+            StreamEntry {
+                device_id: device,
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 1,
+                tx,
+                slot: slot.clone(),
+            },
+        );
+        for _ in 0..STREAM_CHANNEL_QUOTA {
+            assert!(acquire_stream_slot(&plane, &slot, id).await);
+        }
+        let blocked = tokio::spawn({
+            let plane = plane.clone();
+            let slot = slot.clone();
+            async move {
+                tokio::time::timeout(
+                    StdDuration::from_millis(100),
+                    acquire_stream_slot(&plane, &slot, id),
+                )
+                .await
+            }
+        });
+        // Removing the stream wakes the waiting bridge and reports failure.
+        remove_stream_entry(&plane, id).await;
+        let result = tokio::time::timeout(StdDuration::from_secs(1), blocked)
+            .await
+            .expect("blocked task must finish after stream removal")
+            .expect("acquire must return after stream removal");
+        assert_eq!(result, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn pick_data_channel_prefers_lowest_load() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let connection = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: connection,
+                tx: session_tx,
+            },
+        );
+        let (channel_tx, _channel_rx) = mpsc::channel::<Message>(8);
+        plane.data_channels.write().await.insert(
+            device,
+            HashMap::from([
+                (
+                    1,
+                    DataChannel {
+                        connection_id: connection,
+                        tx: channel_tx.clone(),
+                    },
+                ),
+                (
+                    2,
+                    DataChannel {
+                        connection_id: connection,
+                        tx: channel_tx,
+                    },
+                ),
+            ]),
+        );
+        let (stream_tx, _stream_rx) = mpsc::channel::<Vec<u8>>(8);
+        plane.streams.write().await.insert(
+            10,
+            StreamEntry {
+                device_id: device,
+                tunnel_id: Uuid::new_v4(),
+                data_channel: 2,
+                tx: stream_tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
+        assert_eq!(pick_data_channel(&plane, device).await, Some(1));
     }
 
     #[test]
@@ -1647,7 +1876,7 @@ async fn shutdown_signal(state: AppState) {
         .map(|(id, entry)| (*id, entry.device_id))
         .collect();
     for (id, device_id) in tcp {
-        state.plane.streams.write().await.remove(&id);
+        remove_stream_entry(&state.plane, id).await;
         send_control(
             &state,
             device_id,
@@ -3294,7 +3523,7 @@ async fn control_loop(socket: WebSocket, state: AppState) {
                     decode(text.as_bytes())
                 {
                     if let Ok(id) = stream_id.parse::<u128>() {
-                        state.plane.streams.write().await.remove(&id);
+                        remove_stream_entry(&state.plane, id).await;
                         state.plane.udp_sessions.write().await.remove(&id);
                     }
                 } else if let Ok(ControlMessage::ProbeResult {
@@ -3517,8 +3746,16 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
         channel_id
     };
     state.plane.data_channel_signal.notify_waiters();
+    let writer_plane = state.plane.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
+            // The frame has left the shared queue; return the stream's quota
+            // so its bridge can enqueue more without monopolizing the queue.
+            if let Message::Binary(bytes) = &message {
+                if let Ok((id, _)) = decode_stream_data(bytes) {
+                    release_stream_slot(&writer_plane, id).await;
+                }
+            }
             if sink.send(message).await.is_err() {
                 break;
             }
@@ -3832,10 +4069,14 @@ async fn bridge_public_connection(
     if !send_control_to_session(&session, &open, Some(STREAM_OPEN_SEND_TIMEOUT)).await {
         // The control queue stayed full or the session died; drop the stream
         // entry so no orphan registration is left behind.
-        state.plane.streams.write().await.remove(&id);
+        remove_stream_entry(&state.plane, id).await;
         return;
     }
     let out = channel.tx;
+    let slot = {
+        let streams = state.plane.streams.read().await;
+        streams.get(&id).map(|entry| entry.slot.clone())
+    };
     let inbound = tokio::spawn(async move {
         while let Some(data) = incoming_rx.recv().await {
             // The agent already throttled this direction at its source; do
@@ -3854,6 +4095,13 @@ async fn bridge_public_connection(
                 let Ok(frame) = encode_stream_data(id, &buf[..n]) else {
                     break;
                 };
+                // Hold this stream's share of the channel queue while the
+                // frame waits; one bulk stream can never fill the queue.
+                if let Some(slot) = &slot {
+                    if !acquire_stream_slot(&state.plane, slot, id).await {
+                        break;
+                    }
+                }
                 // This bridge task may wait for the device's outbound queue or
                 // the bandwidth budget; it never blocks the control loop, and
                 // TCP must not drop bytes, so queue here instead of closing.
@@ -3874,7 +4122,7 @@ async fn bridge_public_connection(
         .unwrap()
         .into(),
     ));
-    state.plane.streams.write().await.remove(&id);
+    remove_stream_entry(&state.plane, id).await;
     inbound.abort();
 }
 
