@@ -56,6 +56,9 @@ const HEARTBEAT_FLUSH_SECS: u64 = 30;
 /// heartbeats can be configured up to 60s apart, so this is three missed
 /// heartbeats; pruning only stops refreshes, it never touches live sessions.
 const HEARTBEAT_STALE_SECS: u64 = 180;
+/// Interval at which a background task re-checks enabled tunnels and restarts
+/// listeners that exited after an accept/bind error.
+const LISTENER_RECONCILE_SECS: u64 = 30;
 
 #[derive(Clone)]
 struct AppState {
@@ -67,7 +70,7 @@ struct AppState {
     jwt_secret: Arc<String>,
     admin_token_ttl_hours: i64,
     bootstrap_agent_token_hash: Option<String>,
-    listeners: Arc<RwLock<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
+    listeners: Arc<RwLock<HashMap<Uuid, ListenerEntry>>>,
     udp_session_idle_secs: u64,
     probes: Arc<RwLock<HashMap<String, oneshot::Sender<ProbeOutcome>>>>,
     bandwidth: BandwidthLimiter,
@@ -78,6 +81,14 @@ struct AppState {
     accepting: Arc<std::sync::atomic::AtomicBool>,
     plane: DataPlane,
     pending_enrollments: Arc<RwLock<HashMap<Uuid, PendingEnrollment>>>,
+}
+
+/// A running tunnel listener task plus the generation it was started with.
+/// The generation lets an exiting task remove only its own handle instead of
+/// one installed by a newer `start_listener` after a fast restart.
+struct ListenerEntry {
+    generation: u64,
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// In-memory half of a pending enrollment: the live control socket that showed
@@ -1928,6 +1939,7 @@ async fn main() -> anyhow::Result<()> {
         pending_enrollments: Arc::new(RwLock::new(HashMap::new())),
     };
     tokio::spawn(heartbeat_flusher_loop(state.clone()));
+    tokio::spawn(reconcile_listeners(state.clone()));
     for id in sqlx::query_scalar::<_, Uuid>("SELECT id FROM tunnels WHERE enabled")
         .fetch_all(&state.db)
         .await?
@@ -4124,35 +4136,141 @@ async fn start_listener(state: AppState, tunnel_id: Uuid) -> Result<(), String> 
     let tunnel = get_tunnel(&state.db, tunnel_id)
         .await
         .map_err(|e| e.to_string())?;
+    let generation = state
+        .listeners
+        .read()
+        .await
+        .get(&tunnel_id)
+        .map(|entry| entry.generation.saturating_add(1))
+        .unwrap_or(1);
     if tunnel.kind == "udp" {
         let socket = UdpSocket::bind(("0.0.0.0", tunnel.public_port as u16))
             .await
             .map_err(|e| e.to_string())?;
         let listener_state = state.clone();
+        let (exit_tx, mut exit_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            bridge_public_udp(listener_state, tunnel, socket).await;
+            bridge_public_udp(listener_state.clone(), tunnel, socket).await;
+            tracing::warn!(
+                tunnel_id = %tunnel_id,
+                "tunnel listener exited; removed from active listeners"
+            );
+            finish_listener(listener_state, tunnel_id, generation).await;
+            let _ = exit_tx.send(());
         });
-        state.listeners.write().await.insert(tunnel_id, handle);
+        state.listeners.write().await.insert(
+            tunnel_id,
+            ListenerEntry {
+                generation,
+                task: handle,
+            },
+        );
+        if exit_rx.try_recv().is_ok() {
+            remove_stale_listener_entry(&state, tunnel_id, generation).await;
+        }
         return Ok(());
     }
     let listener = TcpListener::bind(("0.0.0.0", tunnel.public_port as u16))
         .await
         .map_err(|e| e.to_string())?;
     let listener_state = state.clone();
+    let (exit_tx, mut exit_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
-        loop {
-            let Ok((socket, _)) = listener.accept().await else {
-                break;
-            };
-            let st = listener_state.clone();
-            let t = tunnel.clone();
-            tokio::spawn(async move {
-                bridge_public_connection(st, t, socket).await;
-            });
-        }
+        let accept_error = loop {
+            match listener.accept().await {
+                Ok((socket, _)) => {
+                    let st = listener_state.clone();
+                    let t = tunnel.clone();
+                    tokio::spawn(async move {
+                        bridge_public_connection(st, t, socket).await;
+                    });
+                }
+                Err(error) => break error,
+            }
+        };
+        tracing::warn!(
+            tunnel_id = %tunnel_id,
+            %accept_error,
+            "tunnel listener accept failed; removed from active listeners"
+        );
+        finish_listener(listener_state, tunnel_id, generation).await;
+        let _ = exit_tx.send(());
     });
-    state.listeners.write().await.insert(tunnel_id, handle);
+    state.listeners.write().await.insert(
+        tunnel_id,
+        ListenerEntry {
+            generation,
+            task: handle,
+        },
+    );
+    if exit_rx.try_recv().is_ok() {
+        remove_stale_listener_entry(&state, tunnel_id, generation).await;
+    }
     Ok(())
+}
+
+/// Removes a listener entry that was installed after its task had already
+/// exited (for example accept failed immediately), but only when it still
+/// belongs to `generation`.
+async fn remove_stale_listener_entry(state: &AppState, tunnel_id: Uuid, generation: u64) {
+    let mut listeners = state.listeners.write().await;
+    if listeners.get(&tunnel_id).map(|entry| entry.generation) == Some(generation) {
+        listeners.remove(&tunnel_id);
+    }
+}
+
+/// Removes a listener handle from the map only when it still belongs to the
+/// generation this task started with, so an exiting task never deletes a
+/// handle installed by a newer `start_listener`.
+async fn finish_listener(state: AppState, tunnel_id: Uuid, generation: u64) {
+    let remove = state
+        .listeners
+        .read()
+        .await
+        .get(&tunnel_id)
+        .map(|entry| entry.generation == generation)
+        .unwrap_or(false);
+    if remove {
+        state.listeners.write().await.remove(&tunnel_id);
+    }
+}
+
+/// Periodically re-checks every enabled tunnel and restarts listeners that
+/// exited (for example after an accept error), so a tunnel never stays dead
+/// in the admin console until an admin toggles it.
+async fn reconcile_listeners(state: AppState) {
+    let mut ticker = tokio::time::interval(StdDuration::from_secs(LISTENER_RECONCILE_SECS));
+    ticker.tick().await; // skip the immediate first tick
+    loop {
+        ticker.tick().await;
+        if !state.accepting.load(Ordering::Relaxed) {
+            return;
+        }
+        let enabled: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tunnels WHERE enabled")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+        for tunnel_id in enabled {
+            if state.listeners.read().await.contains_key(&tunnel_id) {
+                continue;
+            }
+            match start_listener(state.clone(), tunnel_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        tunnel_id = %tunnel_id,
+                        "tunnel listener restarted by reconciliation"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tunnel_id = %tunnel_id,
+                        %error,
+                        "tunnel listener reconciliation failed; will retry"
+                    );
+                }
+            }
+        }
+    }
 }
 async fn bridge_public_connection(
     state: AppState,
@@ -4283,8 +4401,8 @@ async fn bridge_public_connection(
 
 /// Stops a tunnel listener and drops any UDP sessions bound to it.
 async fn remove_listener(state: &AppState, tunnel_id: Uuid) {
-    if let Some(task) = state.listeners.write().await.remove(&tunnel_id) {
-        task.abort();
+    if let Some(entry) = state.listeners.write().await.remove(&tunnel_id) {
+        entry.task.abort();
     }
     let stale: Vec<(u128, Uuid)> = state
         .plane
