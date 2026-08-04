@@ -25,13 +25,13 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpListener, UdpSocket},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -73,6 +73,10 @@ struct AppState {
     listeners: Arc<RwLock<HashMap<Uuid, ListenerEntry>>>,
     udp_session_idle_secs: u64,
     probes: Arc<RwLock<HashMap<String, oneshot::Sender<ProbeOutcome>>>>,
+    /// Live remote-restart state per device. The admin console polls this
+    /// through the management API so it can render a progress bar while the
+    /// agent stops, exits, and comes back online.
+    restarts: Arc<RwLock<HashMap<Uuid, RestartState>>>,
     bandwidth: BandwidthLimiter,
     tunnel_port_start: u16,
     tunnel_port_end: u16,
@@ -99,6 +103,41 @@ struct PendingEnrollment {
     tx: oneshot::Sender<EnrollmentDecision>,
 }
 
+/// Progress of one remote agent restart. Phases move from `sending` ->
+/// `acknowledged` (agent replies) -> `restarting` (control socket dropped)
+/// -> `online` (agent re-registered) -> `done`. A restart older than the
+/// timeout with no completion is reported as `failed` by the status API.
+#[derive(Clone, Serialize)]
+struct RestartState {
+    restart_id: Uuid,
+    phase: String,
+    progress: u8,
+    message: Option<String>,
+    #[serde(skip)]
+    requested_at: Instant,
+}
+
+/// Per-data-channel byte counters kept in memory on the server. `up_bytes`
+/// counts payload bytes received from the agent on that channel,
+/// `down_bytes` counts payload bytes sent to it. Counters survive channel
+/// reconnects within one server process and reset only on server restart.
+#[derive(Default)]
+struct ChannelStats {
+    up_bytes: AtomicU64,
+    down_bytes: AtomicU64,
+    connected: AtomicBool,
+}
+
+impl ChannelStats {
+    fn snapshot(&self) -> (u64, u64, bool) {
+        (
+            self.up_bytes.load(Ordering::Relaxed),
+            self.down_bytes.load(Ordering::Relaxed),
+            self.connected.load(Ordering::Relaxed),
+        )
+    }
+}
+
 enum EnrollmentDecision {
     Approved { token: String, device_id: Uuid },
     Denied,
@@ -121,6 +160,9 @@ struct DataPlane {
     /// by `SocketAddr` directly instead of scanning all sessions.
     udp_peers: Arc<RwLock<HashMap<Uuid, HashMap<SocketAddr, u128>>>>,
     data_channels: Arc<RwLock<HashMap<Uuid, HashMap<u16, DataChannel>>>>,
+    /// Per (device, channel) byte counters; cloned Arcs share the same
+    /// counters across channel reconnects.
+    channel_stats: Arc<RwLock<HashMap<(Uuid, u16), Arc<ChannelStats>>>>,
     data_socket_tasks: Arc<Mutex<HashMap<(Uuid, u16), tokio::task::JoinHandle<()>>>>,
     heartbeats: Arc<RwLock<HashMap<Uuid, HeartbeatEntry>>>,
     /// Wakes bridge tasks waiting for a data channel whenever a device's
@@ -140,6 +182,7 @@ impl Default for DataPlane {
             channel_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             udp_peers: Arc::new(RwLock::new(HashMap::new())),
             data_channels: Arc::new(RwLock::new(HashMap::new())),
+            channel_stats: Arc::new(RwLock::new(HashMap::new())),
             data_socket_tasks: Arc::new(Mutex::new(HashMap::new())),
             heartbeats: Arc::new(RwLock::new(HashMap::new())),
             data_channel_signal: Arc::new(Notify::new()),
@@ -849,6 +892,16 @@ impl BandwidthLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_stats_counts_bytes_and_connection_state() {
+        let stats = ChannelStats::default();
+        assert_eq!(stats.snapshot(), (0, 0, false));
+        stats.up_bytes.fetch_add(10, Ordering::Relaxed);
+        stats.down_bytes.fetch_add(20, Ordering::Relaxed);
+        stats.connected.store(true, Ordering::Relaxed);
+        assert_eq!(stats.snapshot(), (10, 20, true));
+    }
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -1908,6 +1961,27 @@ struct Device {
     latency_ms: i32,
     last_seen_at: Option<chrono::DateTime<Utc>>,
 }
+/// Device row plus live in-memory data-channel statistics for the admin
+/// console. Kept separate from `Device` because the counters are not stored
+/// in the database.
+#[derive(Serialize)]
+struct DeviceView {
+    id: Uuid,
+    name: String,
+    status: String,
+    latency_ms: i32,
+    last_seen_at: Option<chrono::DateTime<Utc>>,
+    channels: Vec<ChannelStatView>,
+}
+
+#[derive(Serialize)]
+struct ChannelStatView {
+    channel_id: u16,
+    up_bytes: u64,
+    down_bytes: u64,
+    total_bytes: u64,
+    connected: bool,
+}
 #[derive(Clone, Serialize, FromRow)]
 struct TunnelRecord {
     id: Uuid,
@@ -2204,6 +2278,7 @@ async fn main() -> anyhow::Result<()> {
         listeners: Arc::new(RwLock::new(HashMap::new())),
         udp_session_idle_secs,
         probes: Arc::new(RwLock::new(HashMap::new())),
+        restarts: Arc::new(RwLock::new(HashMap::new())),
         bandwidth,
         tunnel_port_start,
         tunnel_port_end,
@@ -2231,6 +2306,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/logs", get(list_logs))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{id}", delete(delete_device))
+        .route(
+            "/api/v1/devices/{id}/restart",
+            get(get_device_restart).post(restart_device),
+        )
         .route(
             "/api/v1/devices/{id}/settings",
             get(get_device_settings).put(update_device_settings),
@@ -2561,7 +2640,7 @@ async fn update_settings(
 async fn list_devices(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<Device>>, StatusCode> {
+) -> Result<Json<Vec<DeviceView>>, StatusCode> {
     admin(&headers, &state).await?;
     let rows = sqlx::query_as::<_, Device>(
         "SELECT id,name,status,latency_ms,last_seen_at FROM devices ORDER BY name",
@@ -2569,7 +2648,125 @@ async fn list_devices(
     .fetch_all(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(rows))
+    let stats = state.plane.channel_stats.read().await;
+    let views = rows
+        .into_iter()
+        .map(|row| {
+            let mut channels: Vec<ChannelStatView> = stats
+                .iter()
+                .filter(|((device_id, _), _)| *device_id == row.id)
+                .map(|((_, channel_id), counters)| {
+                    let (up_bytes, down_bytes, connected) = counters.snapshot();
+                    ChannelStatView {
+                        channel_id: *channel_id,
+                        up_bytes,
+                        down_bytes,
+                        total_bytes: up_bytes.saturating_add(down_bytes),
+                        connected,
+                    }
+                })
+                .collect();
+            channels.sort_by_key(|channel| channel.channel_id);
+            DeviceView {
+                id: row.id,
+                name: row.name,
+                status: row.status,
+                latency_ms: row.latency_ms,
+                last_seen_at: row.last_seen_at,
+                channels,
+            }
+        })
+        .collect();
+    Ok(Json(views))
+}
+
+/// Sends a remote restart command to an online agent. The returned state
+/// object is the initial progress entry; the frontend polls
+/// `GET /devices/{id}/restart` for updates as the agent acknowledges, exits,
+/// and reconnects.
+async fn restart_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RestartState>, (StatusCode, String)> {
+    let actor = admin(&headers, &state)
+        .await
+        .map_err(|s| (s, "Unauthorized".into()))?;
+    let device_name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id=$1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
+    let Some(device_name) = device_name else {
+        return Err((StatusCode::NOT_FOUND, "Device not found".into()));
+    };
+    if !state.plane.sessions.read().await.contains_key(&id) {
+        return Err((StatusCode::CONFLICT, "设备当前离线,无法远程重启".into()));
+    }
+    let restart_id = Uuid::new_v4();
+    let restart = RestartState {
+        restart_id,
+        phase: "sending".into(),
+        progress: 10,
+        message: Some("重启指令已发送,等待代理确认".into()),
+        requested_at: Instant::now(),
+    };
+    state.restarts.write().await.insert(id, restart.clone());
+    let command = ControlMessage::RestartAgent {
+        restart_id: restart_id.to_string(),
+        reason: Some("admin_request".into()),
+    };
+    if !send_control(&state, id, &command).await {
+        let mut restarts = state.restarts.write().await;
+        if let Some(current) = restarts.get_mut(&id) {
+            current.phase = "failed".into();
+            current.progress = 100;
+            current.message = Some("重启指令发送失败:代理已离线或控制通道不可用".into());
+        }
+        return Err((StatusCode::CONFLICT, "代理已离线或控制通道不可用".into()));
+    }
+    audit(
+        &state.db,
+        Some(actor.id),
+        "device.restart_requested",
+        &device_name,
+    )
+    .await;
+    Ok(Json(restart))
+}
+
+/// Returns the live restart progress for a device. Completes a restart once
+/// the device is back online, fails it after 60 seconds without reconnection,
+/// and drops stale `done`/`failed` entries after five minutes.
+async fn get_device_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Option<RestartState>>, StatusCode> {
+    admin(&headers, &state).await?;
+    let mut restarts = state.restarts.write().await;
+    let Some(current) = restarts.get_mut(&id) else {
+        return Ok(Json(None));
+    };
+    let elapsed = current.requested_at.elapsed();
+    if current.phase == "online" {
+        if state.plane.sessions.read().await.contains_key(&id) {
+            current.phase = "done".into();
+            current.progress = 100;
+            current.message = Some("代理已成功重启并重新上线".into());
+        } else {
+            current.phase = "restarting".into();
+            current.progress = 70;
+            current.message = Some("代理进程已退出,正在等待重新上线".into());
+        }
+    } else if current.phase != "done" && current.phase != "failed" && elapsed.as_secs() > 60 {
+        current.phase = "failed".into();
+        current.message = Some("重启超时:代理未在 60 秒内重新上线".into());
+    } else if (current.phase == "done" || current.phase == "failed") && elapsed.as_secs() > 300 {
+        restarts.remove(&id);
+        return Ok(Json(None));
+    }
+    Ok(Json(Some(current.clone())))
 }
 
 /// Deletes a device and everything it owns: tunnels, access tokens, per-device
@@ -2615,6 +2812,14 @@ async fn delete_device(
             state.plane.session_signal.notify_waiters();
         }
     }
+    // Drop the device's in-memory channel counters; the database row and all
+    // live sockets are gone, so nothing should reference them anymore.
+    state
+        .plane
+        .channel_stats
+        .write()
+        .await
+        .retain(|(device_id, _), _| *device_id != id);
     let mut tx = state.db.begin().await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2869,6 +3074,9 @@ async fn probe_tunnel(
             "agent_online": agent_online,
             "local": serde_json::Value::Null,
             "message": message,
+            "e2e": serde_json::Value::Null,
+            "e2e_message": serde_json::Value::Null,
+            "e2e_latency_ms": serde_json::Value::Null,
         })));
     }
     let probe_id = Uuid::new_v4().to_string();
@@ -2886,16 +3094,53 @@ async fn probe_tunnel(
             "agent_online": false,
             "local": serde_json::Value::Null,
             "message": "agent went offline while probing",
+            "e2e": serde_json::Value::Null,
+            "e2e_message": serde_json::Value::Null,
+            "e2e_latency_ms": serde_json::Value::Null,
         })));
     }
     match tokio::time::timeout(StdDuration::from_secs(10), rx).await {
-        Ok(Ok(outcome)) => Ok(Json(serde_json::json!({
-            "ok": outcome.ok,
-            "listener": listener_active,
-            "agent_online": agent_online,
-            "local": outcome.ok,
-            "message": outcome.message,
-        }))),
+        Ok(Ok(outcome)) => {
+            if !outcome.ok {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "listener": listener_active,
+                    "agent_online": agent_online,
+                    "local": false,
+                    "message": outcome.message,
+                    "e2e": serde_json::Value::Null,
+                    "e2e_message": serde_json::Value::Null,
+                    "e2e_latency_ms": serde_json::Value::Null,
+                })));
+            }
+            let (e2e, e2e_message, e2e_latency_ms) = match tunnel.kind.as_str() {
+                "udp" => e2e_probe_udp(&tunnel).await,
+                _ => e2e_probe_stream(&tunnel).await,
+            };
+            // TCP/HTTP end-to-end failures mean the full path is broken, so
+            // the overall test fails even though the local service answered
+            // the agent-side probe. UDP cannot reliably verify replies, so
+            // its overall result stays tied to the local probe.
+            let ok = match tunnel.kind.as_str() {
+                "udp" => true,
+                _ => e2e == Some(true),
+            };
+            let message = if ok {
+                e2e_message.clone()
+            } else {
+                e2e_message.clone().or_else(|| outcome.message.clone())
+            };
+            Ok(Json(serde_json::json!({
+                "ok": ok,
+                "listener": listener_active,
+                "agent_online": agent_online,
+                "local": true,
+                "message": message,
+                "e2e": e2e,
+                "e2e_message": e2e_message,
+                "e2e_latency_ms": e2e_latency_ms,
+            })))
+        }
         Ok(Err(_)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "Probe channel failed".into(),
@@ -2907,9 +3152,140 @@ async fn probe_tunnel(
                 "listener": listener_active,
                 "agent_online": agent_online,
                 "local": serde_json::Value::Null,
-                "message": "probe timed out; agent may be running an older version",
+                "message": "探测超时,代理可能运行旧版本",
+                "e2e": serde_json::Value::Null,
+                "e2e_message": serde_json::Value::Null,
+                "e2e_latency_ms": serde_json::Value::Null,
             })))
         }
+    }
+}
+
+/// End-to-end probe for TCP/HTTP tunnels: connects to the public listener the
+/// same way a real client would, so the full path (public port -> server ->
+/// data channel -> agent -> local service) is exercised. Returns whether the
+/// connection stayed alive long enough for the agent to bridge to the local
+/// service, a human-readable message, and the latency of the first response
+/// (or connection establishment).
+async fn e2e_probe_stream(tunnel: &TunnelRecord) -> (Option<bool>, Option<String>, Option<u64>) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], tunnel.public_port as u16));
+    let started = Instant::now();
+    let connect = TcpStream::connect(addr);
+    let Ok(Ok(mut stream)) = tokio::time::timeout(StdDuration::from_secs(5), connect).await else {
+        return (
+            Some(false),
+            Some("无法连接公网端口,监听器可能未就绪".into()),
+            None,
+        );
+    };
+    let _ = stream.set_nodelay(true);
+    if tunnel.kind == "http" {
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            tunnel.public_port
+        );
+        let write = stream.write_all(request.as_bytes());
+        if tokio::time::timeout(StdDuration::from_secs(3), write)
+            .await
+            .is_err()
+        {
+            return (
+                Some(false),
+                Some("向公网端口写入 HTTP 请求超时".into()),
+                None,
+            );
+        }
+        let mut buffer = [0_u8; 128];
+        match tokio::time::timeout(StdDuration::from_secs(3), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => (
+                Some(false),
+                Some("连接被关闭,本地服务可能未运行或拒绝了 HTTP 请求".into()),
+                None,
+            ),
+            Ok(Ok(_)) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                (
+                    Some(true),
+                    Some("公网端口到本地服务的 HTTP 链路连通".into()),
+                    Some(latency_ms),
+                )
+            }
+            Err(_) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                (
+                    Some(true),
+                    Some("链路连通,但本地服务在 3 秒内未返回 HTTP 响应".into()),
+                    Some(latency_ms),
+                )
+            }
+        }
+    } else {
+        // Generic TCP: keep the connection open briefly and watch for an
+        // early close. If the agent cannot reach the local service it sends
+        // StreamClose and the server drops this socket, so a close here means
+        // the local bridge failed; staying open means the path is alive.
+        let mut buffer = [0_u8; 64];
+        let read = stream.read(&mut buffer);
+        match tokio::time::timeout(StdDuration::from_millis(900), read).await {
+            Ok(Ok(0)) | Ok(Err(_)) => (
+                Some(false),
+                Some("连接被关闭,本地服务可能未运行或拒绝了连接".into()),
+                None,
+            ),
+            Ok(Ok(_)) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                (
+                    Some(true),
+                    Some("公网端口到本地服务的 TCP 链路连通,且收到服务端数据".into()),
+                    Some(latency_ms),
+                )
+            }
+            Err(_) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                (
+                    Some(true),
+                    Some("公网端口到本地服务的 TCP 链路连通".into()),
+                    Some(latency_ms),
+                )
+            }
+        }
+    }
+}
+
+/// End-to-end probe for UDP tunnels: sends one probe datagram through the
+/// public listener and waits briefly for a reply. Many UDP services never
+/// reply, so a missing reply is reported as an unverifiable result rather
+/// than a failure.
+async fn e2e_probe_udp(tunnel: &TunnelRecord) -> (Option<bool>, Option<String>, Option<u64>) {
+    let Ok(socket) = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await else {
+        return (None, Some("无法创建 UDP 探测套接字".into()), None);
+    };
+    let target = SocketAddr::from(([127, 0, 0, 1], tunnel.public_port as u16));
+    if socket.send_to(b"tunnel-probe", target).await.is_err() {
+        return (
+            None,
+            Some("UDP 探测包发送失败,公网端口可能未监听".into()),
+            None,
+        );
+    }
+    let mut buffer = [0_u8; 256];
+    match tokio::time::timeout(StdDuration::from_secs(1), socket.recv_from(&mut buffer)).await {
+        Ok(Ok((_, from))) if from == target => (
+            Some(true),
+            Some("公网端口到本地服务的 UDP 链路连通,并收到回包".into()),
+            None,
+        ),
+        Ok(Ok((_, from))) => (
+            None,
+            Some(format!("已发送探测包,但回包来自非目标地址 {from}")),
+            None,
+        ),
+        Ok(Err(_)) => (None, Some("已发送探测包,但读取回包失败".into()), None),
+        Err(_) => (
+            None,
+            Some("已发送探测包,本地服务未回包(单向 UDP 服务属正常情况)".into()),
+            None,
+        ),
     }
 }
 
@@ -3902,6 +4278,19 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         },
     );
     state.plane.session_signal.notify_waiters();
+    // If an admin-requested restart is in flight, the agent coming back is
+    // the last observable milestone; the status API marks it done once the
+    // device is online again.
+    if let Some(restart) = state.restarts.read().await.get(&device_id).cloned() {
+        if restart.phase != "done" && restart.phase != "failed" {
+            let mut restarts = state.restarts.write().await;
+            if let Some(current) = restarts.get_mut(&device_id) {
+                current.phase = "online".into();
+                current.progress = 95;
+                current.message = Some("代理已重新上线,重启完成".into());
+            }
+        }
+    }
     let tunnels = load_specs(&state.db, device_id).await;
     let _ = out_tx
         .send(Message::Text(
@@ -3978,6 +4367,21 @@ async fn control_loop(socket: WebSocket, state: AppState) {
                     if let Some(tx) = state.probes.write().await.remove(&probe_id) {
                         let _ = tx.send(ProbeOutcome { ok, message });
                     }
+                } else if let Ok(ControlMessage::RestartProgress {
+                    restart_id,
+                    progress,
+                    phase,
+                    message,
+                }) = decode(text.as_bytes())
+                {
+                    let mut restarts = state.restarts.write().await;
+                    if let Some(current) = restarts.get_mut(&device_id) {
+                        if current.restart_id.to_string() == restart_id {
+                            current.phase = phase;
+                            current.progress = progress.min(90);
+                            current.message = message;
+                        }
+                    }
                 }
             }
             // Binary frames belong on data channels; the control socket only
@@ -3994,6 +4398,16 @@ async fn control_loop(socket: WebSocket, state: AppState) {
             // The device is offline: drop its bandwidth bucket so idle devices
             // do not accumulate memory; a reconnect lazily recreates it.
             state.bandwidth.remove_device(device_id).await;
+            // A pending remote restart just dropped the control socket; move
+            // the progress bar to "restarting" until the agent reconnects.
+            let mut restarts = state.restarts.write().await;
+            if let Some(current) = restarts.get_mut(&device_id) {
+                if current.phase != "done" && current.phase != "failed" {
+                    current.phase = "restarting".into();
+                    current.progress = 70;
+                    current.message = Some("代理进程已退出,正在等待重新上线".into());
+                }
+            }
         }
     }
     {
@@ -4192,18 +4606,37 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
         channel_id
     };
     state.plane.data_channel_signal.notify_waiters();
+    // Get-or-create the per-channel counters so reconnects keep accumulating
+    // instead of resetting; cloning shares the same underlying counters.
+    let stats = state
+        .plane
+        .channel_stats
+        .write()
+        .await
+        .entry((device_id, channel_id))
+        .or_insert_with(|| Arc::new(ChannelStats::default()))
+        .clone();
+    stats.connected.store(true, Ordering::Relaxed);
     let writer_plane = state.plane.clone();
+    let writer_stats = stats.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             // The frame has left the shared queue; return the stream's quota
             // so its bridge can enqueue more without monopolizing the queue.
+            let mut sent_bytes = 0_usize;
             if let Message::Binary(bytes) = &message {
-                if let Ok((id, _)) = decode_stream_data(bytes) {
+                if let Ok((id, payload)) = decode_stream_data(bytes) {
                     release_stream_slot(&writer_plane, id).await;
+                    sent_bytes = payload.len();
                 }
             }
             if sink.send(message).await.is_err() {
                 break;
+            }
+            if sent_bytes > 0 {
+                writer_stats
+                    .down_bytes
+                    .fetch_add(sent_bytes as u64, Ordering::Relaxed);
             }
         }
     });
@@ -4216,6 +4649,7 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
             .await;
     }
     let reader_state = state.clone();
+    let reader_stats = stats.clone();
     let heartbeat_out = out_tx.clone();
     let reader = tokio::spawn(async move {
         let mut last_echo_warn = Instant::now();
@@ -4223,6 +4657,9 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
             match message {
                 Message::Binary(bytes) => {
                     if let Ok((id, data)) = decode_stream_data(&bytes) {
+                        reader_stats
+                            .up_bytes
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
                         match route_stream_data(&reader_state.plane, id, data).await {
                             RouteOutcome::StreamSendTimeout(stream_id) => {
                                 send_control(
@@ -4318,6 +4755,7 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
         if removed_channel.is_some() {
             reader_state.plane.data_channel_signal.notify_waiters();
         }
+        reader_stats.connected.store(false, Ordering::Relaxed);
         reader_state
             .plane
             .data_socket_tasks

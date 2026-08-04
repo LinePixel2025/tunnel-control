@@ -95,6 +95,24 @@ pub enum ControlMessage {
     BandwidthConfig {
         mbps: u64,
     },
+    /// Server asks the agent to restart its process. The agent replies with
+    /// `RestartProgress` until it exits; service-mode agents rely on the SCM
+    /// failure recovery to come back, while console-mode agents spawn a
+    /// fresh hidden worker before exiting.
+    RestartAgent {
+        restart_id: String,
+        reason: Option<String>,
+    },
+    /// Agent -> server progress updates for a remote restart. Older agents
+    /// simply ignore `RestartAgent` (unknown serde variants decode as
+    /// errors), so the server must time out the restart when no progress is
+    /// heard.
+    RestartProgress {
+        restart_id: String,
+        progress: u8,
+        phase: String,
+        message: Option<String>,
+    },
     /// First message on a data WebSocket: binds the socket to an online
     /// device using the same agent token as the control registration.
     DataBind {
@@ -208,6 +226,21 @@ mod tests {
             latency_ms: 14,
         };
         assert_eq!(decode(&encode(&input).unwrap()).unwrap(), input);
+    }
+    #[test]
+    fn round_trip_restart_messages() {
+        let request = ControlMessage::RestartAgent {
+            restart_id: "b6f9d6c2-4f80-4f7a-9f5b-8e8f4d0f2c3a".into(),
+            reason: Some("admin_request".into()),
+        };
+        assert_eq!(decode(&encode(&request).unwrap()).unwrap(), request);
+        let progress = ControlMessage::RestartProgress {
+            restart_id: "b6f9d6c2-4f80-4f7a-9f5b-8e8f4d0f2c3a".into(),
+            progress: 30,
+            phase: "stopping".into(),
+            message: Some("agent is stopping".into()),
+        };
+        assert_eq!(decode(&encode(&progress).unwrap()).unwrap(), progress);
     }
     #[test]
     fn rejects_wrong_version() {

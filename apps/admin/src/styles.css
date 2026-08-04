@@ -268,6 +268,18 @@ code { font-family: "DM Mono"; font-size: 11px; color: #405047; }
 .empty { text-align: center; padding: 52px 20px; color: #728078; }
 .empty-icon { margin: 0 auto 15px; background: #e2f4ec; color: #13775d; }
 .empty p { font-size: 12px; max-width: 330px; margin: 0 auto 17px; }
+.channel-traffic { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 6px; }
+.channel-total { font: 600 10px inherit; color: #405047; }
+.channel-stat { font: 500 10px "DM Mono"; color: #8b9690; background: #f3f6f4; border: 1px solid #e3e8e5; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
+.channel-stat.connected { color: #17785f; background: #e9f8f0; border-color: #b9e5cf; }
+.restart-progress { margin-top: 8px; max-width: 420px; }
+.restart-bar { height: 6px; background: #edf0ee; border-radius: 999px; overflow: hidden; }
+.restart-bar span { display: block; height: 100%; background: #2bb486; border-radius: 999px; transition: width .4s ease; }
+.restart-progress.fail .restart-bar span { background: #d9534f; }
+.restart-progress.done .restart-bar span { background: #17785f; }
+.restart-message { display: block; font-size: 10px; color: #69766e; margin-top: 4px; }
+.text-button:disabled { opacity: .4; cursor: not-allowed; }
+.text-button:disabled:hover { background: transparent; }
 
 /* ---------- Notice & probe ---------- */
 .notice {
@@ -294,6 +306,14 @@ code { font-family: "DM Mono"; font-size: 11px; color: #405047; }
 .probe span { color: #55635b; }
 .probe.ok { background: #e9f8f0; border-color: #b9e5cf; color: #0f6b4a; }
 .probe.fail { background: #fdf0ee; border-color: #f0c7bf; color: #a13a2a; }
+.probe-stages { list-style: none; display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; font-size: 11px; }
+.probe-stages li { display: inline-flex; gap: 5px; align-items: baseline; color: #69766e; }
+.probe-stages li span { color: #8b9690; }
+.probe-stages li em { font-style: normal; font-weight: 600; }
+.probe-stages li.pass em { color: #17785f; }
+.probe-stages li.fail em { color: #c0392b; }
+.probe-stages li.skip em { color: #9a6817; }
+.probe-latency { font: 500 11px "DM Mono"; white-space: nowrap; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

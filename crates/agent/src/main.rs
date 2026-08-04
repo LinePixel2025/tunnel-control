@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
@@ -10,7 +11,7 @@ use std::{
     process::Command,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -60,6 +61,64 @@ type TaskMap = Arc<tokio::sync::Mutex<HashMap<u128, tokio::task::JoinHandle<()>>
 /// Pending pre-`StreamOpen` frames: first-arrival time, frames in arrival
 /// order, and the total buffered byte count.
 type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>, usize)>>>;
+
+/// Per-channel traffic counters shared between the data-channel task and the
+/// IPC snapshot handler. They live for the whole agent process so the
+/// `traffic` console command reports bytes accumulated across reconnects,
+/// not just the current socket session.
+#[derive(Default)]
+struct ChannelCounters {
+    up_bytes: AtomicU64,
+    down_bytes: AtomicU64,
+    connected: AtomicBool,
+}
+
+impl ChannelCounters {
+    fn snapshot(&self) -> (u64, u64, bool) {
+        (
+            self.up_bytes.load(Ordering::Relaxed),
+            self.down_bytes.load(Ordering::Relaxed),
+            self.connected.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Process-wide map of per-channel counters, keyed by the server-assigned
+/// data channel id (1-based). Cloning shares the same underlying counters.
+#[derive(Clone, Default)]
+struct TrafficStats {
+    channels: Arc<RwLock<HashMap<u16, Arc<ChannelCounters>>>>,
+}
+
+/// Local-only IPC messages exchanged between the client console and the
+/// running agent process over a named pipe. Not part of the server protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IpcRequest {
+    cmd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IpcChannelStat {
+    channel_id: u16,
+    up_bytes: u64,
+    down_bytes: u64,
+    connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IpcTrafficTotals {
+    up_bytes: u64,
+    down_bytes: u64,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IpcSnapshot {
+    settings: AgentSettings,
+    settings_synced_at: Option<u64>,
+    channels: Vec<IpcChannelStat>,
+    totals: IpcTrafficTotals,
+}
 
 /// Byte budget for frames buffered before a stream's `StreamOpen` arrives
 /// (control and data sockets have no ordering guarantee). Four protocol
@@ -127,6 +186,8 @@ struct AgentStatus {
     data_channels: DataSenderMap,
     bandwidth: BandwidthLimiter,
     settings: Arc<RwLock<AgentSettings>>,
+    settings_synced_at: Arc<std::sync::Mutex<Option<u64>>>,
+    traffic: TrafficStats,
 }
 
 impl AgentStatus {
@@ -137,6 +198,8 @@ impl AgentStatus {
             data_channels: Arc::new(RwLock::new(HashMap::new())),
             bandwidth: BandwidthLimiter::default(),
             settings: Arc::new(RwLock::new(config.to_agent_settings())),
+            settings_synced_at: Arc::new(std::sync::Mutex::new(None)),
+            traffic: TrafficStats::default(),
         }
     }
 }
@@ -496,6 +559,9 @@ use windows_service::{
 };
 
 #[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
+
+#[cfg(windows)]
 define_windows_service!(ffi_service_main, service_main);
 
 /// Quotes one Windows command-line argument the way CommandLineToArgvW parses
@@ -601,7 +667,10 @@ fn maybe_self_elevate(arguments: &[String]) -> bool {
         {
             return false;
         }
-        if arguments.get(1).map(String::as_str) == Some("logs") {
+        if matches!(
+            arguments.get(1).map(String::as_str),
+            Some("logs") | Some("settings") | Some("traffic")
+        ) {
             return false;
         }
         if elevation::is_elevated() {
@@ -625,6 +694,13 @@ fn maybe_self_elevate(arguments: &[String]) -> bool {
 
 fn main() {
     let arguments: Vec<String> = env::args().collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("tunnel-agent {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if maybe_self_elevate(&arguments) {
         return;
     }
@@ -688,6 +764,16 @@ fn main() {
             .unwrap_or(100)
             .clamp(1, 2000);
         main_logs(follow, lines);
+        return;
+    }
+    if arguments.get(1).map(String::as_str) == Some("settings") {
+        setup_logging(false);
+        console_settings();
+        return;
+    }
+    if arguments.get(1).map(String::as_str) == Some("traffic") {
+        setup_logging(false);
+        console_traffic();
         return;
     }
     if arguments.iter().any(|argument| argument == "--agent") {
@@ -955,6 +1041,189 @@ fn console_status() {
     );
 }
 
+/// `settings` command: prints the effective agent settings. Values pushed by
+/// the server are persisted to the credentials file on every `SettingsSync`,
+/// so this works whether or not the agent process is currently running.
+fn console_settings() {
+    let settings = AgentConfig::from_env().to_agent_settings();
+    let credentials = load_credentials();
+    match credentials
+        .get("SETTINGS_SYNCED_AT")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(synced_at) => {
+            println!("服务器下发设置(同步时间 {})", format_unix_time(synced_at));
+        }
+        None => {
+            println!("尚未收到服务器下发设置(当前为本地默认)");
+        }
+    }
+    println!("  设备名称    : {}", settings.device_name);
+    println!("  服务器地址  : {}", settings.server_url);
+    println!("  数据通道数  : {}", settings.data_channels);
+    println!("  心跳间隔    : {} 秒", settings.heartbeat_secs);
+    println!("  PONG 超时   : {} 秒", settings.pong_timeout_secs);
+    println!("  重连最小间隔: {} 秒", settings.reconnect_min_secs);
+    println!("  重连最大间隔: {} 秒", settings.reconnect_max_secs);
+    println!("  日志级别    : {}", settings.log_level);
+}
+
+/// `traffic` command: asks the running agent for a live per-channel snapshot
+/// through its named pipe, then prints each channel's up/down/total bytes.
+#[cfg(windows)]
+fn console_traffic() {
+    let Some(pid) = read_console_pid() else {
+        println!("代理未运行,无法获取实时流量。");
+        return;
+    };
+    if !process_is_running(pid) {
+        println!("代理未运行,无法获取实时流量。");
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        println!("无法启动流量查询运行时。");
+        return;
+    };
+    match runtime.block_on(fetch_traffic_snapshot(pid)) {
+        Ok(snapshot) => print_traffic(&snapshot),
+        Err(error) => println!("无法获取实时流量: {error}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn console_traffic() {
+    println!("traffic 命令仅在 Windows 上可用。");
+}
+
+/// Connects to the agent's named pipe and reads one snapshot response.
+#[cfg(windows)]
+async fn fetch_traffic_snapshot(pid: u32) -> io::Result<IpcSnapshot> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = format!(r"\\.\pipe\TunnelControl-agent-{pid}");
+    // Opening a named pipe is synchronous; retry briefly because the agent's
+    // IPC server recreates its pipe instance between accepted connections.
+    let mut client = None;
+    for _ in 0..5 {
+        match ClientOptions::new().open(&path) {
+            Ok(opened) => {
+                client = Some(opened);
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                return Err(io::Error::new(io::ErrorKind::NotFound, error.to_string()));
+            }
+        }
+    }
+    let Some(mut client) = client else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "agent IPC pipe unavailable",
+        ));
+    };
+    client.write_all(b"{\"cmd\":\"snapshot\"}\n").await?;
+    client.flush().await?;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC read timed out"))??;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.contains(&b'\n') {
+            break;
+        }
+        if response.len() > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC response too large",
+            ));
+        }
+    }
+    let line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    serde_json::from_slice(line)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn print_traffic(snapshot: &IpcSnapshot) {
+    println!("流量统计(截至 {})", format_unix_time(unix_now()));
+    if snapshot.channels.is_empty() {
+        println!("  尚无数据通道流量统计。");
+    } else {
+        for channel in &snapshot.channels {
+            let state = if channel.connected {
+                "在线"
+            } else {
+                "离线"
+            };
+            println!(
+                "  通道 {} : 上行 {} / 下行 {} / 合计 {} ({state})",
+                channel.channel_id,
+                format_bytes(channel.up_bytes),
+                format_bytes(channel.down_bytes),
+                format_bytes(channel.up_bytes.saturating_add(channel.down_bytes)),
+            );
+        }
+    }
+    println!(
+        "  合计   : 上行 {} / 下行 {} / 总计 {}",
+        format_bytes(snapshot.totals.up_bytes),
+        format_bytes(snapshot.totals.down_bytes),
+        format_bytes(snapshot.totals.total_bytes),
+    );
+}
+
+/// Formats a byte count with adaptive 1024-based units (B/KB/MB/GB/TB),
+/// keeping one decimal place for values that need it.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let text = format!("{value:.1}");
+    format!("{} {}", text.trim_end_matches(".0"), UNITS[unit])
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Formats a Unix timestamp as local wall-clock time.
+fn format_unix_time(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("{secs} (Unix)"))
+}
+
 fn console_help() {
     println!("Commands:");
     println!("  start     start the agent if it is not running");
@@ -962,6 +1231,8 @@ fn console_help() {
     println!("  restart   terminate and start again");
     println!("  reset     stop the agent and delete ALL local data (re-enroll on next start)");
     println!("  status    show process/service/credential state");
+    println!("  settings  show the settings pushed by the server");
+    println!("  traffic   show live per-channel traffic totals");
     println!("  logs      print the latest agent log lines");
     println!("  exit      leave the console (the agent keeps running)");
     println!("  help      show this help");
@@ -1009,6 +1280,8 @@ fn run_console() {
             }
             "reset" => console_reset(),
             "status" => console_status(),
+            "settings" => console_settings(),
+            "traffic" => console_traffic(),
             "logs" => main_logs(false, 60),
             "exit" => {
                 println!(
@@ -1155,12 +1428,17 @@ fn run_agent_forever() {
         .expect("failed to build tokio runtime");
     runtime.block_on(async move {
         let mut attempt = 0_u32;
+        // Process-wide state: pushed settings and traffic counters must
+        // survive reconnects, so the status is created once instead of per
+        // session. Only connection parameters are re-read from disk below.
+        let status = AgentStatus::new(&AgentConfig::from_env());
+        #[cfg(windows)]
+        tokio::spawn(ipc_server(status.clone()));
         loop {
             // Re-read the config every session so enrollment and pushed
             // settings (persisted to the credentials file) take effect on the
             // next connect without a process restart.
             let config = AgentConfig::from_env();
-            let status = AgentStatus::new(&config);
             let outcome = run(&config, &status).await;
             match outcome {
                 // Enrollment approved or settings require a reconnect:
@@ -1168,6 +1446,22 @@ fn run_agent_forever() {
                 Ok(RunOutcome::ReconnectNow) => {
                     attempt = 0;
                     continue;
+                }
+                // Remote restart: console workers spawn a fresh hidden
+                // process; service mode exits and the SCM failure recovery
+                // actions bring the service back within a few seconds.
+                Ok(RunOutcome::Restarting { restart_id }) => {
+                    tracing::info!(%restart_id, "restarting agent process");
+                    if !restart_agent_process() {
+                        // Could not replace the console worker; stay online
+                        // instead of taking the device down.
+                        attempt = 0;
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    // Non-zero exit makes the SCM failure recovery kick in
+                    // for service mode; console workers are already replaced.
+                    std::process::exit(1);
                 }
                 Ok(RunOutcome::Disconnected) => {
                     tracing::info!("control connection closed; backing off");
@@ -1188,6 +1482,157 @@ fn run_agent_forever() {
             tokio::time::sleep(delay).await;
         }
     });
+}
+
+/// Restarts the agent process in place. Console mode (`--agent`) spawns a
+/// fresh hidden worker and updates the pid file before the old process
+/// exits. Service mode needs no spawn: the Windows SCM was configured with
+/// `failure restart/5000` at install time, so exiting the process makes the
+/// service restart automatically. Returns false only when a console-mode
+/// worker could not be spawned, in which case the caller keeps running.
+fn restart_agent_process() -> bool {
+    #[cfg(windows)]
+    if env::args().any(|argument| argument == "--agent") {
+        let Some(exe) = env::current_exe().ok() else {
+            return false;
+        };
+        let stdout = fs::File::create(console_state_dir().join("console.log")).ok();
+        let stderr = fs::File::create(console_state_dir().join("console.err.log")).ok();
+        let mut command = Command::new(exe);
+        command
+            .arg("--agent")
+            .env_remove("TUNNEL_TOKEN")
+            .env_remove("TUNNEL_SERVER_URL")
+            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        if let (Some(stdout), Some(stderr)) = (stdout, stderr) {
+            command.stdout(stdout).stderr(stderr);
+        }
+        if let Ok(child) = command.spawn() {
+            let _ = fs::write(console_pid_file(), child.id().to_string());
+            tracing::info!(
+                pid = child.id(),
+                "fresh console-mode agent spawned; old process exiting"
+            );
+            return true;
+        }
+        tracing::error!("could not spawn fresh console-mode agent; staying online");
+        return false;
+    }
+    true
+}
+
+/// Windows named pipe used for console <-> agent queries. The PID keeps the
+/// name collision-free across user sessions and stale agent processes; the
+/// console reads the same PID from its `agent.pid` file.
+#[cfg(windows)]
+fn agent_pipe_name() -> String {
+    format!(r"\\.\pipe\TunnelControl-agent-{}", std::process::id())
+}
+
+/// Serves one-shot `snapshot` requests from the client console. Each accepted
+/// connection is handled in its own task and closed after the response, so
+/// the console always reads counters as of the moment its command runs.
+#[cfg(windows)]
+async fn ipc_server(status: AgentStatus) {
+    let path = agent_pipe_name();
+    loop {
+        let server = match ServerOptions::new().create(&path) {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::warn!(%error, "IPC pipe create failed; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        match server.connect().await {
+            Ok(()) => {
+                let status = status.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_ipc_client(server, status).await {
+                        tracing::debug!(%error, "IPC client session ended");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "IPC pipe accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Reads one newline-delimited JSON request, answers with a `snapshot`
+/// payload, and closes the connection.
+#[cfg(windows)]
+async fn handle_ipc_client(mut server: NamedPipeServer, status: AgentStatus) -> io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 512];
+    loop {
+        let read = server.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.contains(&b'\n') {
+            break;
+        }
+        if request.len() > 4096 {
+            return Ok(());
+        }
+    }
+    if request.is_empty() {
+        return Ok(());
+    }
+    let Ok(IpcRequest { cmd }) = serde_json::from_slice(&request) else {
+        return Ok(());
+    };
+    if cmd != "snapshot" {
+        return Ok(());
+    }
+    let snapshot = build_ipc_snapshot(&status).await;
+    let response = serde_json::to_vec(&snapshot)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    server.write_all(&response).await?;
+    server.write_all(b"\n").await?;
+    server.flush().await?;
+    Ok(())
+}
+
+/// Builds the live snapshot: effective settings plus per-channel byte totals
+/// accumulated since the agent process started.
+async fn build_ipc_snapshot(status: &AgentStatus) -> IpcSnapshot {
+    let settings = status.settings.read().await.clone();
+    let settings_synced_at = *status.settings_synced_at.lock().unwrap();
+    let mut channels: Vec<IpcChannelStat> = status
+        .traffic
+        .channels
+        .read()
+        .await
+        .iter()
+        .map(|(channel_id, counters)| {
+            let (up_bytes, down_bytes, connected) = counters.snapshot();
+            IpcChannelStat {
+                channel_id: *channel_id,
+                up_bytes,
+                down_bytes,
+                connected,
+            }
+        })
+        .collect();
+    channels.sort_by_key(|channel| channel.channel_id);
+    let up_bytes: u64 = channels.iter().map(|channel| channel.up_bytes).sum();
+    let down_bytes: u64 = channels.iter().map(|channel| channel.down_bytes).sum();
+    IpcSnapshot {
+        settings,
+        settings_synced_at,
+        channels,
+        totals: IpcTrafficTotals {
+            up_bytes,
+            down_bytes,
+            total_bytes: up_bytes.saturating_add(down_bytes),
+        },
+    }
 }
 
 /// `logs` CLI: prints recent agent log lines and optionally follows the
@@ -1434,6 +1879,9 @@ enum RunOutcome {
     /// control session (server_url / data_channels / token); reconnect now
     /// without backoff.
     ReconnectNow,
+    /// The server asked this agent to restart its process. The caller must
+    /// respawn (console mode) or exit (service mode, SCM recovery restarts).
+    Restarting { restart_id: String },
     /// The control channel closed or errored; the outer loop applies backoff.
     Disconnected,
 }
@@ -1468,6 +1916,7 @@ async fn run(
     let last_rtt_ms = Arc::new(std::sync::Mutex::new(0_u32));
     let reader_done = Arc::new(tokio::sync::Notify::new());
     let settings_changed = Arc::new(tokio::sync::Notify::new());
+    let restart_requested = Arc::new(std::sync::Mutex::new(None::<String>));
 
     let register = ControlMessage::Register {
         version: PROTOCOL_VERSION,
@@ -1503,6 +1952,7 @@ async fn run(
     let reader_data_tasks = data_tasks.clone();
     let reader_done_notify = reader_done.clone();
     let reader_settings_changed = settings_changed.clone();
+    let reader_restart_requested = restart_requested.clone();
     let reader_task = tokio::spawn(async move {
         let mut data_channels_opened = false;
         while let Some(Ok(message)) = read.next().await {
@@ -1554,6 +2004,7 @@ async fn run(
                         // Fields that cannot change live require a reconnect;
                         // everything else applies immediately.
                         let reconnect_required = settings_reconnect_decision(&current, &settings);
+                        let synced_at = unix_now();
                         let mut updates = HashMap::new();
                         // Empty server_url means "not configured"; keep the
                         // local bootstrap address instead of wiping it.
@@ -1582,9 +2033,11 @@ async fn run(
                             settings.reconnect_max_secs.to_string(),
                         );
                         updates.insert("LOG_LEVEL".to_string(), settings.log_level.clone());
+                        updates.insert("SETTINGS_SYNCED_AT".to_string(), synced_at.to_string());
                         if save_credentials(&updates).is_err() {
                             tracing::warn!("could not persist pushed settings");
                         }
+                        *reader_status.settings_synced_at.lock().unwrap() = Some(synced_at);
                         apply_log_level(&settings.log_level);
                         *reader_status.settings.write().await = settings;
                         tracing::info!("server settings applied");
@@ -1741,6 +2194,34 @@ async fn run(
                             }
                         });
                     }
+                    Ok(ControlMessage::RestartAgent { restart_id, reason }) => {
+                        if let Ok(mut pending_restart) = reader_restart_requested.lock() {
+                            *pending_restart = Some(restart_id.clone());
+                        }
+                        tracing::warn!(
+                            %restart_id,
+                            reason = reason.as_deref().unwrap_or("admin_request"),
+                            "remote restart requested; stopping agent"
+                        );
+                        // Tell the server we are stopping, then give the
+                        // control writer a moment to flush the progress
+                        // message before the session tears down.
+                        let progress = ControlMessage::RestartProgress {
+                            restart_id,
+                            progress: 30,
+                            phase: "stopping".into(),
+                            message: Some("代理已收到重启指令,正在停止本地隧道".into()),
+                        };
+                        if let Ok(payload) = encode(&progress) {
+                            let _ = reader_control
+                                .send(Message::Text(
+                                    String::from_utf8_lossy(&payload).into_owned().into(),
+                                ))
+                                .await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        reader_settings_changed.notify_one();
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -1791,9 +2272,15 @@ async fn run(
             }
         }
     }
+    let restart_id = restart_requested.lock().unwrap().clone();
     status.connections.write().await.clear();
     for task in data_tasks.lock().await.drain(..) {
         task.abort();
+    }
+    // The control session is ending; every data channel is gone even though
+    // its process-wide counters stay for the `traffic` command.
+    for counters in status.traffic.channels.read().await.values() {
+        counters.connected.store(false, Ordering::Relaxed);
     }
     for (_, task) in bridge_tasks.lock().await.drain() {
         task.abort();
@@ -1804,7 +2291,11 @@ async fn run(
     writer_task.abort();
     reader_task.abort();
     if reconnect {
-        Ok(RunOutcome::ReconnectNow)
+        if let Some(restart_id) = restart_id {
+            Ok(RunOutcome::Restarting { restart_id })
+        } else {
+            Ok(RunOutcome::ReconnectNow)
+        }
     } else {
         Ok(RunOutcome::Disconnected)
     }
@@ -1972,19 +2463,38 @@ async fn data_channel_task(
                     .write()
                     .await
                     .insert(channel_id, tx.clone());
+                // Get-or-create the process-wide counters for this channel
+                // id so a reconnect keeps accumulating instead of resetting.
+                let counters = status
+                    .traffic
+                    .channels
+                    .write()
+                    .await
+                    .entry(channel_id)
+                    .or_insert_with(|| Arc::new(ChannelCounters::default()))
+                    .clone();
+                counters.connected.store(true, Ordering::Relaxed);
                 let writer_streams = streams.clone();
+                let writer_counters = counters.clone();
                 let writer = tokio::spawn(async move {
                     while let Some(message) = rx.recv().await {
                         // The frame has left the shared queue; return the
                         // stream's quota so its bridge can enqueue more
                         // without monopolizing the channel.
+                        let mut sent_bytes = 0_usize;
                         if let Message::Binary(bytes) = &message {
-                            if let Ok((id, _)) = decode_stream_data(bytes) {
+                            if let Ok((id, payload)) = decode_stream_data(bytes) {
                                 release_stream_slot_agent(&writer_streams, id).await;
+                                sent_bytes = payload.len();
                             }
                         }
                         if sink.send(message).await.is_err() {
                             break;
+                        }
+                        if sent_bytes > 0 {
+                            writer_counters
+                                .up_bytes
+                                .fetch_add(sent_bytes as u64, Ordering::Relaxed);
                         }
                     }
                 });
@@ -2020,6 +2530,9 @@ async fn data_channel_task(
                 while let Some(Ok(message)) = source.next().await {
                     if let Message::Binary(bytes) = message {
                         if let Ok((id, data)) = decode_stream_data(&bytes) {
+                            counters
+                                .down_bytes
+                                .fetch_add(data.len() as u64, Ordering::Relaxed);
                             route_agent_binary(
                                 &reader_streams,
                                 &reader_connections,
@@ -2035,6 +2548,7 @@ async fn data_channel_task(
                 writer.abort();
                 keepalive.abort();
                 status.data_channels.write().await.remove(&channel_id);
+                counters.connected.store(false, Ordering::Relaxed);
                 tracing::warn!(channel_id, "data channel lost; reconnecting");
                 let delay = data_channel_backoff(attempt);
                 attempt = attempt.saturating_add(1);
@@ -2874,6 +3388,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_channel_task_counts_bytes_in_both_directions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = websocket.split();
+            // Answer the DataBind with channel id 1, then push a 100-byte
+            // frame down to the agent and expect a 200-byte frame back.
+            let first = source.next().await.unwrap().unwrap();
+            let Message::Text(text) = first else {
+                panic!("expected DataBind text");
+            };
+            assert!(matches!(
+                decode(text.as_bytes()),
+                Ok(ControlMessage::DataBind { .. })
+            ));
+            let bound = encode(&ControlMessage::DataBound { channel_id: 1 }).unwrap();
+            sink.send(Message::Text(String::from_utf8(bound).unwrap().into()))
+                .await
+                .unwrap();
+            let down = encode_stream_data(7, &vec![0xAB; 100]).unwrap();
+            sink.send(Message::Binary(down.into())).await.unwrap();
+            let up = source.next().await.unwrap().unwrap();
+            let Message::Binary(bytes) = up else {
+                panic!("expected binary frame from agent");
+            };
+            let (id, data) = decode_stream_data(&bytes).unwrap();
+            assert_eq!(id, 7);
+            assert_eq!(data.len(), 200);
+        });
+
+        let config = AgentConfig {
+            server: format!("ws://{addr}/control"),
+            data_server: format!("ws://{addr}/data"),
+            token: "test-token".into(),
+            name: "test".into(),
+            data_channels: 2,
+            heartbeat_secs: 10,
+            pong_timeout_secs: 25,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 10,
+            log_level: "info".into(),
+        };
+        let status = AgentStatus::new(&config);
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let (control, _control_rx) = mpsc::channel::<Message>(64);
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let task = tokio::spawn(data_channel_task(
+            config,
+            status.clone(),
+            streams,
+            connections,
+            control,
+            pending,
+        ));
+
+        // Wait until the channel binds and the down frame was counted.
+        let counters = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(counters) = status.traffic.channels.read().await.get(&1).cloned() {
+                    if counters.connected.load(Ordering::Relaxed) {
+                        return counters;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("data channel must bind");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counters.down_bytes.load(Ordering::Relaxed) != 100 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("down bytes must be counted");
+
+        // Send a 200-byte frame up through the channel sender.
+        let up_frame = encode_stream_data(7, &vec![0xCC; 200]).unwrap();
+        status
+            .data_channels
+            .read()
+            .await
+            .get(&1)
+            .expect("channel sender must exist")
+            .send(Message::Binary(up_frame.into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counters.up_bytes.load(Ordering::Relaxed) != 200 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("up bytes must be counted");
+
+        server.await.unwrap();
+        // Once the server drops the socket, the channel task must mark the
+        // channel offline while keeping its totals.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counters.connected.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("channel must be marked offline after drop");
+        assert_eq!(counters.up_bytes.load(Ordering::Relaxed), 200);
+        assert_eq!(counters.down_bytes.load(Ordering::Relaxed), 100);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn pending_buffer_grows_past_byte_budget_without_dropping() {
         let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
         let id: u128 = 91;
@@ -3101,5 +3729,93 @@ mod tests {
             ..current.clone()
         };
         assert!(settings_reconnect_decision(&current, &more_channels));
+    }
+
+    #[test]
+    fn format_bytes_uses_adaptive_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1_048_576), "1 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1 GB");
+        assert_eq!(format_bytes(1_099_511_627_776), "1 TB");
+    }
+
+    #[tokio::test]
+    async fn traffic_stats_accumulate_across_channel_reconnects() {
+        let stats = TrafficStats::default();
+        let counters = {
+            let mut map = stats.channels.write().await;
+            map.entry(1)
+                .or_insert_with(|| Arc::new(ChannelCounters::default()))
+                .clone()
+        };
+        counters.connected.store(true, Ordering::Relaxed);
+        counters.up_bytes.fetch_add(1000, Ordering::Relaxed);
+        counters.down_bytes.fetch_add(500, Ordering::Relaxed);
+        // Simulate a channel drop and a rebind on the same channel id; the
+        // totals must carry over instead of resetting.
+        counters.connected.store(false, Ordering::Relaxed);
+        let rebound = {
+            let mut map = stats.channels.write().await;
+            map.entry(1)
+                .or_insert_with(|| Arc::new(ChannelCounters::default()))
+                .clone()
+        };
+        rebound.connected.store(true, Ordering::Relaxed);
+        rebound.up_bytes.fetch_add(24, Ordering::Relaxed);
+        assert_eq!(rebound.up_bytes.load(Ordering::Relaxed), 1024);
+        assert_eq!(rebound.down_bytes.load(Ordering::Relaxed), 500);
+        assert!(rebound.connected.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn ipc_snapshot_serializes_and_totals() {
+        let config = AgentConfig {
+            server: "ws://127.0.0.1:18080/control".into(),
+            data_server: "ws://127.0.0.1:18080/data".into(),
+            token: String::new(),
+            name: "test".into(),
+            data_channels: 2,
+            heartbeat_secs: 10,
+            pong_timeout_secs: 25,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 10,
+            log_level: "info".into(),
+        };
+        let status = AgentStatus::new(&config);
+        let counters = Arc::new(ChannelCounters::default());
+        counters.up_bytes.store(1000, Ordering::Relaxed);
+        counters.down_bytes.store(24, Ordering::Relaxed);
+        counters.connected.store(true, Ordering::Relaxed);
+        status.traffic.channels.write().await.insert(1, counters);
+        *status.settings_synced_at.lock().unwrap() = Some(1_752_000_000);
+
+        let snapshot = build_ipc_snapshot(&status).await;
+        assert_eq!(snapshot.settings.device_name, "test");
+        assert_eq!(snapshot.settings_synced_at, Some(1_752_000_000));
+        assert_eq!(snapshot.channels.len(), 1);
+        assert_eq!(snapshot.channels[0].channel_id, 1);
+        assert_eq!(snapshot.channels[0].up_bytes, 1000);
+        assert_eq!(snapshot.channels[0].down_bytes, 24);
+        assert!(snapshot.channels[0].connected);
+        assert_eq!(
+            snapshot.totals,
+            IpcTrafficTotals {
+                up_bytes: 1000,
+                down_bytes: 24,
+                total_bytes: 1024,
+            }
+        );
+
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let decoded: IpcSnapshot = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn unix_time_formats_epoch() {
+        assert!(format_unix_time(0).starts_with("1970-01-01"));
     }
 }

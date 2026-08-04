@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
-use tunnel_protocol::{AgentSettings, ControlMessage, encode};
+use tunnel_protocol::{AgentSettings, ControlMessage, decode, encode};
 
 #[tokio::main]
 async fn main() {
@@ -27,10 +27,31 @@ async fn main() {
         tokio::spawn(async move {
             let websocket = accept_async(stream).await.expect("websocket handshake");
             let (mut sink, mut source) = websocket.split();
+            // Data WebSockets open with DataBind; answer once with DataBound
+            // so the agent binds the channel and traffic counters show up.
+            let mut data_bound = false;
             while let Some(Ok(message)) = source.next().await {
                 match message {
                     Message::Text(text) => {
                         println!("server received: {text}");
+                        if !data_bound
+                            && matches!(
+                                decode(text.as_bytes()),
+                                Ok(ControlMessage::DataBind { .. })
+                            )
+                        {
+                            data_bound = true;
+                            if let Ok(payload) =
+                                encode(&ControlMessage::DataBound { channel_id: 1 })
+                            {
+                                let _ = sink
+                                    .send(Message::Text(
+                                        String::from_utf8_lossy(&payload).into_owned().into(),
+                                    ))
+                                    .await;
+                            }
+                            continue;
+                        }
                         // Reply with the same messages a real server sends on
                         // registration, using the default (empty) server_url.
                         for control in [

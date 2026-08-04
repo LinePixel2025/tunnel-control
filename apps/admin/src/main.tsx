@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import {
   Activity, Cable, Check, CirclePlus, Computer, Copy, FlaskConical, KeyRound,
   LogIn, Pencil, Power, RefreshCw, ScrollText, Settings, ShieldCheck, Trash2,
@@ -9,9 +9,11 @@ import "./styles.css";
 
 const API = import.meta.env.VITE_API_URL ?? "/api/v1";
 type Summary = { devices: number; online_devices: number; tunnels: number; active_connections: number };
-type Device = { id: string; name: string; status: "online" | "offline"; latency_ms: number; last_seen_at: string | null };
+type ChannelStat = { channel_id: number; up_bytes: number; down_bytes: number; total_bytes: number; connected: boolean };
+type Device = { id: string; name: string; status: "online" | "offline"; latency_ms: number; last_seen_at: string | null; channels: ChannelStat[] };
 type Tunnel = { id: string; name: string; kind: "tcp" | "http" | "udp"; public_port: number; local_host: string; local_port: number; enabled: boolean; max_connections: number; device_id: string; status: string; connections: number };
-type ProbeResult = { ok: boolean; listener: boolean; agent_online: boolean; local: boolean | null; message: string | null };
+type ProbeResult = { ok: boolean; listener: boolean; agent_online: boolean; local: boolean | null; message: string | null; e2e: boolean | null; e2e_message: string | null; e2e_latency_ms: number | null };
+type RestartState = { restart_id: string; phase: "sending" | "acknowledged" | "restarting" | "online" | "done" | "failed" | string; progress: number; message: string | null };
 type AccessKey = { id: string; label: string; device_id: string | null; device_name: string | null; created_at: string; expires_at: string | null; revoked_at: string | null; last_used_at: string | null; status: "active" | "expired" | "revoked" };
 type AgentDefaults = { server_url: string; data_channels: number; heartbeat_secs: number; pong_timeout_secs: number; reconnect_min_secs: number; reconnect_max_secs: number; log_level: string };
 type SettingsData = { bandwidth_limit_mbps: number; agent_defaults: AgentDefaults };
@@ -41,9 +43,25 @@ const actionLabels: Record<string, string> = {
   "enrollment.denied": "拒绝设备注册",
   "device.settings_updated": "修改设备设置",
   "device.token_rotated": "轮换设备令牌",
+  "device.restart_requested": "远程重启设备",
   "device.deleted": "删除设备",
 };
 const formatDate = (value: string | null) => (value ? new Date(value).toLocaleString() : "—");
+const formatBytes = (bytes: number) => {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value >= 100 || index === 0 ? Math.round(value) : value.toFixed(1)} ${units[index]}`;
+};
+const restartPhaseLabel: Record<string, string> = {
+  sending: "发送指令",
+  acknowledged: "代理已确认",
+  restarting: "代理重启中",
+  online: "已重新上线",
+  done: "重启完成",
+  failed: "重启失败",
+};
 const tunnelStatusLabel = (tunnel: Tunnel) =>
   !tunnel.enabled ? "已停用" : tunnel.status === "ready" ? "运行中" : "设备离线";
 
@@ -284,7 +302,7 @@ function App() {
           <div className="header-actions"><span className="online-dot"/>服务运行中<button className="icon-button" title="刷新数据" onClick={refresh}><RefreshCw size={16}/></button><button className="text-button" onClick={() => { localStorage.removeItem("tunnel-admin-token"); setToken(""); }}>退出</button></div>
         </header>
         {error && <div className="notice"><b>连接提示</b>{error}</div>}
-        {activeView === "overview" && <OverviewPage summary={summary} tunnels={tunnels} devices={devices} enrollments={enrollments.length} onToggle={toggle} onEdit={setEditingTunnel} onDelete={deleteTunnel} onCreate={() => setShowForm(true)} onProbe={probeTunnel} testingId={testingId} probeResult={probeResult} onSettings={loadDeviceSettings} onDeleteDevice={deleteDevice} onGoAccess={() => setActiveView("access")}/>}
+        {activeView === "overview" && <OverviewPage summary={summary} tunnels={tunnels} devices={devices} enrollments={enrollments.length} onToggle={toggle} onEdit={setEditingTunnel} onDelete={deleteTunnel} onCreate={() => setShowForm(true)} onProbe={probeTunnel} testingId={testingId} probeResult={probeResult} onSettings={loadDeviceSettings} onDeleteDevice={deleteDevice} onGoAccess={() => setActiveView("access")} request={request} onRestarted={refresh}/>}
         {activeView === "access" && <AccessPage keys={keys} enrollments={enrollments} message={enrollmentMessage} onCreateKey={() => setShowKeyForm(true)} onEditKey={setEditingKey} onDeleteKey={deleteKey} onRevokeKey={revokeKey} onApprove={approveEnrollment} onDeny={denyEnrollment}/>}
         {activeView === "system" && <SystemPage settings={settings} logs={logs} onSave={saveSettings}/>}
       </main>
@@ -316,11 +334,13 @@ function Metric({ label, value, hint, icon }: { label: string; value: string; hi
   );
 }
 
-function OverviewPage({ summary, tunnels, devices, enrollments, onToggle, onEdit, onDelete, onCreate, onProbe, testingId, probeResult, onSettings, onDeleteDevice, onGoAccess }: {
+function OverviewPage({ summary, tunnels, devices, enrollments, onToggle, onEdit, onDelete, onCreate, onProbe, testingId, probeResult, onSettings, onDeleteDevice, onGoAccess, request, onRestarted }: {
   summary: Summary | undefined; tunnels: Tunnel[]; devices: Device[]; enrollments: number;
   onToggle: (id: string) => void; onEdit: (tunnel: Tunnel) => void; onDelete: (tunnel: Tunnel) => void; onCreate: () => void;
   onProbe: (id: string) => void; testingId: string | null; probeResult: ProbeResult | null;
   onSettings: (device: Device) => void; onDeleteDevice: (device: Device) => void; onGoAccess: () => void;
+  request: <T,>(path: string, init?: RequestInit) => Promise<T>;
+  onRestarted: () => void;
 }) {
   return (
     <>
@@ -331,7 +351,7 @@ function OverviewPage({ summary, tunnels, devices, enrollments, onToggle, onEdit
         <Metric label="待审批注册" value={`${enrollments}`} hint={enrollments ? "需要处理" : "无待办"} icon={<UserPlus size={19}/>}/>
       </section>
       <TunnelsPanel tunnels={tunnels} devices={devices} onToggle={onToggle} onEdit={onEdit} onDelete={onDelete} onCreate={onCreate} onProbe={onProbe} testingId={testingId} probeResult={probeResult}/>
-      <DevicesPanel devices={devices} tunnels={tunnels} onSettings={onSettings} onDelete={onDeleteDevice} onGoAccess={onGoAccess}/>
+      <DevicesPanel devices={devices} tunnels={tunnels} onSettings={onSettings} onDelete={onDeleteDevice} onGoAccess={onGoAccess} request={request} onRestarted={onRestarted}/>
     </>
   );
 }
@@ -369,7 +389,20 @@ function TunnelsPanel({ tunnels, devices, onToggle, onEdit, onDelete, onCreate, 
   return (
     <section className="panel">
       <div className="panel-heading"><div><h2>公网隧道</h2><p>由管理员分配端口，并转发到指定 Windows 设备的本地服务。</p></div><button className="primary" onClick={onCreate}><CirclePlus size={16}/>新建隧道</button></div>
-      {probeResult && <div className={`probe ${probeResult.ok ? "ok" : "fail"}`}><b>{probeResult.ok ? "连接正常" : "连接失败"}</b><span>{probeResult.message ?? ""}</span></div>}
+      {probeResult && (
+        <div className={`probe ${probeResult.ok ? "ok" : "fail"}`}>
+          <b>{probeResult.ok ? "连接正常" : "连接失败"}</b>
+          <ul className="probe-stages">
+            <li className={probeResult.listener ? "pass" : "fail"}><span>公网监听</span><em>{probeResult.listener ? "正常" : "未运行"}</em></li>
+            <li className={probeResult.agent_online ? "pass" : "fail"}><span>代理在线</span><em>{probeResult.agent_online ? "是" : "否"}</em></li>
+            {probeResult.local !== null && <li className={probeResult.local ? "pass" : "fail"}><span>本地服务</span><em>{probeResult.local ? "可达" : "不可达"}</em></li>}
+            {probeResult.e2e !== null && probeResult.local !== null && <li className={probeResult.e2e ? "pass" : "fail"}><span>端到端链路</span><em>{probeResult.e2e ? "连通" : "失败"}</em></li>}
+            {probeResult.e2e === null && probeResult.local !== null && <li className="skip"><span>端到端链路</span><em>未验证（UDP 服务通常不回包）</em></li>}
+          </ul>
+          {probeResult.e2e_latency_ms !== null && <span className="probe-latency">端到端延迟 {probeResult.e2e_latency_ms} ms</span>}
+          {probeResult.message && <span>{probeResult.message}</span>}
+        </div>
+      )}
       {tunnels.length ? (
         <div className="table tunnels-table">
           <div className="row label"><span>名称</span><span>公网入口</span><span>本地目标</span><span>设备</span><span>状态</span><span>连接</span><span/></div>
@@ -395,26 +428,100 @@ function TunnelsPanel({ tunnels, devices, onToggle, onEdit, onDelete, onCreate, 
   );
 }
 
-function DevicesPanel({ devices, tunnels, onSettings, onDelete, onGoAccess }: {
+function DevicesPanel({ devices, tunnels, onSettings, onDelete, onGoAccess, request, onRestarted }: {
   devices: Device[]; tunnels: Tunnel[]; onSettings: (device: Device) => void; onDelete: (device: Device) => void; onGoAccess: () => void;
+  request: <T,>(path: string, init?: RequestInit) => Promise<T>;
+  onRestarted: () => void;
 }) {
   return (
     <section className="panel devices-panel">
       <div className="panel-heading"><div><h2>设备状态</h2><p>设备需使用接入密钥连接；点击「设置」可控制该设备的全部运行参数。</p></div></div>
       {devices.length ? devices.map(device => {
         const tunnelCount = tunnels.filter(tunnel => tunnel.device_id === device.id).length;
-        return (
-          <div className="device" key={device.id}>
-            <span className={`device-dot ${device.status}`}/>
-            <div className="device-main"><b>{device.name}</b><p>{device.id.slice(0, 8)} · 延迟 {device.latency_ms} ms</p></div>
-            <span className="device-tunnels"><Cable size={13}/>{tunnelCount} 条隧道</span>
-            <span className={`status ${device.status === "online" ? "ready" : "off"}`}>{device.status === "online" ? "在线" : "离线"}</span>
-            <button className="text-button" onClick={() => onSettings(device)}><Settings size={15}/>设置</button>
-            <button className="text-button danger-text" title="删除设备" onClick={() => onDelete(device)}><Trash2 size={15}/>删除</button>
-          </div>
-        );
+        return <DeviceCard key={device.id} device={device} tunnelCount={tunnelCount} onSettings={onSettings} onDelete={onDelete} request={request} onRestarted={onRestarted}/>;
       }) : <div className="device-empty">尚无设备。请先在「接入管理」页批准代理的注册请求，或创建接入密钥。<button className="text-button" onClick={onGoAccess}>前往接入管理</button></div>}
     </section>
+  );
+}
+
+function DeviceCard({ device, tunnelCount, onSettings, onDelete, request, onRestarted }: {
+  device: Device; tunnelCount: number; onSettings: (device: Device) => void; onDelete: (device: Device) => void;
+  request: <T,>(path: string, init?: RequestInit) => Promise<T>;
+  onRestarted: () => void;
+}) {
+  const [restart, setRestart] = useState<RestartState | null>(null);
+  const [restarting, setRestarting] = useState(false);
+  const pollTimer = useRef<number | null>(null);
+  const clearPoll = () => {
+    if (pollTimer.current !== null) {
+      window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+  useEffect(() => clearPoll, []);
+  const pollRestart = async () => {
+    try {
+      const state = await request<RestartState | null>(`/devices/${device.id}/restart`);
+      if (!state) {
+        setRestart(null);
+        clearPoll();
+        return;
+      }
+      setRestart(state);
+      if (state.phase === "done" || state.phase === "failed") {
+        clearPoll();
+        onRestarted();
+        return;
+      }
+      pollTimer.current = window.setTimeout(pollRestart, 1500);
+    } catch {
+      clearPoll();
+    }
+  };
+  const startRestart = async () => {
+    if (!window.confirm(`确定远程重启设备「${device.name}」吗？重启期间该设备的隧道会短暂中断。`)) return;
+    setRestarting(true);
+    try {
+      const state = await request<RestartState>(`/devices/${device.id}/restart`, { method: "POST" });
+      setRestart(state);
+      pollRestart();
+    } catch (reason) {
+      // 设备离线或控制通道不可用时,服务端返回明确错误;保持进度条为空。
+      window.alert(reason instanceof Error ? reason.message : "重启指令发送失败");
+    } finally {
+      setRestarting(false);
+    }
+  };
+  const channelTotal = device.channels.reduce((sum, channel) => sum + channel.total_bytes, 0);
+  return (
+    <div className="device">
+      <span className={`device-dot ${device.status}`}/>
+      <div className="device-main">
+        <b>{device.name}</b>
+        <p>{device.id.slice(0, 8)} · 延迟 {device.latency_ms} ms</p>
+        {device.channels.length > 0 && (
+          <div className="channel-traffic">
+            <span className="channel-total">信道合计 {formatBytes(channelTotal)}</span>
+            {device.channels.map(channel => (
+              <span key={channel.channel_id} className={`channel-stat ${channel.connected ? "connected" : ""}`} title={`信道 #${channel.channel_id}${channel.connected ? " 已连接" : " 未连接"}`}>
+                #{channel.channel_id} ↑{formatBytes(channel.up_bytes)} ↓{formatBytes(channel.down_bytes)}
+              </span>
+            ))}
+          </div>
+        )}
+        {restart && (
+          <div className={`restart-progress ${restart.phase === "failed" ? "fail" : restart.phase === "done" ? "done" : ""}`}>
+            <div className="restart-bar"><span style={{ width: `${Math.max(2, Math.min(100, restart.progress))}%` }}/></div>
+            <span className="restart-message">{restartPhaseLabel[restart.phase] ?? restart.phase}{restart.message ? ` · ${restart.message}` : ""}</span>
+          </div>
+        )}
+      </div>
+      <span className="device-tunnels"><Cable size={13}/>{tunnelCount} 条隧道</span>
+      <span className={`status ${device.status === "online" ? "ready" : "off"}`}>{device.status === "online" ? "在线" : "离线"}</span>
+      <button className="text-button" title="远程重启设备" disabled={device.status !== "online" || restarting || (restart !== null && restart.phase !== "done" && restart.phase !== "failed")} onClick={startRestart}><RefreshCw size={15}/>重启</button>
+      <button className="text-button" onClick={() => onSettings(device)}><Settings size={15}/>设置</button>
+      <button className="text-button danger-text" title="删除设备" onClick={() => onDelete(device)}><Trash2 size={15}/>删除</button>
+    </div>
   );
 }
 
