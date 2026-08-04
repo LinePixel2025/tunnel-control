@@ -247,6 +247,9 @@ const DATA_CHANNEL_QUEUE_FRAMES: usize = 128;
 /// queue. 16 x 64KiB bounds the head-of-line delay a bulk stream can impose
 /// on other streams sharing the same channel.
 const STREAM_CHANNEL_QUOTA: usize = 16;
+/// Minimum gap between "heartbeat echo dropped" warnings so a saturated data
+/// channel logs the symptom without flooding the log.
+const ECHO_DROP_WARN_SECS: u64 = 10;
 
 /// Removes a session entry only when it still belongs to `connection_id`, so a
 /// stale control loop can never delete the session of a newer connection.
@@ -3907,6 +3910,7 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
     let reader_state = state.clone();
     let heartbeat_out = out_tx.clone();
     let reader = tokio::spawn(async move {
+        let mut last_echo_warn = Instant::now();
         while let Some(Ok(message)) = source.next().await {
             match message {
                 Message::Binary(bytes) => {
@@ -3958,9 +3962,25 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
                             version: PROTOCOL_VERSION,
                             latency_ms: 0,
                         }) {
-                            let _ = heartbeat_out.try_send(Message::Text(
+                            match heartbeat_out.try_send(Message::Text(
                                 String::from_utf8_lossy(&payload).into_owned().into(),
-                            ));
+                            )) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    let now = Instant::now();
+                                    if now.duration_since(last_echo_warn)
+                                        >= StdDuration::from_secs(ECHO_DROP_WARN_SECS)
+                                    {
+                                        last_echo_warn = now;
+                                        tracing::warn!(
+                                            %device_id,
+                                            channel_id,
+                                            "data channel heartbeat echo dropped; channel queue full"
+                                        );
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            }
                         }
                     }
                 }
