@@ -892,6 +892,31 @@ impl BandwidthLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn mark_restart_online_does_not_deadlock() {
+        let restarts: RwLock<HashMap<Uuid, RestartState>> = RwLock::new(HashMap::new());
+        let device_id = Uuid::new_v4();
+        restarts.write().await.insert(
+            device_id,
+            RestartState {
+                restart_id: Uuid::new_v4(),
+                phase: "sending".into(),
+                progress: 10,
+                message: None,
+                requested_at: Instant::now(),
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
+            mark_restart_online(&restarts, device_id).await;
+        })
+        .await;
+        assert!(result.is_ok(), "mark_restart_online deadlocked");
+        let current = restarts.read().await.get(&device_id).cloned().unwrap();
+        assert_eq!(current.phase, "online");
+        assert_eq!(current.progress, 95);
+    }
 
     #[test]
     fn channel_stats_counts_bytes_and_connection_state() {
@@ -2400,7 +2425,11 @@ async fn shutdown_signal(state: AppState) {
         .copied()
         .collect();
     for id in udp {
-        if let Some(session) = state.plane.udp_sessions.read().await.get(&id).cloned() {
+        let session = {
+            let sessions = state.plane.udp_sessions.read().await;
+            sessions.get(&id).cloned()
+        };
+        if let Some(session) = session {
             remove_udp_session(&state.plane, id).await;
             send_control_with_timeout(
                 &state,
@@ -4110,6 +4139,27 @@ async fn control_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
     ws.on_upgrade(move |socket| control_loop(socket, state))
 }
 
+/// Marks an in-flight admin restart as "online" once the agent reconnects.
+/// The entry is snapshotted first so the read guard is dropped before the
+/// write lock is acquired: upgrading while a scrutinee guard is still alive
+/// would self-deadlock (the writer waits for a reader held by this task).
+async fn mark_restart_online(restarts: &RwLock<HashMap<Uuid, RestartState>>, device_id: Uuid) {
+    let restart = {
+        let restarts = restarts.read().await;
+        restarts.get(&device_id).cloned()
+    };
+    if let Some(restart) = restart {
+        if restart.phase != "done" && restart.phase != "failed" {
+            let mut restarts = restarts.write().await;
+            if let Some(current) = restarts.get_mut(&device_id) {
+                current.phase = "online".into();
+                current.progress = 95;
+                current.message = Some("代理已重新上线,重启完成".into());
+            }
+        }
+    }
+}
+
 /// Periodically persists in-memory heartbeats to the database and refreshes
 /// the Redis online markers. Runs entirely outside the control read loops:
 /// database/Redis slowness or outages only degrade online-status display,
@@ -4285,16 +4335,7 @@ async fn control_loop(socket: WebSocket, state: AppState) {
     // If an admin-requested restart is in flight, the agent coming back is
     // the last observable milestone; the status API marks it done once the
     // device is online again.
-    if let Some(restart) = state.restarts.read().await.get(&device_id).cloned() {
-        if restart.phase != "done" && restart.phase != "failed" {
-            let mut restarts = state.restarts.write().await;
-            if let Some(current) = restarts.get_mut(&device_id) {
-                current.phase = "online".into();
-                current.progress = 95;
-                current.message = Some("代理已重新上线,重启完成".into());
-            }
-        }
-    }
+    mark_restart_online(&state.restarts, device_id).await;
     let tunnels = load_specs(&state.db, device_id).await;
     let _ = out_tx
         .send(Message::Text(
@@ -4427,10 +4468,15 @@ async fn control_loop(socket: WebSocket, state: AppState) {
     }
     drop_invalid_udp_sessions(&state, device_id, connection_id).await;
     teardown_device_data_channels(&state, device_id, connection_id).await;
-    let _ = sqlx::query("UPDATE devices SET status='offline' WHERE id=$1")
-        .bind(device_id)
-        .execute(&state.db)
-        .await;
+    if removed {
+        // Only mark the device offline when this session was still the
+        // registered one; a newer session may already be online after a
+        // remote restart, and this stale cleanup must not flip it offline.
+        let _ = sqlx::query("UPDATE devices SET status='offline' WHERE id=$1")
+            .bind(device_id)
+            .execute(&state.db)
+            .await;
+    }
 }
 
 /// Pre-registration pairing loop: the agent showed a one-time code and waits
