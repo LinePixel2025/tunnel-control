@@ -549,14 +549,15 @@ struct ProbeOutcome {
     message: Option<String>,
 }
 
-/// Shared token bucket that throttles traffic so the server's bandwidth stays
-/// under the configured cap. `rate` is bytes per second; a rate of 0 disables
-/// throttling. All tunnels draw from one bucket, so when the cap is reached
-/// every connection slows down fairly instead of being dropped.
+/// Per-device token buckets that throttle the public -> agent direction; the
+/// agent throttles agent -> server at its source, so no direction is ever
+/// charged twice. Each device keeps its own bucket at the configured rate, so
+/// frames of different devices never serialize on one global mutex. A rate
+/// of 0 disables throttling.
 #[derive(Clone)]
 struct BandwidthLimiter {
     mbps: Arc<AtomicU64>,
-    state: Arc<tokio::sync::Mutex<BucketState>>,
+    buckets: Arc<RwLock<HashMap<Uuid, Arc<tokio::sync::Mutex<BucketState>>>>>,
 }
 
 struct BucketState {
@@ -568,10 +569,7 @@ impl BandwidthLimiter {
     fn new(mbps: u64) -> Self {
         Self {
             mbps: Arc::new(AtomicU64::new(mbps)),
-            state: Arc::new(tokio::sync::Mutex::new(BucketState {
-                tokens: mbps as f64 * 1_000_000.0 / 8.0,
-                last: Instant::now(),
-            })),
+            buckets: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -583,12 +581,13 @@ impl BandwidthLimiter {
         self.mbps.store(mbps, Ordering::Relaxed);
     }
 
-    async fn acquire(&self, bytes: usize) {
+    async fn acquire(&self, device_id: Uuid, bytes: usize) {
         let mbps = self.mbps.load(Ordering::Relaxed);
         if mbps == 0 {
             return;
         }
-        let mut state = self.state.lock().await;
+        let bucket = self.bucket(device_id).await;
+        let mut state = bucket.lock().await;
         loop {
             let mbps = self.mbps.load(Ordering::Relaxed);
             if mbps == 0 {
@@ -607,8 +606,25 @@ impl BandwidthLimiter {
             let wait = (bytes as f64 - state.tokens) / rate;
             drop(state);
             tokio::time::sleep(StdDuration::from_secs_f64(wait.min(0.5))).await;
-            state = self.state.lock().await;
+            state = bucket.lock().await;
         }
+    }
+
+    async fn bucket(&self, device_id: Uuid) -> Arc<tokio::sync::Mutex<BucketState>> {
+        if let Some(bucket) = self.buckets.read().await.get(&device_id).cloned() {
+            return bucket;
+        }
+        let mut buckets = self.buckets.write().await;
+        buckets
+            .entry(device_id)
+            .or_insert_with(|| {
+                let mbps = self.mbps.load(Ordering::Relaxed);
+                Arc::new(tokio::sync::Mutex::new(BucketState {
+                    tokens: mbps as f64 * 1_000_000.0 / 8.0,
+                    last: Instant::now(),
+                }))
+            })
+            .clone()
     }
 }
 
@@ -619,12 +635,13 @@ mod tests {
     #[tokio::test]
     async fn bandwidth_limiter_caps_throughput() {
         let limiter = BandwidthLimiter::new(1);
+        let device = Uuid::new_v4();
         let started = Instant::now();
         let mut sent = 0usize;
         // Four seconds worth of budget: the first second is the burst, the
         // remaining three seconds must be paced by the token bucket.
         while sent < 500_000 {
-            limiter.acquire(1_250).await;
+            limiter.acquire(device, 1_250).await;
             sent += 1_250;
         }
         let elapsed = started.elapsed().as_secs_f64();
@@ -634,12 +651,29 @@ mod tests {
     #[tokio::test]
     async fn bandwidth_limiter_disabled_passes_through() {
         let limiter = BandwidthLimiter::new(1);
+        let device = Uuid::new_v4();
         limiter.set_mbps(0);
         let started = Instant::now();
         for _ in 0..100 {
-            limiter.acquire(64 * 1024).await;
+            limiter.acquire(device, 64 * 1024).await;
         }
         assert!(started.elapsed().as_millis() < 500);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limiter_per_device_buckets_do_not_share_tokens() {
+        let limiter = BandwidthLimiter::new(1);
+        let device_a = Uuid::new_v4();
+        let device_b = Uuid::new_v4();
+        let started = Instant::now();
+        // Each device starts with its own full burst; consuming A's burst
+        // must not consume B's, so B's burst-sized acquire returns at once.
+        limiter.acquire(device_a, 125_000).await;
+        limiter.acquire(device_b, 125_000).await;
+        assert!(
+            started.elapsed() < StdDuration::from_millis(200),
+            "per-device buckets must not share tokens"
+        );
     }
 
     #[tokio::test]
@@ -3802,10 +3836,10 @@ async fn bridge_public_connection(
         return;
     }
     let out = channel.tx;
-    let limiter = state.bandwidth.clone();
     let inbound = tokio::spawn(async move {
         while let Some(data) = incoming_rx.recv().await {
-            limiter.acquire(data.len()).await;
+            // The agent already throttled this direction at its source; do
+            // not charge the same bytes again on the way out.
             if writer.write_all(&data).await.is_err() {
                 break;
             }
@@ -3816,7 +3850,7 @@ async fn bridge_public_connection(
         match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                state.bandwidth.acquire(n).await;
+                state.bandwidth.acquire(tunnel.device_id, n).await;
                 let Ok(frame) = encode_stream_data(id, &buf[..n]) else {
                     break;
                 };
@@ -3911,7 +3945,7 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                 if !state.accepting.load(Ordering::Relaxed) {
                     continue;
                 }
-                state.bandwidth.acquire(size).await;
+                state.bandwidth.acquire(tunnel.device_id, size).await;
                 let stream_id = {
                     let sessions = state.plane.udp_sessions.read().await;
                     sessions
@@ -3971,10 +4005,10 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                         let (outbox_tx, mut outbox_rx) = mpsc::channel::<Vec<u8>>(512);
                         let send_socket = socket.clone();
                         let send_peer = peer;
-                        let limiter = state.bandwidth.clone();
                         tokio::spawn(async move {
                             while let Some(data) = outbox_rx.recv().await {
-                                limiter.acquire(data.len()).await;
+                                // Agent-side throttling already charged this
+                                // direction; the server must not charge twice.
                                 if send_socket.send_to(&data, send_peer).await.is_err() {
                                     break;
                                 }

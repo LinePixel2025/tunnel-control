@@ -94,7 +94,8 @@ pub enum ControlMessage {
         message: Option<String>,
     },
     /// Server pushes its current bandwidth cap to the agent so the agent can
-    /// throttle its own outbound data at the source. 0 disables throttling.
+    /// throttle its own agent -> server data at the source; the server does
+    /// not charge that direction again. 0 disables throttling.
     BandwidthConfig {
         mbps: u64,
     },
