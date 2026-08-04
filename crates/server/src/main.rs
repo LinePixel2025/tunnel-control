@@ -25,7 +25,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -102,6 +102,13 @@ struct DataPlane {
     sessions: Arc<RwLock<HashMap<Uuid, SessionEntry>>>,
     streams: Arc<RwLock<HashMap<u128, StreamEntry>>>,
     udp_sessions: Arc<RwLock<HashMap<u128, UdpSession>>>,
+    /// Per (device, data channel) count of live TCP streams and UDP sessions.
+    /// `pick_data_channel` reads these counters instead of scanning every
+    /// stream, keeping channel selection O(channels) per new connection.
+    channel_loads: Arc<std::sync::Mutex<HashMap<(Uuid, u16), Arc<AtomicUsize>>>>,
+    /// Per-tunnel UDP peer index so each incoming datagram hits its session
+    /// by `SocketAddr` directly instead of scanning all sessions.
+    udp_peers: Arc<RwLock<HashMap<Uuid, HashMap<SocketAddr, u128>>>>,
     data_channels: Arc<RwLock<HashMap<Uuid, HashMap<u16, DataChannel>>>>,
     data_socket_tasks: Arc<Mutex<HashMap<(Uuid, u16), tokio::task::JoinHandle<()>>>>,
     heartbeats: Arc<RwLock<HashMap<Uuid, HeartbeatEntry>>>,
@@ -119,6 +126,8 @@ impl Default for DataPlane {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             streams: Arc::new(RwLock::new(HashMap::new())),
             udp_sessions: Arc::new(RwLock::new(HashMap::new())),
+            channel_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            udp_peers: Arc::new(RwLock::new(HashMap::new())),
             data_channels: Arc::new(RwLock::new(HashMap::new())),
             data_socket_tasks: Arc::new(Mutex::new(HashMap::new())),
             heartbeats: Arc::new(RwLock::new(HashMap::new())),
@@ -272,6 +281,73 @@ fn remove_heartbeat_if_owned(
     }
 }
 
+impl DataPlane {
+    /// Live TCP streams + UDP sessions currently assigned to one data channel.
+    fn channel_load(&self, device_id: Uuid, channel_id: u16) -> usize {
+        let loads = self.channel_loads.lock().unwrap();
+        loads
+            .get(&(device_id, channel_id))
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn increment_channel_load(&self, device_id: Uuid, channel_id: u16) {
+        let counter = {
+            let mut loads = self.channel_loads.lock().unwrap();
+            loads
+                .entry((device_id, channel_id))
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone()
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_channel_load(&self, device_id: Uuid, channel_id: u16) {
+        let counter = {
+            let mut loads = self.channel_loads.lock().unwrap();
+            loads
+                .entry((device_id, channel_id))
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone()
+        };
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_sub(1))
+        });
+    }
+}
+
+/// Inserts a UDP session and keeps the channel-load counter and the
+/// per-tunnel peer index in sync. Bookkeeping is committed before the session
+/// becomes visible, so a concurrent removal either finds the fully-registered
+/// session (and cleans up all three structures) or finds nothing.
+async fn insert_udp_session(plane: &DataPlane, id: u128, session: UdpSession) {
+    plane.increment_channel_load(session.device_id, session.data_channel);
+    plane
+        .udp_peers
+        .write()
+        .await
+        .entry(session.tunnel_id)
+        .or_default()
+        .insert(session.peer, id);
+    plane.udp_sessions.write().await.insert(id, session);
+}
+
+/// Removes a UDP session together with its peer-index entry and channel-load
+/// counter. Safe to call for ids that are already gone.
+async fn remove_udp_session(plane: &DataPlane, id: u128) {
+    let session = plane.udp_sessions.write().await.remove(&id);
+    if let Some(session) = session {
+        plane.decrement_channel_load(session.device_id, session.data_channel);
+        let mut peers = plane.udp_peers.write().await;
+        if let Some(peers_for_tunnel) = peers.get_mut(&session.tunnel_id) {
+            peers_for_tunnel.remove(&session.peer);
+            if peers_for_tunnel.is_empty() {
+                peers.remove(&session.tunnel_id);
+            }
+        }
+    }
+}
+
 /// Routes one incoming data frame (from any data socket) to its destination.
 /// TCP frames wait in the stream's bounded queue so backpressure reaches the
 /// sender; UDP datagrams are dropped when their queue is full instead.
@@ -310,6 +386,9 @@ async fn try_register_stream(
             slot: Arc::new(Mutex::new(StreamSlot::default())),
         },
     );
+    // Count while still holding the streams lock so a concurrent removal can
+    // never observe the entry without the counter having been incremented.
+    plane.increment_channel_load(device_id, data_channel);
     true
 }
 
@@ -353,12 +432,13 @@ async fn release_stream_slot(plane: &DataPlane, id: u128) {
 /// Removes a stream entry and wakes its bridge if it is waiting on the
 /// channel-queue quota, so closing the stream cannot strand the bridge.
 async fn remove_stream_entry(plane: &DataPlane, id: u128) {
-    let slot = {
+    let entry = {
         let mut streams = plane.streams.write().await;
-        streams.remove(&id).map(|entry| entry.slot)
+        streams.remove(&id)
     };
-    if let Some(slot) = slot {
-        let mut state = slot.lock().await;
+    if let Some(entry) = entry {
+        plane.decrement_channel_load(entry.device_id, entry.data_channel);
+        let mut state = entry.slot.lock().await;
         state.outstanding = 0;
         state.notify.notify_waiters();
     }
@@ -383,7 +463,7 @@ async fn route_stream_data_with_timeout(
                 RouteOutcome::Ok
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                plane.udp_sessions.write().await.remove(&id);
+                remove_udp_session(plane, id).await;
                 RouteOutcome::UdpSessionGone(id)
             }
             Err(mpsc::error::TrySendError::Full(_)) => RouteOutcome::Dropped,
@@ -446,20 +526,6 @@ async fn send_control_to_session(
     )
 }
 
-/// Number of live streams currently assigned to one data channel.
-async fn data_channel_load(plane: &DataPlane, device_id: Uuid, channel_id: u16) -> usize {
-    let streams = plane.streams.read().await;
-    let udp = plane.udp_sessions.read().await;
-    streams
-        .values()
-        .filter(|entry| entry.device_id == device_id && entry.data_channel == channel_id)
-        .count()
-        + udp
-            .values()
-            .filter(|session| session.device_id == device_id && session.data_channel == channel_id)
-            .count()
-}
-
 /// Picks the data channel with the fewest active streams, preferring the
 /// lowest channel id on ties. Only channels bound to the device's current
 /// control session are eligible, so a stale channel left over from a fast
@@ -487,7 +553,7 @@ async fn pick_data_channel(plane: &DataPlane, device_id: Uuid) -> Option<u16> {
     }
     let mut best: Option<(usize, u16)> = None;
     for channel_id in channels {
-        let load = data_channel_load(plane, device_id, channel_id).await;
+        let load = plane.channel_load(device_id, channel_id);
         if best.map(|(best_load, _)| load < best_load).unwrap_or(true) {
             best = Some((load, channel_id));
         }
@@ -552,7 +618,7 @@ async fn close_channel_streams(plane: &DataPlane, device_id: Uuid, channel_id: u
         .map(|(id, _)| *id)
         .collect();
     for id in &udp {
-        plane.udp_sessions.write().await.remove(id);
+        remove_udp_session(plane, *id).await;
     }
     tcp.into_iter().chain(udp).collect()
 }
@@ -1045,18 +1111,10 @@ mod tests {
         let tcp_id: u128 = 1;
         let udp_id: u128 = 2;
         let (tcp_tx, mut tcp_rx) = mpsc::channel::<Vec<u8>>(4096);
-        plane.streams.write().await.insert(
-            tcp_id,
-            StreamEntry {
-                device_id: device,
-                tunnel_id: Uuid::new_v4(),
-                data_channel: 1,
-                tx: tcp_tx,
-                slot: Arc::new(Mutex::new(StreamSlot::default())),
-            },
-        );
+        assert!(try_register_stream(&plane, tcp_id, device, Uuid::new_v4(), 1, tcp_tx, 100).await);
         let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(4096);
-        plane.udp_sessions.write().await.insert(
+        insert_udp_session(
+            &plane,
             udp_id,
             UdpSession {
                 device_id: device,
@@ -1067,7 +1125,8 @@ mod tests {
                 outbox: udp_tx,
                 last_seen: Instant::now(),
             },
-        );
+        )
+        .await;
         // Hammer both kinds of frames from many tasks at once; the routing
         // function must never hang (regression: shared data-plane freeze).
         let result = tokio::time::timeout(StdDuration::from_secs(5), async {
@@ -1111,16 +1170,7 @@ mod tests {
         let device = Uuid::new_v4();
         for (id, channel) in [(1u128, 1u16), (2, 1), (3, 2), (4, 2)] {
             let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
-            plane.streams.write().await.insert(
-                id,
-                StreamEntry {
-                    device_id: device,
-                    tunnel_id: Uuid::new_v4(),
-                    data_channel: channel,
-                    tx,
-                    slot: Arc::new(Mutex::new(StreamSlot::default())),
-                },
-            );
+            assert!(try_register_stream(&plane, id, device, Uuid::new_v4(), channel, tx, 8).await);
         }
         let removed = close_channel_streams(&plane, device, 1).await;
         let mut removed = removed;
@@ -1143,7 +1193,8 @@ mod tests {
         let plane = DataPlane::default();
         let udp_id: u128 = 9;
         let (outbox, mut rx) = mpsc::channel::<Vec<u8>>(8);
-        plane.udp_sessions.write().await.insert(
+        insert_udp_session(
+            &plane,
             udp_id,
             UdpSession {
                 device_id: Uuid::new_v4(),
@@ -1154,7 +1205,8 @@ mod tests {
                 outbox,
                 last_seen: Instant::now(),
             },
-        );
+        )
+        .await;
         assert_eq!(
             route_stream_data(&plane, udp_id, &[]).await,
             RouteOutcome::Ok
@@ -1273,7 +1325,7 @@ mod tests {
         assert!(try_register_stream(&plane, 4, device, tunnel_b, 1, tx.clone(), 2).await);
         assert!(try_register_stream(&plane, 5, Uuid::new_v4(), tunnel_a, 1, tx.clone(), 2).await);
         // Closing one connection frees a slot for the same tunnel.
-        plane.streams.write().await.remove(&1);
+        remove_stream_entry(&plane, 1).await;
         assert!(try_register_stream(&plane, 6, device, tunnel_a, 1, tx.clone(), 2).await);
     }
 
@@ -1412,17 +1464,100 @@ mod tests {
             ]),
         );
         let (stream_tx, _stream_rx) = mpsc::channel::<Vec<u8>>(8);
-        plane.streams.write().await.insert(
-            10,
-            StreamEntry {
-                device_id: device,
-                tunnel_id: Uuid::new_v4(),
-                data_channel: 2,
-                tx: stream_tx,
-                slot: Arc::new(Mutex::new(StreamSlot::default())),
-            },
-        );
+        assert!(try_register_stream(&plane, 10, device, Uuid::new_v4(), 2, stream_tx, 10).await);
         assert_eq!(pick_data_channel(&plane, device).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn channel_load_counters_track_concurrent_stream_registration() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let tunnel = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let mut tasks = Vec::new();
+        for id in 0..50_u128 {
+            let plane = plane.clone();
+            let tx = tx.clone();
+            tasks.push(tokio::spawn(async move {
+                assert!(
+                    try_register_stream(&plane, id, device, tunnel, 1, tx, 100).await,
+                    "concurrent registration must not exceed the configured limit"
+                );
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(plane.channel_load(device, 1), 50);
+        // Removing streams on the direct path must decrement the counter too.
+        for id in 0..20_u128 {
+            remove_stream_entry(&plane, id).await;
+        }
+        assert_eq!(plane.channel_load(device, 1), 30);
+        // close_channel_streams covers the bulk teardown path.
+        let removed = close_channel_streams(&plane, device, 1).await;
+        assert_eq!(removed.len(), 30);
+        assert_eq!(plane.channel_load(device, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn udp_peer_index_matches_sessions_and_cleans_up() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let tunnel = Uuid::new_v4();
+        let peer_a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let peer_c: SocketAddr = "10.0.0.1:3000".parse().unwrap();
+        for (id, peer) in [(1_u128, peer_a), (2, peer_b), (3, peer_c)] {
+            let (outbox, _rx) = mpsc::channel::<Vec<u8>>(8);
+            insert_udp_session(
+                &plane,
+                id,
+                UdpSession {
+                    device_id: device,
+                    connection_id: Uuid::new_v4(),
+                    tunnel_id: tunnel,
+                    data_channel: 1,
+                    peer,
+                    outbox,
+                    last_seen: Instant::now(),
+                },
+            )
+            .await;
+        }
+        let index = plane.udp_peers.read().await;
+        assert_eq!(
+            index.get(&tunnel).and_then(|peers| peers.get(&peer_a)),
+            Some(&1)
+        );
+        assert_eq!(
+            index.get(&tunnel).and_then(|peers| peers.get(&peer_b)),
+            Some(&2)
+        );
+        assert_eq!(
+            index.get(&tunnel).and_then(|peers| peers.get(&peer_c)),
+            Some(&3)
+        );
+        drop(index);
+        assert_eq!(plane.channel_load(device, 1), 3);
+        // Removing one session drops its peer entry and the counter.
+        remove_udp_session(&plane, 2).await;
+        assert_eq!(plane.channel_load(device, 1), 2);
+        let index = plane.udp_peers.read().await;
+        assert_eq!(
+            index.get(&tunnel).and_then(|peers| peers.get(&peer_b)),
+            None
+        );
+        assert_eq!(
+            index.get(&tunnel).and_then(|peers| peers.get(&peer_a)),
+            Some(&1)
+        );
+        drop(index);
+        // Removing the last sessions drops the empty per-tunnel map.
+        remove_udp_session(&plane, 1).await;
+        remove_udp_session(&plane, 3).await;
+        assert!(plane.udp_peers.read().await.get(&tunnel).is_none());
+        assert_eq!(plane.channel_load(device, 1), 0);
     }
 
     #[test]
@@ -1897,7 +2032,7 @@ async fn shutdown_signal(state: AppState) {
         .collect();
     for id in udp {
         if let Some(session) = state.plane.udp_sessions.read().await.get(&id).cloned() {
-            state.plane.udp_sessions.write().await.remove(&id);
+            remove_udp_session(&state.plane, id).await;
             send_control(
                 &state,
                 session.device_id,
@@ -3524,7 +3659,7 @@ async fn control_loop(socket: WebSocket, state: AppState) {
                 {
                     if let Ok(id) = stream_id.parse::<u128>() {
                         remove_stream_entry(&state.plane, id).await;
-                        state.plane.udp_sessions.write().await.remove(&id);
+                        remove_udp_session(&state.plane, id).await;
                     }
                 } else if let Ok(ControlMessage::ProbeResult {
                     probe_id,
@@ -4141,7 +4276,7 @@ async fn remove_listener(state: &AppState, tunnel_id: Uuid) {
         .map(|(id, session)| (*id, session.device_id))
         .collect();
     for (id, device_id) in stale {
-        state.plane.udp_sessions.write().await.remove(&id);
+        remove_udp_session(&state.plane, id).await;
         send_control(
             &state,
             device_id,
@@ -4171,7 +4306,7 @@ async fn drop_invalid_udp_sessions(state: &AppState, device_id: Uuid, connection
         .map(|(id, _)| *id)
         .collect();
     for id in stale {
-        state.plane.udp_sessions.write().await.remove(&id);
+        remove_udp_session(&state.plane, id).await;
     }
 }
 
@@ -4195,25 +4330,23 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                 }
                 state.bandwidth.acquire(tunnel.device_id, size).await;
                 let stream_id = {
-                    let sessions = state.plane.udp_sessions.read().await;
-                    sessions
-                        .iter()
-                        .find(|(_, session)| {
-                            session.tunnel_id == tunnel.id && session.peer == peer
-                        })
-                        .map(|(id, _)| *id)
+                    let peers = state.plane.udp_peers.read().await;
+                    peers
+                        .get(&tunnel.id)
+                        .and_then(|peers| peers.get(&peer))
+                        .copied()
                 };
                 let stream_id = match stream_id {
                     Some(id) => id,
                     None => {
                         let active = state
                             .plane
-                            .udp_sessions
+                            .udp_peers
                             .read()
                             .await
-                            .values()
-                            .filter(|session| session.tunnel_id == tunnel.id)
-                            .count();
+                            .get(&tunnel.id)
+                            .map(|peers| peers.len())
+                            .unwrap_or(0);
                         if active >= tunnel.max_connections as usize {
                             continue;
                         }
@@ -4262,7 +4395,8 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                                 }
                             }
                         });
-                        state.plane.udp_sessions.write().await.insert(
+                        insert_udp_session(
+                            &state.plane,
                             id,
                             UdpSession {
                                 device_id: tunnel.device_id,
@@ -4273,7 +4407,8 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                                 outbox: outbox_tx,
                                 last_seen: Instant::now(),
                             },
-                        );
+                        )
+                        .await;
                         id
                     }
                 };
@@ -4331,7 +4466,7 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                     .map(|(id, _)| *id)
                     .collect();
                 for id in expired {
-                    state.plane.udp_sessions.write().await.remove(&id);
+                    remove_udp_session(&state.plane, id).await;
                     send_control(
                         &state,
                         tunnel.device_id,
