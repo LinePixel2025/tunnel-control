@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::{Mutex, RwLock, mpsc},
+    sync::{Mutex, Notify, RwLock, mpsc},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing_subscriber::prelude::*;
@@ -44,7 +44,16 @@ const OFFICIAL_SERVER_URL: &str = "ws://123.207.8.77:18080/control";
 /// inside the closure to avoid naming the full subscriber type.
 static LOG_FILTER: OnceLock<Arc<dyn Fn(&str) + Send + Sync>> = OnceLock::new();
 
-type StreamMap = Arc<RwLock<HashMap<u128, mpsc::Sender<Vec<u8>>>>>;
+/// One agent-side TCP stream: the bounded local queue used by data-socket
+/// frames, plus its share of the shared data-channel writer queue. The slot
+/// mirrors the server's `StreamSlot` so a bulk upload cannot head-of-line
+/// block other streams on the same channel.
+struct StreamEntry {
+    tx: mpsc::Sender<Vec<u8>>,
+    slot: Arc<Mutex<StreamSlot>>,
+}
+
+type StreamMap = Arc<RwLock<HashMap<u128, StreamEntry>>>;
 type ConnectionMap = Arc<RwLock<HashMap<u128, ConnectionInfo>>>;
 type DataSenderMap = Arc<RwLock<HashMap<u16, mpsc::Sender<Message>>>>;
 type TaskMap = Arc<tokio::sync::Mutex<HashMap<u128, tokio::task::JoinHandle<()>>>>;
@@ -55,9 +64,15 @@ type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>, usize)>>>;
 /// Byte budget for frames buffered before a stream's `StreamOpen` arrives
 /// (control and data sockets have no ordering guarantee). Four protocol
 /// frames cover the realistic cross-socket race; if traffic keeps arriving
-/// the buffer grows with a warning instead of dropping TCP bytes, and the
-/// 10s pending expiry still bounds memory.
+/// the buffer grows with a warning instead of dropping TCP bytes, up to the
+/// hard limit below; the 10s pending expiry reclaims entries whose
+/// `StreamOpen` never arrives.
 const PENDING_STREAM_BYTES: usize = 4 * MAX_FRAME_BYTES;
+/// Hard ceiling for the pre-`StreamOpen` buffer. Above this the stream is
+/// never going to register normally, so further frames are dropped with an
+/// error log instead of letting one pathological stream consume unbounded
+/// memory inside the 10s expiry window.
+const PENDING_STREAM_HARD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Frames buffered per TCP stream before local backpressure applies; 64 x
 /// 64KiB keeps the worst-case per-stream queue at 4MiB.
@@ -66,6 +81,29 @@ const STREAM_QUEUE_FRAMES: usize = 64;
 /// Frames buffered per data channel; 128 x 64KiB keeps the worst-case shared
 /// queue at 8MiB, matching the old 512 x 16KiB budget.
 const DATA_CHANNEL_QUEUE_FRAMES: usize = 128;
+
+/// Max frames one stream may have waiting in its data channel's shared writer
+/// queue. Mirrors the server's `STREAM_CHANNEL_QUOTA` so one upload stream
+/// cannot head-of-line block the other streams on the same channel.
+const STREAM_CHANNEL_QUOTA: usize = 16;
+
+/// One stream's share of its data channel's shared writer queue. `outstanding`
+/// counts frames queued but not yet forwarded by the channel writer; when it
+/// reaches `STREAM_CHANNEL_QUOTA` the bridge waits so a single bulk upload
+/// stream cannot head-of-line block the other streams on the channel.
+struct StreamSlot {
+    outstanding: usize,
+    notify: Arc<Notify>,
+}
+
+impl Default for StreamSlot {
+    fn default() -> Self {
+        Self {
+            outstanding: 0,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
 
 /// Upper bound on how long routing waits for one TCP frame to enter a
 /// stream's bounded queue before closing the stream. Waiting (instead of
@@ -1593,7 +1631,13 @@ async fn run(
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_FRAMES);
                         // Register the stream before spawning the bridge so the
                         // first data frame following StreamOpen is never dropped.
-                        reader_streams.write().await.insert(id, tx.clone());
+                        reader_streams.write().await.insert(
+                            id,
+                            StreamEntry {
+                                tx: tx.clone(),
+                                slot: Arc::new(Mutex::new(StreamSlot::default())),
+                            },
+                        );
                         reader_connections.write().await.insert(
                             id,
                             ConnectionInfo {
@@ -1659,13 +1703,13 @@ async fn run(
                     }
                     Ok(ControlMessage::StreamClose { stream_id, reason }) => {
                         if let Ok(id) = stream_id.parse::<u128>() {
-                            tracing::info!(
-                                stream_id = %stream_id,
-                                reason = reason.as_deref().unwrap_or("server_close"),
-                                "stream closed"
-                            );
-                            reader_streams.write().await.remove(&id);
-                            reader_connections.write().await.remove(&id);
+                            drop_stream(
+                                &reader_streams,
+                                &reader_connections,
+                                id,
+                                reason.as_deref().unwrap_or("server_close"),
+                            )
+                            .await;
                             reader_pending.write().await.remove(&id);
                             if let Some(task) = reader_bridge_tasks.lock().await.remove(&id) {
                                 task.abort();
@@ -1928,8 +1972,17 @@ async fn data_channel_task(
                     .write()
                     .await
                     .insert(channel_id, tx.clone());
+                let writer_streams = streams.clone();
                 let writer = tokio::spawn(async move {
                     while let Some(message) = rx.recv().await {
+                        // The frame has left the shared queue; return the
+                        // stream's quota so its bridge can enqueue more
+                        // without monopolizing the channel.
+                        if let Message::Binary(bytes) = &message {
+                            if let Ok((id, _)) = decode_stream_data(bytes) {
+                                release_stream_slot_agent(&writer_streams, id).await;
+                            }
+                        }
                         if sink.send(message).await.is_err() {
                             break;
                         }
@@ -2021,15 +2074,32 @@ async fn route_agent_binary(
 }
 
 /// Buffers one frame that arrived before its `StreamOpen` (cross-socket
-/// ordering is not guaranteed). The byte budget is a warning threshold, not a
-/// drop point: TCP must never lose bytes before registration, so once the
-/// budget is crossed the buffer grows and we warn once. The 10s pending
-/// expiry reclaims entries whose `StreamOpen` never arrives.
-async fn buffer_pending_frame(pending: &PendingMap, id: u128, data: &[u8], byte_budget: usize) {
+/// ordering is not guaranteed). `byte_budget` is a warning threshold, not a
+/// drop point: below the hard limit TCP must never lose bytes before
+/// registration, so once the budget is crossed the buffer grows and we warn
+/// once. `hard_limit` is the absolute ceiling: a stream that never registers
+/// must not consume unbounded memory, so frames past it are dropped with an
+/// error log. The 10s pending expiry reclaims entries whose `StreamOpen`
+/// never arrives.
+async fn buffer_pending_frame(
+    pending: &PendingMap,
+    id: u128,
+    data: &[u8],
+    byte_budget: usize,
+    hard_limit: usize,
+) {
     let mut guard = pending.write().await;
     let entry = guard
         .entry(id)
         .or_insert_with(|| (Instant::now(), Vec::new(), 0));
+    if entry.2 + data.len() > hard_limit {
+        tracing::error!(
+            stream_id = %id,
+            buffered_bytes = entry.2,
+            "pending stream buffer hit hard limit; dropping frame"
+        );
+        return;
+    }
     if entry.2 < byte_budget && entry.2 + data.len() >= byte_budget {
         tracing::warn!(
             stream_id = %id,
@@ -2052,7 +2122,7 @@ async fn route_agent_binary_with_timeout(
 ) {
     let tx = {
         let map = streams.read().await;
-        map.get(&id).cloned()
+        map.get(&id).map(|entry| entry.tx.clone())
     };
     let Some(tx) = tx else {
         // `StreamOpen` travels on the control socket while data frames arrive
@@ -2060,8 +2130,16 @@ async fn route_agent_binary_with_timeout(
         // them briefly so the StreamOpen handler can flush them once the
         // stream exists. The stream kind is unknown before registration, so
         // every frame is buffered (dropping would corrupt TCP byte order);
-        // past the budget the buffer grows with a warning instead.
-        buffer_pending_frame(pending, id, data, PENDING_STREAM_BYTES).await;
+        // past the warning budget it grows, and past the hard limit it is
+        // dropped with an error.
+        buffer_pending_frame(
+            pending,
+            id,
+            data,
+            PENDING_STREAM_BYTES,
+            PENDING_STREAM_HARD_BYTES,
+        )
+        .await;
         return;
     };
     let is_udp = connections
@@ -2168,7 +2246,19 @@ async fn bridge_local(
                 };
                 // TCP must not drop bytes, so queue on the data channel rather
                 // than closing the stream; control messages still jump ahead.
-                if data.send(Message::Binary(frame.into())).await.is_err() {
+                // Hold this stream's share of the shared channel queue so one
+                // bulk upload cannot head-of-line block the other streams.
+                if !acquire_stream_slot_agent(&streams, id).await {
+                    break;
+                }
+                if !send_agent_channel_with_stream_alive(
+                    &streams,
+                    id,
+                    &data,
+                    Message::Binary(frame.into()),
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -2240,8 +2330,88 @@ async fn bridge_local_udp(
     send_close(&control, id.to_string(), None);
 }
 
+/// Waits until the stream has fewer than `STREAM_CHANNEL_QUOTA` frames waiting
+/// in the channel writer queue, then reserves one slot. Returns false if the
+/// stream entry is removed while waiting (the bridge should stop).
+async fn acquire_stream_slot_agent(streams: &StreamMap, id: u128) -> bool {
+    loop {
+        let slot = {
+            let map = streams.read().await;
+            match map.get(&id) {
+                Some(entry) => entry.slot.clone(),
+                None => return false,
+            }
+        };
+        let notify = {
+            let mut state = slot.lock().await;
+            if state.outstanding < STREAM_CHANNEL_QUOTA {
+                state.outstanding += 1;
+                return true;
+            }
+            state.notify.clone()
+        };
+        notify.notified().await;
+        if !streams.read().await.contains_key(&id) {
+            return false;
+        }
+    }
+}
+
+/// Releases one reserved slot after the channel writer dequeued the frame and
+/// wakes the stream's bridge so it can enqueue more.
+async fn release_stream_slot_agent(streams: &StreamMap, id: u128) {
+    let slot = {
+        let map = streams.read().await;
+        map.get(&id).map(|entry| entry.slot.clone())
+    };
+    if let Some(slot) = slot {
+        let mut state = slot.lock().await;
+        state.outstanding = state.outstanding.saturating_sub(1);
+        state.notify.notify_waiters();
+    }
+}
+
+/// Reserves space on the shared data-channel writer queue while periodically
+/// checking that the stream is still registered, so a full channel cannot
+/// strand the bridge after the stream was removed. `reserve` is
+/// cancellation-safe: a cancelled attempt leaves no message in the queue.
+async fn send_agent_channel_with_stream_alive(
+    streams: &StreamMap,
+    id: u128,
+    data: &mpsc::Sender<Message>,
+    message: Message,
+) -> bool {
+    let mut check = tokio::time::interval(Duration::from_secs(1));
+    check.tick().await; // consume the immediate first tick
+    loop {
+        let reserve = data.reserve();
+        tokio::select! {
+            result = reserve => match result {
+                Ok(permit) => {
+                    let _ = permit.send(message);
+                    return true;
+                }
+                Err(_) => return false,
+            },
+            _ = check.tick() => {
+                if !streams.read().await.contains_key(&id) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 async fn drop_stream(streams: &StreamMap, connections: &ConnectionMap, id: u128, reason: &str) {
-    streams.write().await.remove(&id);
+    let slot = {
+        let mut map = streams.write().await;
+        map.remove(&id).map(|entry| entry.slot)
+    };
+    if let Some(slot) = slot {
+        let mut state = slot.lock().await;
+        state.outstanding = 0;
+        state.notify.notify_waiters();
+    }
     connections.write().await.remove(&id);
     tracing::info!(stream_id = %id, reason, "stream closed");
 }
@@ -2311,7 +2481,13 @@ mod tests {
         let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
         // The StreamOpen handler registers the stream before spawning the bridge.
-        streams.write().await.insert(42, tx.clone());
+        streams.write().await.insert(
+            42,
+            StreamEntry {
+                tx: tx.clone(),
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
         let bridge = tokio::spawn(bridge_local_udp(
             42,
             spec,
@@ -2371,7 +2547,13 @@ mod tests {
         let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
         let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-        streams.write().await.insert(43, tx.clone());
+        streams.write().await.insert(
+            43,
+            StreamEntry {
+                tx: tx.clone(),
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
         let bridge = tokio::spawn(bridge_local_udp(
             43,
             spec,
@@ -2439,7 +2621,13 @@ mod tests {
         let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
         let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-        streams.write().await.insert(7, tx.clone());
+        streams.write().await.insert(
+            7,
+            StreamEntry {
+                tx: tx.clone(),
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
         let bridge = tokio::spawn(bridge_local(
             7,
             spec,
@@ -2472,7 +2660,13 @@ mod tests {
         let (control, _control_rx) = mpsc::channel::<Message>(8);
         let id: u128 = 88;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
-        streams.write().await.insert(id, tx);
+        streams.write().await.insert(
+            id,
+            StreamEntry {
+                tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
         connections
             .write()
             .await
@@ -2509,7 +2703,13 @@ mod tests {
         let (control, mut control_rx) = mpsc::channel::<Message>(8);
         let id: u128 = 89;
         let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
-        streams.write().await.insert(id, tx);
+        streams.write().await.insert(
+            id,
+            StreamEntry {
+                tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
         connections
             .write()
             .await
@@ -2564,7 +2764,13 @@ mod tests {
         let (control, _control_rx) = mpsc::channel::<Message>(8);
         let id: u128 = 90;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
-        streams.write().await.insert(id, tx);
+        streams.write().await.insert(
+            id,
+            StreamEntry {
+                tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
         connections
             .write()
             .await
@@ -2581,11 +2787,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_stream_slot_quota_blocks_only_that_stream() {
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let id_a: u128 = 201;
+        let id_b: u128 = 202;
+        let (tx_a, _rx_a) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_b, _rx_b) = mpsc::channel::<Vec<u8>>(8);
+        streams.write().await.insert(
+            id_a,
+            StreamEntry {
+                tx: tx_a,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
+        streams.write().await.insert(
+            id_b,
+            StreamEntry {
+                tx: tx_b,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
+        for _ in 0..STREAM_CHANNEL_QUOTA {
+            assert!(acquire_stream_slot_agent(&streams, id_a).await);
+        }
+        // Stream A is at quota; its next slot must wait...
+        let blocked = tokio::spawn({
+            let streams = streams.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    acquire_stream_slot_agent(&streams, id_a),
+                )
+                .await
+            }
+        });
+        // ...while stream B can still reserve a slot immediately.
+        assert!(acquire_stream_slot_agent(&streams, id_b).await);
+        assert!(
+            blocked.await.unwrap().is_err(),
+            "stream A must stay blocked at quota"
+        );
+        // Releasing one forwarded frame unblocks A.
+        release_stream_slot_agent(&streams, id_a).await;
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_stream_slot_agent(&streams, id_a),
+        )
+        .await
+        .expect("released quota must unblock the stream");
+        assert!(acquired);
+    }
+
+    #[tokio::test]
+    async fn agent_stream_slot_quota_aborts_when_stream_removed() {
+        let streams: StreamMap = Arc::new(RwLock::new(HashMap::new()));
+        let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
+        let id: u128 = 203;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        streams.write().await.insert(
+            id,
+            StreamEntry {
+                tx,
+                slot: Arc::new(Mutex::new(StreamSlot::default())),
+            },
+        );
+        for _ in 0..STREAM_CHANNEL_QUOTA {
+            assert!(acquire_stream_slot_agent(&streams, id).await);
+        }
+        let blocked = tokio::spawn({
+            let streams = streams.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    acquire_stream_slot_agent(&streams, id),
+                )
+                .await
+            }
+        });
+        // Removing the stream wakes the waiting bridge and reports failure.
+        drop_stream(&streams, &connections, id, "test_removed").await;
+        let result = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("blocked task must finish after stream removal")
+            .expect("acquire must return after stream removal");
+        assert_eq!(result, Ok(false));
+    }
+
+    #[tokio::test]
     async fn pending_buffer_grows_past_byte_budget_without_dropping() {
         let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
         let id: u128 = 91;
         for _ in 0..10 {
-            buffer_pending_frame(&pending, id, &[0xAB; 4], 16).await;
+            buffer_pending_frame(&pending, id, &[0xAB; 4], 16, usize::MAX).await;
         }
         let (_, frames, total) = pending
             .read()
@@ -2600,6 +2893,70 @@ mod tests {
         );
         assert_eq!(total, 40, "buffered byte count must be exact");
         assert!(frames.iter().all(|frame| frame == &vec![0xAB; 4]));
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_buffer_stops_growing_at_hard_limit() {
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CaptureWriter(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(writer)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let id: u128 = 92;
+        let hard_limit = 16;
+        for _ in 0..10 {
+            buffer_pending_frame(&pending, id, &[0xAB; 4], 16, hard_limit).await;
+        }
+        let (_, frames, total) = pending
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending entry must exist");
+        assert_eq!(frames.len(), 4, "buffer must stop at the hard limit");
+        assert_eq!(
+            total, hard_limit,
+            "buffered byte count must cap at the limit"
+        );
+        // Frames past the ceiling keep being dropped.
+        buffer_pending_frame(&pending, id, &[0xAB; 4], 16, hard_limit).await;
+        assert_eq!(
+            pending.read().await.get(&id).unwrap().2,
+            hard_limit,
+            "buffer must not grow past the hard limit"
+        );
+        drop(_guard);
+        let captured = captured.lock().unwrap();
+        let output = String::from_utf8_lossy(&captured);
+        assert!(
+            output.contains("hit hard limit"),
+            "expected an error log for dropped frames, got: {output}"
+        );
     }
 
     #[test]

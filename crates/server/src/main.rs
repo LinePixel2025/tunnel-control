@@ -258,6 +258,18 @@ const DATA_CHANNEL_QUEUE_FRAMES: usize = 128;
 /// queue. 16 x 64KiB bounds the head-of-line delay a bulk stream can impose
 /// on other streams sharing the same channel.
 const STREAM_CHANNEL_QUOTA: usize = 16;
+/// How often a bridge loop re-checks that its stream is still registered
+/// while blocked on socket or channel IO, so a wedged public client cannot
+/// keep a half-open connection alive after the stream was reclaimed.
+const STREAM_ALIVE_CHECK_SECS: u64 = 1;
+/// Upper bound for control notifications sent from cleanup paths. Long enough
+/// for a congested control queue to drain, short enough that cleanup never
+/// stalls the shutdown or teardown path.
+const CONTROL_CLEANUP_SEND_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+/// Fallback re-check interval for data-channel waiters that lost the
+/// `notify_waiters` race, bounding the added latency to well below the total
+/// `DATA_CHANNEL_WAIT` budget.
+const DATA_CHANNEL_RECHECK_INTERVAL: StdDuration = StdDuration::from_millis(100);
 /// Minimum gap between "heartbeat echo dropped" warnings so a saturated data
 /// channel logs the symptom without flooding the log.
 const ECHO_DROP_WARN_SECS: u64 = 10;
@@ -293,6 +305,21 @@ fn remove_heartbeat_if_owned(
         }
         _ => false,
     }
+}
+
+/// Returns true while `device_id` still has a live heartbeat entry owned by
+/// `connection_id`. The heartbeat flusher re-checks this immediately before
+/// each database/Redis refresh so a device that disconnected after the flush
+/// snapshot can never be re-marked online.
+fn heartbeat_registered_for_connection(
+    heartbeats: &HashMap<Uuid, HeartbeatEntry>,
+    device_id: Uuid,
+    connection_id: Uuid,
+) -> bool {
+    heartbeats
+        .get(&device_id)
+        .map(|entry| entry.connection_id == connection_id)
+        .unwrap_or(false)
 }
 
 impl DataPlane {
@@ -515,6 +542,22 @@ async fn send_control(state: &AppState, device_id: Uuid, message: &ControlMessag
     send_control_to_session(&session, message, None).await
 }
 
+/// Sends one control message on a cleanup path with a short deadline instead
+/// of a pure `try_send`, so `StreamClose` and teardown notifications are not
+/// silently dropped by a momentarily full control queue. The bounded timeout
+/// still treats an unavailable control plane as "send failed"; callers never
+/// block indefinitely.
+async fn send_control_with_timeout(
+    state: &AppState,
+    device_id: Uuid,
+    message: &ControlMessage,
+) -> bool {
+    let Some(session) = state.plane.sessions.read().await.get(&device_id).cloned() else {
+        return false;
+    };
+    send_control_to_session(&session, message, Some(CONTROL_CLEANUP_SEND_TIMEOUT)).await
+}
+
 /// Encodes and sends one control message to a specific session. Tries without
 /// blocking first; when `timeout` is set and the queue is full, waits at most
 /// that long for space. Returns false when the queue is full past the timeout
@@ -592,11 +635,23 @@ async fn wait_for_data_channel_with_timeout(
     }
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        // Re-check before registering the notifications: a bind that raced the
+        // previous check must not have to wait for the next signal.
+        if plane.sessions.read().await.get(&device_id).is_none() {
+            return None;
+        }
+        if let Some(channel_id) = pick_data_channel(plane, device_id).await {
+            return Some(channel_id);
+        }
         let channel_signal = plane.data_channel_signal.notified();
         let session_signal = plane.session_signal.notified();
         tokio::select! {
             _ = channel_signal => {}
             _ = session_signal => {}
+            // `notify_waiters` stores no permit: a bind between the last
+            // re-check and this registration would otherwise sleep until the
+            // deadline. The short fallback bounds that loss to 100ms.
+            _ = tokio::time::sleep(DATA_CHANNEL_RECHECK_INTERVAL) => {}
             _ = tokio::time::sleep_until(deadline) => return None,
         }
         if plane.sessions.read().await.get(&device_id).is_none() {
@@ -657,7 +712,7 @@ async fn teardown_device_data_channels(state: &AppState, device_id: Uuid, connec
         removed_any = true;
         let removed = close_channel_streams(&state.plane, device_id, channel_id).await;
         for id in removed {
-            send_control(
+            send_control_with_timeout(
                 &state,
                 device_id,
                 &ControlMessage::StreamClose {
@@ -782,11 +837,20 @@ impl BandwidthLimiter {
             })
             .clone()
     }
+
+    /// Drops a device's token bucket when its control session ends. A later
+    /// `acquire` lazily recreates the bucket, so this is safe to call from any
+    /// cleanup path without racing in-flight `acquire` calls.
+    async fn remove_device(&self, device_id: Uuid) {
+        self.buckets.write().await.remove(&device_id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     #[tokio::test]
     async fn bandwidth_limiter_caps_throughput() {
@@ -829,6 +893,28 @@ mod tests {
         assert!(
             started.elapsed() < StdDuration::from_millis(200),
             "per-device buckets must not share tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limiter_bucket_cleared_and_recreated() {
+        let limiter = BandwidthLimiter::new(1);
+        let device = Uuid::new_v4();
+        limiter.acquire(device, 1_250).await;
+        assert!(
+            limiter.buckets.read().await.contains_key(&device),
+            "acquire must lazily create the device bucket"
+        );
+        limiter.remove_device(device).await;
+        assert!(
+            !limiter.buckets.read().await.contains_key(&device),
+            "remove_device must drop the idle bucket"
+        );
+        // The next acquire recreates the bucket with a fresh burst.
+        limiter.acquire(device, 125_000).await;
+        assert!(
+            limiter.buckets.read().await.contains_key(&device),
+            "acquire after removal must recreate the bucket"
         );
     }
 
@@ -890,6 +976,47 @@ mod tests {
             new_connection
         ));
         assert!(!heartbeats.contains_key(&device));
+    }
+
+    #[test]
+    fn heartbeat_refresh_skips_stale_or_replaced_entries() {
+        let device = Uuid::new_v4();
+        let old_connection = Uuid::new_v4();
+        let new_connection = Uuid::new_v4();
+        let mut heartbeats = HashMap::new();
+        heartbeats.insert(
+            device,
+            HeartbeatEntry {
+                connection_id: new_connection,
+                latency_ms: 12,
+                last_seen: Instant::now(),
+            },
+        );
+        assert!(heartbeat_registered_for_connection(
+            &heartbeats,
+            device,
+            new_connection
+        ));
+        // A flusher snapshot taken before a fast reconnect must not refresh a
+        // newer connection's entry as if it were the old one.
+        assert!(!heartbeat_registered_for_connection(
+            &heartbeats,
+            device,
+            old_connection
+        ));
+        // Once the device disconnects and the entry is gone, no online write
+        // may be produced for it.
+        heartbeats.remove(&device);
+        assert!(!heartbeat_registered_for_connection(
+            &heartbeats,
+            device,
+            new_connection
+        ));
+        assert!(!heartbeat_registered_for_connection(
+            &heartbeats,
+            device,
+            old_connection
+        ));
     }
 
     #[tokio::test]
@@ -1005,6 +1132,44 @@ mod tests {
             wait_for_data_channel_with_timeout(&plane, device, StdDuration::from_millis(50)).await;
         assert_eq!(result, None);
         assert!(started.elapsed() >= StdDuration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn wait_for_data_channel_falls_back_when_bind_notification_is_lost() {
+        let plane = DataPlane::default();
+        let device = Uuid::new_v4();
+        let connection = Uuid::new_v4();
+        let (session_tx, _session_rx) = mpsc::channel::<Message>(8);
+        plane.sessions.write().await.insert(
+            device,
+            SessionEntry {
+                connection_id: connection,
+                tx: session_tx,
+            },
+        );
+        let wait_plane = plane.clone();
+        let wait = tokio::spawn(async move {
+            wait_for_data_channel_with_timeout(&wait_plane, device, StdDuration::from_secs(2)).await
+        });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        // Simulate the lost-notification window: the channel binds, but the
+        // waiter never receives a signal. The short fallback re-check must
+        // pick it up well before the 2s deadline.
+        let (channel_tx, _channel_rx) = mpsc::channel::<Message>(8);
+        plane.data_channels.write().await.insert(
+            device,
+            HashMap::from([(
+                1,
+                DataChannel {
+                    connection_id: connection,
+                    tx: channel_tx,
+                },
+            )]),
+        );
+        let picked = tokio::time::timeout(StdDuration::from_millis(500), wait)
+            .await
+            .expect("fallback re-check must find the channel before the deadline");
+        assert_eq!(picked.unwrap(), Some(1));
     }
 
     #[tokio::test]
@@ -1442,6 +1607,116 @@ mod tests {
             .expect("blocked task must finish after stream removal")
             .expect("acquire must return after stream removal");
         assert_eq!(result, Ok(false));
+    }
+
+    struct PendingWriter;
+
+    impl tokio::io::AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let _ = buf;
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_public_with_stream_alive_exits_after_stream_removal() {
+        let plane = DataPlane::default();
+        let id: u128 = 104;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        assert!(try_register_stream(&plane, id, Uuid::new_v4(), Uuid::new_v4(), 1, tx, 10,).await);
+        let mut writer = PendingWriter;
+        let write_plane = plane.clone();
+        let write = tokio::spawn(async move {
+            write_public_with_stream_alive(&write_plane, id, &mut writer, b"payload").await
+        });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        remove_stream_entry(&plane, id).await;
+        let done = tokio::time::timeout(StdDuration::from_secs(2), write)
+            .await
+            .expect("blocked write must exit after the stream is removed");
+        assert!(
+            !done.unwrap(),
+            "write must abort once the stream entry is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_public_with_stream_alive_exits_after_stream_removal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let plane = DataPlane::default();
+        let id: u128 = 105;
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        assert!(try_register_stream(&plane, id, Uuid::new_v4(), Uuid::new_v4(), 1, tx, 10,).await);
+        let mut buf = [0_u8; 4096];
+        let read_plane = plane.clone();
+        let read = tokio::spawn(async move {
+            read_public_with_stream_alive(&read_plane, id, &mut server, &mut buf).await
+        });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        remove_stream_entry(&plane, id).await;
+        let result = tokio::time::timeout(StdDuration::from_secs(2), read)
+            .await
+            .expect("blocked read must exit after the stream is removed");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "read must report stream removal, not EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_listener_entry_serializes_concurrent_starts() {
+        let listeners: Arc<RwLock<HashMap<Uuid, ListenerEntry>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let tunnel = Uuid::new_v4();
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let listeners = listeners.clone();
+            let spawned = spawned.clone();
+            tasks.push(tokio::spawn(async move {
+                reserve_listener_entry(&listeners, tunnel, |tunnel_id, generation| {
+                    let _ = (tunnel_id, generation);
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(StdDuration::from_secs(30)).await;
+                    })
+                })
+                .await
+            }));
+        }
+        let mut generations = Vec::new();
+        for task in tasks {
+            generations.push(task.await.unwrap());
+        }
+        // Every caller must agree on one generation and only one spawn may
+        // install a handle; later callers are no-ops instead of overwriting.
+        assert_eq!(generations, vec![1; 8]);
+        assert_eq!(spawned.load(Ordering::Relaxed), 1);
+        assert_eq!(listeners.read().await.len(), 1);
+        assert_eq!(
+            listeners
+                .read()
+                .await
+                .get(&tunnel)
+                .map(|entry| entry.generation),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -2027,7 +2302,7 @@ async fn shutdown_signal(state: AppState) {
         .collect();
     for (id, device_id) in tcp {
         remove_stream_entry(&state.plane, id).await;
-        send_control(
+        send_control_with_timeout(
             &state,
             device_id,
             &ControlMessage::StreamClose {
@@ -2048,7 +2323,7 @@ async fn shutdown_signal(state: AppState) {
     for id in udp {
         if let Some(session) = state.plane.udp_sessions.read().await.get(&id).cloned() {
             remove_udp_session(&state.plane, id).await;
-            send_control(
+            send_control_with_timeout(
                 &state,
                 session.device_id,
                 &ControlMessage::StreamClose {
@@ -3478,6 +3753,17 @@ async fn heartbeat_flusher_loop(state: AppState) {
             continue;
         }
         for (device_id, entry) in &heartbeats {
+            // The snapshot may be stale: the device can disconnect while the
+            // flush loop is running. Only refresh devices that are still
+            // registered under the same connection id, otherwise a stale
+            // UPDATE could re-mark an offline device as online.
+            let still_registered = {
+                let map = state.plane.heartbeats.read().await;
+                heartbeat_registered_for_connection(&map, *device_id, entry.connection_id)
+            };
+            if !still_registered {
+                continue;
+            }
             if let Err(error) = sqlx::query(
                 "UPDATE devices SET latency_ms=$1,last_seen_at=now(),status='online' WHERE id=$2",
             )
@@ -3506,6 +3792,13 @@ async fn heartbeat_flusher_loop(state: AppState) {
         if let Some(conn) = guard.as_mut() {
             let mut broken = false;
             for (device_id, _) in &heartbeats {
+                let still_registered = {
+                    let map = state.plane.heartbeats.read().await;
+                    map.get(device_id).is_some()
+                };
+                if !still_registered {
+                    continue;
+                }
                 let result: redis::RedisResult<()> =
                     conn.set_ex(format!("online:{device_id}"), "1", 60).await;
                 if let Err(error) = result {
@@ -3698,6 +3991,9 @@ async fn control_loop(socket: WebSocket, state: AppState) {
         let removed = remove_session_if_owned(&mut sessions, device_id, connection_id);
         if removed {
             state.plane.session_signal.notify_waiters();
+            // The device is offline: drop its bandwidth bucket so idle devices
+            // do not accumulate memory; a reconnect lazily recreates it.
+            state.bandwidth.remove_device(device_id).await;
         }
     }
     {
@@ -4002,7 +4298,7 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
         writer.abort();
         let removed = close_channel_streams(&reader_state.plane, device_id, channel_id).await;
         for id in removed {
-            send_control(
+            send_control_with_timeout(
                 &reader_state,
                 device_id,
                 &ControlMessage::StreamClose {
@@ -4130,83 +4426,125 @@ async fn load_specs(db: &PgPool, device_id: Uuid) -> Vec<TunnelSpec> {
     .collect()
 }
 async fn start_listener(state: AppState, tunnel_id: Uuid) -> Result<(), String> {
+    // Fast path: skip the database lookup and bind when the listener is
+    // already running. This check is only an optimization; the authoritative
+    // check happens under the write lock below.
     if state.listeners.read().await.contains_key(&tunnel_id) {
         return Ok(());
     }
     let tunnel = get_tunnel(&state.db, tunnel_id)
         .await
         .map_err(|e| e.to_string())?;
-    let generation = state
-        .listeners
-        .read()
-        .await
-        .get(&tunnel_id)
-        .map(|entry| entry.generation.saturating_add(1))
-        .unwrap_or(1);
     if tunnel.kind == "udp" {
-        let socket = UdpSocket::bind(("0.0.0.0", tunnel.public_port as u16))
-            .await
-            .map_err(|e| e.to_string())?;
+        let socket = match UdpSocket::bind(("0.0.0.0", tunnel.public_port as u16)).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                // Another start_listener may have bound the port while we were
+                // preparing; that is a successful start, not a failure.
+                if state.listeners.read().await.contains_key(&tunnel_id) {
+                    return Ok(());
+                }
+                return Err(error.to_string());
+            }
+        };
         let listener_state = state.clone();
         let (exit_tx, mut exit_rx) = oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            bridge_public_udp(listener_state.clone(), tunnel, socket).await;
-            tracing::warn!(
-                tunnel_id = %tunnel_id,
-                "tunnel listener exited; removed from active listeners"
-            );
-            finish_listener(listener_state, tunnel_id, generation).await;
-            let _ = exit_tx.send(());
-        });
-        state.listeners.write().await.insert(
-            tunnel_id,
-            ListenerEntry {
-                generation,
-                task: handle,
-            },
-        );
+        let generation = reserve_listener_entry(&state.listeners, tunnel_id, {
+            let listener_state = listener_state.clone();
+            move |tunnel_id, generation| {
+                tokio::spawn(async move {
+                    bridge_public_udp(listener_state.clone(), tunnel, socket).await;
+                    tracing::warn!(
+                        tunnel_id = %tunnel_id,
+                        "tunnel listener exited; removed from active listeners"
+                    );
+                    finish_listener(listener_state, tunnel_id, generation).await;
+                    let _ = exit_tx.send(());
+                })
+            }
+        })
+        .await;
         if exit_rx.try_recv().is_ok() {
             remove_stale_listener_entry(&state, tunnel_id, generation).await;
         }
         return Ok(());
     }
-    let listener = TcpListener::bind(("0.0.0.0", tunnel.public_port as u16))
-        .await
-        .map_err(|e| e.to_string())?;
+    let listener = match TcpListener::bind(("0.0.0.0", tunnel.public_port as u16)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            if state.listeners.read().await.contains_key(&tunnel_id) {
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+    };
     let listener_state = state.clone();
     let (exit_tx, mut exit_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        let accept_error = loop {
-            match listener.accept().await {
-                Ok((socket, _)) => {
-                    let st = listener_state.clone();
-                    let t = tunnel.clone();
-                    tokio::spawn(async move {
-                        bridge_public_connection(st, t, socket).await;
-                    });
-                }
-                Err(error) => break error,
-            }
-        };
-        tracing::warn!(
-            tunnel_id = %tunnel_id,
-            %accept_error,
-            "tunnel listener accept failed; removed from active listeners"
-        );
-        finish_listener(listener_state, tunnel_id, generation).await;
-        let _ = exit_tx.send(());
-    });
-    state.listeners.write().await.insert(
+    let generation = reserve_listener_entry(&state.listeners, tunnel_id, {
+        let listener_state = listener_state.clone();
+        move |tunnel_id, generation| {
+            tokio::spawn(async move {
+                let accept_error = loop {
+                    match listener.accept().await {
+                        Ok((socket, _)) => {
+                            let st = listener_state.clone();
+                            let t = tunnel.clone();
+                            tokio::spawn(async move {
+                                bridge_public_connection(st, t, socket).await;
+                            });
+                        }
+                        Err(error) => break error,
+                    }
+                };
+                tracing::warn!(
+                    tunnel_id = %tunnel_id,
+                    %accept_error,
+                    "tunnel listener accept failed; removed from active listeners"
+                );
+                finish_listener(listener_state, tunnel_id, generation).await;
+                let _ = exit_tx.send(());
+            })
+        }
+    })
+    .await;
+    if exit_rx.try_recv().is_ok() {
+        remove_stale_listener_entry(&state, tunnel_id, generation).await;
+    }
+    Ok(())
+}
+
+/// Atomically checks that no listener is registered for `tunnel_id`, allocates
+/// the next generation, spawns the listener task, and installs its handle.
+/// Concurrent `start_listener` calls serialize on the write lock here, so two
+/// tasks can never race past the `contains_key` check and overwrite each
+/// other's handle with the same generation.
+async fn reserve_listener_entry(
+    listeners: &Arc<RwLock<HashMap<Uuid, ListenerEntry>>>,
+    tunnel_id: Uuid,
+    spawn: impl FnOnce(Uuid, u64) -> tokio::task::JoinHandle<()>,
+) -> u64 {
+    let mut guard = listeners.write().await;
+    if guard.contains_key(&tunnel_id) {
+        // Another start_listener already installed its entry; treat this call
+        // as a no-op instead of overwriting the running task.
+        return guard
+            .get(&tunnel_id)
+            .map(|entry| entry.generation)
+            .unwrap_or(1);
+    }
+    let generation = guard
+        .get(&tunnel_id)
+        .map(|entry| entry.generation.saturating_add(1))
+        .unwrap_or(1);
+    let handle = spawn(tunnel_id, generation);
+    guard.insert(
         tunnel_id,
         ListenerEntry {
             generation,
             task: handle,
         },
     );
-    if exit_rx.try_recv().is_ok() {
-        remove_stale_listener_entry(&state, tunnel_id, generation).await;
-    }
-    Ok(())
+    generation
 }
 
 /// Removes a listener entry that was installed after its task had already
@@ -4272,6 +4610,98 @@ async fn reconcile_listeners(state: AppState) {
         }
     }
 }
+
+/// Reads from a public client while periodically checking that the stream is
+/// still registered. Returns `None` when the stream was reclaimed (the bridge
+/// must stop immediately), `Some(0)` on EOF/error, and `Some(n)` with bytes
+/// read otherwise. Racing the read against the check is safe: a tokio `read`
+/// future only completes once bytes have been consumed, so cancellation cannot
+/// lose data.
+async fn read_public_with_stream_alive<R: tokio::io::AsyncRead + Unpin>(
+    plane: &DataPlane,
+    id: u128,
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let mut check = tokio::time::interval(StdDuration::from_secs(STREAM_ALIVE_CHECK_SECS));
+    check.tick().await; // consume the immediate first tick
+    loop {
+        let read = tokio::io::AsyncReadExt::read(&mut *reader, buf);
+        tokio::select! {
+            result = read => return match result {
+                Ok(0) | Err(_) => Some(0),
+                Ok(n) => Some(n),
+            },
+            _ = check.tick() => {
+                if !plane.streams.read().await.contains_key(&id) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Writes one buffer to the public client while periodically checking that the
+/// stream is still registered. Uses `write` + position tracking so a cancelled
+/// attempt never loses already-transmitted bytes; returns false on write
+/// failure or when the stream is reclaimed.
+async fn write_public_with_stream_alive<W: tokio::io::AsyncWrite + Unpin>(
+    plane: &DataPlane,
+    id: u128,
+    writer: &mut W,
+    data: &[u8],
+) -> bool {
+    let mut check = tokio::time::interval(StdDuration::from_secs(STREAM_ALIVE_CHECK_SECS));
+    check.tick().await; // consume the immediate first tick
+    let mut pos = 0;
+    while pos < data.len() {
+        let write = writer.write(&data[pos..]);
+        tokio::select! {
+            result = write => match result {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => pos += n,
+            },
+            _ = check.tick() => {
+                if !plane.streams.read().await.contains_key(&id) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Reserves space on the shared data-channel queue while periodically checking
+/// that the stream is still registered, so a full channel cannot strand the
+/// bridge after the stream was reclaimed. `reserve` is cancellation-safe: a
+/// cancelled attempt leaves no message in the queue.
+async fn send_channel_with_stream_alive(
+    plane: &DataPlane,
+    id: u128,
+    out: &mpsc::Sender<Message>,
+    frame: Message,
+) -> bool {
+    let mut check = tokio::time::interval(StdDuration::from_secs(STREAM_ALIVE_CHECK_SECS));
+    check.tick().await; // consume the immediate first tick
+    loop {
+        let reserve = out.reserve();
+        tokio::select! {
+            result = reserve => match result {
+                Ok(permit) => {
+                    let _ = permit.send(frame);
+                    return true;
+                }
+                Err(_) => return false,
+            },
+            _ = check.tick() => {
+                if !plane.streams.read().await.contains_key(&id) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 async fn bridge_public_connection(
     state: AppState,
     tunnel: TunnelRecord,
@@ -4350,20 +4780,22 @@ async fn bridge_public_connection(
         let streams = state.plane.streams.read().await;
         streams.get(&id).map(|entry| entry.slot.clone())
     };
+    let plane = state.plane.clone();
     let inbound = tokio::spawn(async move {
         while let Some(data) = incoming_rx.recv().await {
             // The agent already throttled this direction at its source; do
             // not charge the same bytes again on the way out.
-            if writer.write_all(&data).await.is_err() {
+            if !write_public_with_stream_alive(&plane, id, &mut writer, &data).await {
                 break;
             }
         }
     });
     let mut buf = [0_u8; TCP_CHUNK_SIZE];
     loop {
-        match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
+        match read_public_with_stream_alive(&state.plane, id, &mut reader, &mut buf).await {
+            None => break,
+            Some(0) => break,
+            Some(n) => {
                 state.bandwidth.acquire(tunnel.device_id, n).await;
                 let Ok(frame) = encode_stream_data(id, &buf[..n]) else {
                     break;
@@ -4378,7 +4810,14 @@ async fn bridge_public_connection(
                 // This bridge task may wait for the device's outbound queue or
                 // the bandwidth budget; it never blocks the control loop, and
                 // TCP must not drop bytes, so queue here instead of closing.
-                if out.send(Message::Binary(frame.into())).await.is_err() {
+                if !send_channel_with_stream_alive(
+                    &state.plane,
+                    id,
+                    &out,
+                    Message::Binary(frame.into()),
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -4415,7 +4854,7 @@ async fn remove_listener(state: &AppState, tunnel_id: Uuid) {
         .collect();
     for (id, device_id) in stale {
         remove_udp_session(&state.plane, id).await;
-        send_control(
+        send_control_with_timeout(
             &state,
             device_id,
             &ControlMessage::StreamClose {
@@ -4605,7 +5044,7 @@ async fn bridge_public_udp(state: AppState, tunnel: TunnelRecord, socket: UdpSoc
                     .collect();
                 for id in expired {
                     remove_udp_session(&state.plane, id).await;
-                    send_control(
+                    send_control_with_timeout(
                         &state,
                         tunnel.device_id,
                         &ControlMessage::StreamClose {
