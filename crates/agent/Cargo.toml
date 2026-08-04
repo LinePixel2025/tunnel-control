@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 rand = "0.8"
 socket2 = "0.6"

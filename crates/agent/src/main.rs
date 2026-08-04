@@ -1813,18 +1813,29 @@ async fn run_enroll(config: &AgentConfig) -> Result<(), Box<dyn std::error::Erro
 
 /// Sets an aggressive TCP keepalive so a half-open link (router reboot, NAT
 /// table loss, WiFi handoff) is detected by the OS instead of waiting for the
-/// pong timeout. Applied to the control socket and every data socket.
+/// pong timeout. Applied to the control socket and every data socket, for
+/// both plain (`ws://`) and TLS (`wss://`) connections.
 fn enable_tcp_keepalive(
     socket: &tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) {
-    if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
-        let _ = tcp.set_nodelay(true);
-        let socket_ref = socket2::SockRef::from(tcp);
-        let _ = socket_ref
-            .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)));
+    match socket.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => apply_tcp_keepalive(tcp),
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => apply_tcp_keepalive(tls.get_ref().0),
+        // Non-exhaustive upstream enum; keepalive stays best-effort for any
+        // future TLS backend.
+        _ => {}
     }
+}
+
+/// Sets nodelay and a 10s TCP keepalive on the underlying socket so the OS
+/// probes a half-open link regardless of whether the WebSocket is encrypted.
+fn apply_tcp_keepalive(tcp: &tokio::net::TcpStream) {
+    let _ = tcp.set_nodelay(true);
+    let socket_ref = socket2::SockRef::from(tcp);
+    let _ = socket_ref
+        .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(10)));
 }
 
 /// One data WebSocket: binds to the control session with `DataBind`, waits for
