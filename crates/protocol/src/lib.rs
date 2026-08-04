@@ -75,10 +75,6 @@ pub enum ControlMessage {
         /// frames for this stream through the matching WebSocket.
         data_channel: u16,
     },
-    StreamData {
-        stream_id: String,
-        data: Vec<u8>,
-    },
     StreamClose {
         stream_id: String,
         reason: Option<String>,
