@@ -1426,6 +1426,8 @@ async fn run(
     let data_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let last_ping_sent = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let last_rtt_ms = Arc::new(std::sync::Mutex::new(0_u32));
     let reader_done = Arc::new(tokio::sync::Notify::new());
     let settings_changed = Arc::new(tokio::sync::Notify::new());
 
@@ -1456,6 +1458,8 @@ async fn run(
     let reader_bridge_tasks = bridge_tasks.clone();
     let reader_pending = pending.clone();
     let reader_pong = last_pong.clone();
+    let reader_ping_sent = last_ping_sent.clone();
+    let reader_rtt = last_rtt_ms.clone();
     let reader_config = config.clone();
     let reader_status = status.clone();
     let reader_data_tasks = data_tasks.clone();
@@ -1468,6 +1472,15 @@ async fn run(
                 Message::Pong(_) => {
                     if let Ok(mut guard) = reader_pong.lock() {
                         *guard = Instant::now();
+                    }
+                    if let Ok(mut ping_sent) = reader_ping_sent.lock() {
+                        if let Some(sent) = ping_sent.take() {
+                            let rtt_ms =
+                                sent.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                            if let Ok(mut rtt_guard) = reader_rtt.lock() {
+                                *rtt_guard = rtt_ms;
+                            }
+                        }
                     }
                 }
                 Message::Text(text) => match decode(text.as_bytes()) {
@@ -1714,9 +1727,10 @@ async fn run(
         if last_pong.lock().unwrap().elapsed() > Duration::from_secs(pong_timeout_secs) {
             break;
         }
+        let latency_ms = last_rtt_ms.lock().map(|rtt| *rtt).unwrap_or(0);
         let heartbeat = ControlMessage::Heartbeat {
             version: PROTOCOL_VERSION,
-            latency_ms: 0,
+            latency_ms,
         };
         if let Ok(payload) = encode(&heartbeat) {
             // The pong timeout still guards a dead connection.
@@ -1724,7 +1738,14 @@ async fn run(
                 String::from_utf8_lossy(&payload).into_owned().into(),
             ));
         }
-        let _ = control_tx.try_send(Message::Ping(Vec::new().into()));
+        if control_tx
+            .try_send(Message::Ping(Vec::new().into()))
+            .is_ok()
+        {
+            if let Ok(mut ping_sent) = last_ping_sent.lock() {
+                *ping_sent = Some(Instant::now());
+            }
+        }
     }
     status.connections.write().await.clear();
     for task in data_tasks.lock().await.drain(..) {
