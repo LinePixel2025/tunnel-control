@@ -5,6 +5,10 @@ use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Payload bytes read from a TCP socket into one data frame. Larger chunks
+/// cut syscall/allocation/frame-header overhead while staying well under the
+/// frame cap.
+pub const TCP_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Runtime parameters the server pushes to an agent. The server is the source
 /// of truth: local bootstrap values only cover the first connection, after
@@ -191,6 +195,15 @@ pub fn decode_stream_data(frame: &[u8]) -> Result<(u128, &[u8]), ProtocolError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_chunk_size_fits_frame_cap() {
+        assert!(
+            TCP_CHUNK_SIZE + 16 <= MAX_FRAME_BYTES,
+            "one 64KiB TCP chunk plus the 16-byte stream header must fit a frame"
+        );
+    }
+
     #[test]
     fn round_trip_message() {
         let input = ControlMessage::Heartbeat {

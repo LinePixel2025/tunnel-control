@@ -23,8 +23,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, reload};
 use tunnel_protocol::{
-    AgentSettings, ControlMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION, TunnelKind, TunnelSpec,
-    decode, decode_stream_data, encode, encode_stream_data,
+    AgentSettings, ControlMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION, TCP_CHUNK_SIZE, TunnelKind,
+    TunnelSpec, decode, decode_stream_data, encode, encode_stream_data,
 };
 use url::Url;
 
@@ -58,6 +58,14 @@ type PendingMap = Arc<RwLock<HashMap<u128, (Instant, Vec<Vec<u8>>, usize)>>>;
 /// the buffer grows with a warning instead of dropping TCP bytes, and the
 /// 10s pending expiry still bounds memory.
 const PENDING_STREAM_BYTES: usize = 4 * MAX_FRAME_BYTES;
+
+/// Frames buffered per TCP stream before local backpressure applies; 64 x
+/// 64KiB keeps the worst-case per-stream queue at 4MiB.
+const STREAM_QUEUE_FRAMES: usize = 64;
+
+/// Frames buffered per data channel; 128 x 64KiB keeps the worst-case shared
+/// queue at 8MiB, matching the old 512 x 16KiB budget.
+const DATA_CHANNEL_QUEUE_FRAMES: usize = 128;
 
 /// Upper bound on how long routing waits for one TCP frame to enter a
 /// stream's bounded queue before closing the stream. Waiting (instead of
@@ -1569,7 +1577,7 @@ async fn run(
                             );
                             continue;
                         };
-                        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_FRAMES);
                         // Register the stream before spawning the bridge so the
                         // first data frame following StreamOpen is never dropped.
                         reader_streams.write().await.insert(id, tx.clone());
@@ -1882,7 +1890,7 @@ async fn data_channel_task(
                     continue;
                 };
                 attempt = 0;
-                let (tx, mut rx) = mpsc::channel::<Message>(512);
+                let (tx, mut rx) = mpsc::channel::<Message>(DATA_CHANNEL_QUEUE_FRAMES);
                 status
                     .data_channels
                     .write()
@@ -2115,7 +2123,7 @@ async fn bridge_local(
             }
         }
     });
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = [0_u8; TCP_CHUNK_SIZE];
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) | Err(_) => break,

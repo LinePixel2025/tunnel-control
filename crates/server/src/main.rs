@@ -36,8 +36,8 @@ use tokio::{
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tunnel_protocol::{
-    AgentSettings, ControlMessage, PROTOCOL_VERSION, TunnelKind, TunnelSpec, decode,
-    decode_stream_data, encode, encode_stream_data,
+    AgentSettings, ControlMessage, PROTOCOL_VERSION, TCP_CHUNK_SIZE, TunnelKind, TunnelSpec,
+    decode, decode_stream_data, encode, encode_stream_data,
 };
 use uuid::Uuid;
 
@@ -206,6 +206,14 @@ const DATA_CHANNEL_WAIT: StdDuration = StdDuration::from_secs(3);
 /// connection is rejected. Short enough that a congested control socket never
 /// stalls bridge tasks for long.
 const STREAM_OPEN_SEND_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+
+/// Frames buffered per TCP stream before backpressure applies; 64 x 64KiB
+/// keeps the worst-case per-stream queue at 4MiB.
+const STREAM_QUEUE_FRAMES: usize = 64;
+
+/// Frames buffered per data channel; 128 x 64KiB keeps the worst-case shared
+/// queue at 8MiB, matching the old 512 x 16KiB budget.
+const DATA_CHANNEL_QUEUE_FRAMES: usize = 128;
 
 /// Removes a session entry only when it still belongs to `connection_id`, so a
 /// stale control loop can never delete the session of a newer connection.
@@ -3453,7 +3461,7 @@ async fn data_channel_loop(socket: WebSocket, state: AppState) {
     else {
         return;
     };
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(512);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(DATA_CHANNEL_QUEUE_FRAMES);
     let channel_id = {
         let mut pool = state.plane.data_channels.write().await;
         let channels = pool.entry(device_id).or_default();
@@ -3762,7 +3770,7 @@ async fn bridge_public_connection(
     };
     let id = Uuid::new_v4().as_u128();
     let (mut reader, mut writer) = socket.into_split();
-    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_FRAMES);
     if !try_register_stream(
         &state.plane,
         id,
@@ -3803,7 +3811,7 @@ async fn bridge_public_connection(
             }
         }
     });
-    let mut buf = [0_u8; 16 * 1024];
+    let mut buf = [0_u8; TCP_CHUNK_SIZE];
     loop {
         match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
             Ok(0) | Err(_) => break,
