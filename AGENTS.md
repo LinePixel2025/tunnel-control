@@ -33,6 +33,44 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
 
 1Panel uses `deploy/compose.1panel.yaml` with a prebuilt server binary in `deploy/bin/`.
 
+## Client Packaging
+
+Every client release is versioned and stored in its own folder under
+`release/V<version>/`; the `release/` directory is gitignored.
+
+Release steps:
+
+1. Bump the version:
+   - `version` in `Cargo.toml` (workspace package), which also updates
+     `Cargo.lock` on the next build.
+   - The release line and installer path in `README.md`.
+   - `TargetName` / `FriendlyName` in `deploy/windows/iexpress.sed` (legacy
+     IExpress descriptor kept in sync even though packaging uses the native
+     installer script below).
+2. Build and package:
+
+```powershell
+cargo build --release -p tunnel-agent
+.\deploy\windows\build-installer.ps1 -Version 4.2
+```
+
+`build-installer.ps1` with `-Version` writes two identical copies of the
+release binary into `release\V4.2\`:
+
+- `tunnel-agent.exe` — the native CLI installer / client executable.
+- `Tunnel-Agent-Setup-V4.2.exe` — the same binary under the documented setup
+  package name.
+
+3. Distribute `release\V4.2\Tunnel-Agent-Setup-V4.2.exe` to target Windows
+   machines. Install with:
+
+```powershell
+.\tunnel-agent.exe --install --server ws://SERVER_IP:18080/control
+```
+
+4. Verify the release: `Get-Service TunnelAgent` is running, the agent
+   enrolls/connects in the admin console, and a tunnel passes traffic.
+
 ## Coding Style & Naming Conventions
 
 - Rust: run `cargo fmt`; use `snake_case`, concise comments, and ASCII source text.
