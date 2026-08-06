@@ -880,7 +880,7 @@ fn run_powershell(args: &[&str]) -> Option<std::process::Output> {
 
 /// Returns the process name the worker is spawned under. Deriving it from
 /// the current executable keeps detection correct regardless of the file
-/// name the user launches (`tunnel-agent.exe`, the `Tunnel-Agent-Setup-V4.2`
+/// name the user launches (`tunnel-agent.exe`, the `Tunnel-Agent-Setup-V4.9`
 /// setup package, or a renamed console copy).
 fn worker_process_name() -> String {
     env::current_exe()
@@ -954,7 +954,7 @@ fn running_worker_pids() -> Vec<u32> {
         .map(|path| path.to_string_lossy().replace('\'', "''"))
         .unwrap_or_default();
     let script = format!(
-        "$names=@('tunnel-agent','tunnel-agent-setup-v4.2','tunnel-client','{current_name}'); \
+        "$names=@('tunnel-agent','tunnel-agent-setup-v4.9','tunnel-client','{current_name}'); \
          $exe='{exe}'; \
          $servicePid=@(Get-CimInstance Win32_Service -Filter 'Name=''TunnelAgent''' -ErrorAction SilentlyContinue | \
            Where-Object {{ $_.ProcessId -gt 0 }} | Select-Object -ExpandProperty ProcessId); \
@@ -3445,11 +3445,11 @@ mod tests {
 
     #[test]
     fn ps_output_matching_accepts_setup_and_renamed_console_exes() {
-        // The setup package ships as Tunnel-Agent-Setup-V4.2.exe and the
+        // The setup package ships as Tunnel-Agent-Setup-V4.9.exe and the
         // console may be renamed (tunnel-client.exe); both spawn workers
         // whose ProcessName does not equal the lowercase "tunnel-agent".
         assert!(ps_stdout_contains_bytes(
-            b"Tunnel-Agent-Setup-V4.2\r\n",
+            b"Tunnel-Agent-Setup-V4.9\r\n",
             "tunnel-agent"
         ));
         assert!(ps_stdout_contains_bytes(
