@@ -5,7 +5,7 @@ use axum::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
@@ -34,7 +34,10 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
 };
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 use tunnel_protocol::{
     AgentSettings, ControlMessage, PROTOCOL_VERSION, TCP_CHUNK_SIZE, TunnelKind, TunnelSpec,
     decode, decode_stream_data, encode, encode_stream_data,
@@ -59,6 +62,20 @@ const HEARTBEAT_STALE_SECS: u64 = 180;
 /// Interval at which a background task re-checks enabled tunnels and restarts
 /// listeners that exited after an accept/bind error.
 const LISTENER_RECONCILE_SECS: u64 = 30;
+/// How long an upgraded control/data WebSocket may wait for its first message
+/// before the connection is dropped. Bounds the task/memory cost of
+/// unauthenticated clients that connect and then stay silent.
+const WS_FIRST_MESSAGE_TIMEOUT_SECS: u64 = 10;
+/// Default cap on simultaneous WebSocket connections (control + data); upgrades
+/// over the cap are closed immediately. Override with `WS_CONNECTIONS_MAX`.
+const WS_CONNECTIONS_MAX_DEFAULT: usize = 256;
+/// Login brute-force protection: once this many failed logins accumulate for a
+/// single email within the sliding window, further attempts are answered with
+/// 429 Too Many Requests.
+const LOGIN_FAIL_MAX: u32 = 5;
+/// Length (seconds) of the sliding window over which failed logins are counted
+/// before the per-email rate limit takes effect.
+const LOGIN_FAIL_WINDOW_SECS: u64 = 900;
 
 #[derive(Clone)]
 struct AppState {
@@ -71,6 +88,10 @@ struct AppState {
     admin_token_ttl_hours: i64,
     bootstrap_agent_token_hash: Option<String>,
     listeners: Arc<RwLock<HashMap<Uuid, ListenerEntry>>>,
+    /// Monotonic counter for listener generations. Every `reserve_listener_entry`
+    /// call draws a fresh, unique generation from it, so a fast restart can never
+    /// hand a new listener task the same generation as an exiting one.
+    listener_generation: Arc<AtomicU64>,
     udp_session_idle_secs: u64,
     probes: Arc<RwLock<HashMap<String, oneshot::Sender<ProbeOutcome>>>>,
     /// Live remote-restart state per device. The admin console polls this
@@ -82,9 +103,45 @@ struct AppState {
     tunnel_port_end: u16,
     data_channels_max: u16,
     shutdown_drain_secs: u64,
+    /// Live count of open control/data WebSocket tasks, used to reject new
+    /// upgrades once `ws_connections_max` is reached.
+    ws_connections: Arc<AtomicUsize>,
+    ws_connections_max: usize,
     accepting: Arc<std::sync::atomic::AtomicBool>,
     plane: DataPlane,
     pending_enrollments: Arc<RwLock<HashMap<Uuid, PendingEnrollment>>>,
+    /// Failed-login timestamps keyed by email, used to rate-limit brute-force
+    /// attempts on the management login. Entries fall out of the sliding window
+    /// on access and are dropped once empty, so the map stays bounded.
+    login_failures: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+}
+
+/// RAII guard that holds one slot of the global WebSocket connection budget for
+/// the lifetime of a control/data socket task. Dropping it releases the slot, so
+/// over-limit or silently-hanging connections can never leak a slot.
+struct WsConnectionGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl WsConnectionGuard {
+    /// Registers one open WebSocket connection. Returns `None` when the cap is
+    /// already reached (the caller must drop the socket); `Some` guard releases
+    /// its slot automatically on drop.
+    fn acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        if counter.fetch_add(1, Ordering::Relaxed) >= max {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(Self {
+            counter: counter.clone(),
+        })
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A running tunnel listener task plus the generation it was started with.
@@ -780,6 +837,18 @@ async fn teardown_device_data_channels(state: &AppState, device_id: Uuid, connec
             .remove(&(device_id, channel_id))
         {
             task.abort();
+            // `abort()` cancels the reader without running its normal
+            // cleanup, so reset the channel's connection state here instead
+            // of leaving it stuck "online".
+            if let Some(stats) = state
+                .plane
+                .channel_stats
+                .read()
+                .await
+                .get(&(device_id, channel_id))
+            {
+                stats.connected.store(false, Ordering::Relaxed);
+            }
         }
     }
     if removed_any {
@@ -1761,20 +1830,27 @@ mod tests {
     async fn reserve_listener_entry_serializes_concurrent_starts() {
         let listeners: Arc<RwLock<HashMap<Uuid, ListenerEntry>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let generation_counter = Arc::new(AtomicU64::new(0));
         let tunnel = Uuid::new_v4();
         let spawned = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let listeners = listeners.clone();
+            let generation_counter = generation_counter.clone();
             let spawned = spawned.clone();
             tasks.push(tokio::spawn(async move {
-                reserve_listener_entry(&listeners, tunnel, |tunnel_id, generation| {
-                    let _ = (tunnel_id, generation);
-                    spawned.fetch_add(1, Ordering::Relaxed);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(StdDuration::from_secs(30)).await;
-                    })
-                })
+                reserve_listener_entry(
+                    &listeners,
+                    &generation_counter,
+                    tunnel,
+                    |tunnel_id, generation| {
+                        let _ = (tunnel_id, generation);
+                        spawned.fetch_add(1, Ordering::Relaxed);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(StdDuration::from_secs(30)).await;
+                        })
+                    },
+                )
                 .await
             }));
         }
@@ -1782,18 +1858,25 @@ mod tests {
         for task in tasks {
             generations.push(task.await.unwrap());
         }
-        // Every caller must agree on one generation and only one spawn may
-        // install a handle; later callers are no-ops instead of overwriting.
-        assert_eq!(generations, vec![1; 8]);
+        // Every call draws a distinct generation from the monotonic counter,
+        // so no-op callers never share the generation of the handle that won
+        // the race. Only one spawn may install a handle; the rest are no-ops.
+        let mut sorted = generations.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(spawned.load(Ordering::Relaxed), 1);
         assert_eq!(listeners.read().await.len(), 1);
-        assert_eq!(
-            listeners
-                .read()
-                .await
-                .get(&tunnel)
-                .map(|entry| entry.generation),
-            Some(1)
+        let entry_generation = listeners
+            .read()
+            .await
+            .get(&tunnel)
+            .map(|entry| entry.generation)
+            .expect("the winning caller must have installed a handle");
+        // The winning caller is whichever task took the lock first, so its
+        // generation is not fixed; it must be one of the values handed out.
+        assert!(
+            generations.contains(&entry_generation),
+            "installed generation {entry_generation} must be one of the allocated generations"
         );
     }
 
@@ -2251,6 +2334,14 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     sqlx::migrate!("../../deploy/migrations").run(&db).await?;
     bootstrap_admin(&db).await?;
+    // A crash or unclean shutdown leaves devices stuck at 'online' in the
+    // database: the offline path only runs on a clean control-socket close,
+    // and Redis markers are ignored by the frontend. Reset every device on
+    // startup; agents reconnect and re-mark themselves online, so nothing
+    // live is mislabeled.
+    sqlx::query("UPDATE devices SET status='offline'")
+        .execute(&db)
+        .await?;
     let tunnel_port_start = read_port("TUNNEL_PORT_START", 10000)?;
     let tunnel_port_end = read_port("TUNNEL_PORT_END", 10100)?;
     if tunnel_port_start > tunnel_port_end {
@@ -2301,6 +2392,7 @@ async fn main() -> anyhow::Result<()> {
             .filter(|token| !token.trim().is_empty())
             .map(|token| format!("{:x}", sha2::Sha256::digest(token.as_bytes()))),
         listeners: Arc::new(RwLock::new(HashMap::new())),
+        listener_generation: Arc::new(AtomicU64::new(0)),
         udp_session_idle_secs,
         probes: Arc::new(RwLock::new(HashMap::new())),
         restarts: Arc::new(RwLock::new(HashMap::new())),
@@ -2309,9 +2401,16 @@ async fn main() -> anyhow::Result<()> {
         tunnel_port_end,
         data_channels_max,
         shutdown_drain_secs,
+        ws_connections: Arc::new(AtomicUsize::new(0)),
+        ws_connections_max: env::var("WS_CONNECTIONS_MAX")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(WS_CONNECTIONS_MAX_DEFAULT),
         accepting: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         plane: DataPlane::default(),
         pending_enrollments: Arc::new(RwLock::new(HashMap::new())),
+        login_failures: Arc::new(Mutex::new(HashMap::new())),
     };
     tokio::spawn(heartbeat_flusher_loop(state.clone()));
     tokio::spawn(reconcile_listeners(state.clone()));
@@ -2323,6 +2422,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(anyhow::Error::msg)?;
     }
+    let cors = cors_layer();
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/auth/login", post(login))
@@ -2358,7 +2458,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .route("/control", get(control_socket))
         .route("/data", get(data_socket))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     let port = env::var("MANAGEMENT_PORT")
@@ -2451,6 +2551,31 @@ fn read_port(name: &str, default: u16) -> anyhow::Result<u16> {
         .parse::<u16>()?)
 }
 
+/// Builds the CORS layer from `CORS_ALLOWED_ORIGINS`, a comma-separated list of
+/// origins allowed to read the management API from a browser (e.g.
+/// `https://admin.example.com,http://localhost:5173`). When the variable is
+/// unset no origin is allowed, so cross-origin requests are rejected by the
+/// browser while same-origin ones (the Nginx-reverse-proxied admin UI, or the
+/// Vite dev proxy) are unaffected because CORS only applies across origins.
+/// The /control and /data WebSockets never go through CORS.
+fn cors_layer() -> CorsLayer {
+    let origins: Vec<HeaderValue> = env::var("CORS_ALLOWED_ORIGINS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|origin| origin.trim())
+                .filter(|origin| !origin.is_empty())
+                .filter_map(|origin| origin.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+}
+
 async fn bootstrap_admin(db: &PgPool) -> anyhow::Result<()> {
     let (Ok(email), Ok(password)) = (
         env::var("BOOTSTRAP_ADMIN_EMAIL"),
@@ -2509,14 +2634,31 @@ async fn admin(headers: &HeaderMap, state: &AppState) -> Result<Admin, StatusCod
     if claims.role != "admin" {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(Admin {
-        id: Uuid::parse_str(&claims.sub).map_err(|_| StatusCode::UNAUTHORIZED)?,
-    })
+    let admin_id = Uuid::parse_str(&claims.sub).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    // A token must reference an admin that still exists: deleting a user must
+    // immediately invalidate their outstanding tokens instead of letting them
+    // keep driving the management API. One cheap primary-key lookup per request
+    // is acceptable because the console only polls every few seconds.
+    let still_exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1")
+        .bind(admin_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some();
+    if !still_exists {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Admin { id: admin_id })
 }
 async fn login(
     State(state): State<AppState>,
     Json(input): Json<Login>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Reject attempts for an email that already has too many recent failures,
+    // before spending the argon2 verification cost on them.
+    if login_fail_count(&state, &input.email).await >= LOGIN_FAIL_MAX as usize {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let user: (Uuid, String, String) =
         match sqlx::query_as("SELECT id, password_hash, role FROM users WHERE email = $1")
             .bind(&input.email)
@@ -2527,6 +2669,9 @@ async fn login(
             Some(user) => user,
             None => {
                 audit(&state.db, None, "auth.login_failed", &input.email).await;
+                if record_login_failure(&state, &input.email).await {
+                    return Err(StatusCode::TOO_MANY_REQUESTS);
+                }
                 return Err(StatusCode::UNAUTHORIZED);
             }
         };
@@ -2543,8 +2688,12 @@ async fn login(
         .is_some();
     if !valid {
         audit(&state.db, None, "auth.login_failed", &input.email).await;
+        if record_login_failure(&state, &input.email).await {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
         return Err(StatusCode::UNAUTHORIZED);
     }
+    clear_login_failures(&state, &input.email).await;
     audit(&state.db, Some(user.0), "auth.login", &input.email).await;
     let claims = Claims {
         sub: user.0.to_string(),
@@ -2559,14 +2708,56 @@ async fn login(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({"access_token": token})))
 }
+
+/// Counts unexpired failed-login timestamps for `email`, pruning any that have
+/// fallen out of the rate-limit window. The entry is removed once empty so the
+/// map never grows without bound.
+async fn login_fail_count(state: &AppState, email: &str) -> usize {
+    let now = Instant::now();
+    let window = StdDuration::from_secs(LOGIN_FAIL_WINDOW_SECS);
+    let mut failures = state.login_failures.lock().await;
+    let Some(windowed) = failures.get_mut(email) else {
+        return 0;
+    };
+    windowed.retain(|attempt| now.duration_since(*attempt) < window);
+    let count = windowed.len();
+    if count == 0 {
+        failures.remove(email);
+    }
+    count
+}
+
+/// Records a failed login for `email` and returns true when it pushes the
+/// email past the failure limit, in which case the caller answers with 429.
+async fn record_login_failure(state: &AppState, email: &str) -> bool {
+    let now = Instant::now();
+    let window = StdDuration::from_secs(LOGIN_FAIL_WINDOW_SECS);
+    let mut failures = state.login_failures.lock().await;
+    let windowed = failures.entry(email.to_string()).or_default();
+    windowed.retain(|attempt| now.duration_since(*attempt) < window);
+    windowed.push(now);
+    windowed.len() >= LOGIN_FAIL_MAX as usize
+}
+
+/// Clears the recorded failures for `email` after a successful login so a
+/// locked-out admin who eventually supplies the right password is not blocked
+/// for the rest of the window.
+async fn clear_login_failures(state: &AppState, email: &str) {
+    state.login_failures.lock().await.remove(email);
+}
+
 async fn summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     admin(&headers, &state).await?;
     let row: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM devices), (SELECT count(*) FROM devices WHERE status = 'online'), (SELECT count(*) FROM tunnels)").fetch_one(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Report real live usage instead of the placeholder zero: TCP/HTTP streams
+    // plus UDP sessions currently active, matching list_tunnels().
+    let streams = state.plane.streams.read().await.len();
+    let udp = state.plane.udp_sessions.read().await.len();
     Ok(Json(
-        serde_json::json!({"devices":row.0,"online_devices":row.1,"tunnels":row.2,"active_connections":0}),
+        serde_json::json!({"devices":row.0,"online_devices":row.1,"tunnels":row.2,"active_connections":streams + udp}),
     ))
 }
 async fn get_settings(
@@ -2934,6 +3125,14 @@ async fn create_tunnel(
             ),
         ));
     }
+    if let Some(max) = input.max_connections {
+        if !(1..=1000).contains(&max) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "max_connections must be between 1 and 1000".into(),
+            ));
+        }
+    }
     let kind = match input.kind {
         TunnelKind::Tcp => "tcp",
         TunnelKind::Http => "http",
@@ -3002,6 +3201,14 @@ async fn update_tunnel(
                 state.tunnel_port_start, state.tunnel_port_end
             ),
         ));
+    }
+    if let Some(max) = input.max_connections {
+        if !(1..=1000).contains(&max) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "max_connections must be between 1 and 1000".into(),
+            ));
+        }
     }
     let current = get_tunnel(&state.db, id)
         .await
@@ -3617,15 +3824,24 @@ async fn rotate_device_token(
             "Device went offline; token was not rotated".into(),
         ));
     }
-    // Old tokens are now invalid; the fresh one remains active.
-    let _ = sqlx::query(
+    // Old tokens are now invalid; the fresh one remains active. Revoking the
+    // superseded tokens is best-effort: the agent has already overwritten its
+    // stored token with the fresh one and discarded the old, so deleting the
+    // fresh token here would leave the device permanently unable to
+    // authenticate. If the revoke fails we therefore keep the fresh token and
+    // surface the failure in the logs; "old + new both valid" is harmless for
+    // a single device because only the agent holds the new token.
+    if let Err(error) = sqlx::query(
         "UPDATE access_tokens SET revoked_at=now() WHERE device_id=$1 AND revoked_at IS NULL \
          AND token_hash <> $2",
     )
     .bind(id)
     .bind(&token_hash)
     .execute(&state.db)
-    .await;
+    .await
+    {
+        tracing::warn!(device_id = %id, %error, "could not revoke old tokens after rotation; keeping the new token");
+    }
     audit(
         &state.db,
         Some(actor.id),
@@ -4160,6 +4376,36 @@ async fn mark_restart_online(restarts: &RwLock<HashMap<Uuid, RestartState>>, dev
     }
 }
 
+/// Marks `device_id` offline in the database, unless it has since re-registered
+/// a fresh heartbeat (a reconnect racing this tick) — those are flipped by the
+/// reconnect path, not here. Returns true when the offline state is durably
+/// persisted or should not be touched; false when the write failed and the
+/// caller should retry on a later tick.
+async fn flush_device_offline(state: &AppState, device_id: Uuid) -> bool {
+    let still_live = {
+        let map = state.plane.heartbeats.read().await;
+        map.contains_key(&device_id)
+    };
+    if still_live {
+        return true;
+    }
+    match sqlx::query("UPDATE devices SET status='offline' WHERE id=$1")
+        .bind(device_id)
+        .execute(&state.db)
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                device_id = %device_id,
+                "offline flush to database failed"
+            );
+            false
+        }
+    }
+}
+
 /// Periodically persists in-memory heartbeats to the database and refreshes
 /// the Redis online markers. Runs entirely outside the control read loops:
 /// database/Redis slowness or outages only degrade online-status display,
@@ -4168,17 +4414,48 @@ async fn mark_restart_online(restarts: &RwLock<HashMap<Uuid, RestartState>>, dev
 async fn heartbeat_flusher_loop(state: AppState) {
     let mut ticker = tokio::time::interval(StdDuration::from_secs(HEARTBEAT_FLUSH_SECS));
     ticker.tick().await; // skip the immediate first tick
+    // Devices whose offline flush failed on an earlier tick. Retried each tick
+    // so a transient datastore outage cannot strand a pruned device online
+    // forever — once pruned from the in-memory map it would never be collected
+    // again by the retain pass.
+    let mut pending_offline: Vec<Uuid> = Vec::new();
     loop {
         ticker.tick().await;
         let now = Instant::now();
         let stale_after = StdDuration::from_secs(HEARTBEAT_STALE_SECS);
+        // Retry earlier failures first; flush_device_offline skips any device
+        // that has since re-registered a fresh heartbeat.
+        let retry = std::mem::take(&mut pending_offline);
+        for device_id in retry {
+            if !flush_device_offline(&state, device_id).await {
+                pending_offline.push(device_id);
+            }
+        }
+        let mut stale_devices: Vec<Uuid> = Vec::new();
         let heartbeats: Vec<(Uuid, HeartbeatEntry)> = {
             let mut map = state.plane.heartbeats.write().await;
-            map.retain(|_, entry| now.duration_since(entry.last_seen) <= stale_after);
+            map.retain(|device_id, entry| {
+                let is_stale = now.duration_since(entry.last_seen) > stale_after;
+                if is_stale {
+                    stale_devices.push(*device_id);
+                }
+                !is_stale
+            });
             map.iter()
                 .map(|(device_id, entry)| (*device_id, entry.clone()))
                 .collect()
         };
+        // Devices whose heartbeat went stale are pruned from the in-memory map
+        // above. Persist that to the database so a dead device never shows as
+        // online; failures join the retry set for the next tick.
+        for device_id in &stale_devices {
+            if pending_offline.contains(device_id) {
+                continue;
+            }
+            if !flush_device_offline(&state, *device_id).await {
+                pending_offline.push(*device_id);
+            }
+        }
         if heartbeats.is_empty() {
             continue;
         }
@@ -4249,8 +4526,17 @@ async fn heartbeat_flusher_loop(state: AppState) {
 }
 
 async fn control_loop(socket: WebSocket, state: AppState) {
+    let Some(guard) = WsConnectionGuard::acquire(&state.ws_connections, state.ws_connections_max)
+    else {
+        return;
+    };
     let mut socket = socket;
-    let Some(Ok(Message::Text(first))) = socket.next().await else {
+    let Ok(Some(Ok(Message::Text(first)))) = tokio::time::timeout(
+        StdDuration::from_secs(WS_FIRST_MESSAGE_TIMEOUT_SECS),
+        socket.next(),
+    )
+    .await
+    else {
         return;
     };
     let Ok(message) = decode(first.as_bytes()) else {
@@ -4261,6 +4547,11 @@ async fn control_loop(socket: WebSocket, state: AppState) {
     } = message
     else {
         if let ControlMessage::Enroll { code, device_name } = message {
+            // Enrollment is tracked independently via its DB row and the
+            // pending_enrollments oneshot, so release the WebSocket slot now:
+            // holding it through the (up to 15 minute) enrollment wait would
+            // let unauthenticated attackers occupy every slot cheaply.
+            drop(guard);
             enroll_loop(socket, state, code, device_name).await;
         }
         return;
@@ -4515,11 +4806,26 @@ async fn enroll_loop(socket: WebSocket, state: AppState, code: String, device_na
     .unwrap_or(0);
     if already_pending > 0 {
         tracing::warn!("duplicate enrollment code rejected");
+        // Tell the agent explicitly so it rotates to a fresh code instead of
+        // hanging until the pending row naturally expires.
+        let _ = sink
+            .send(Message::Text(
+                String::from_utf8_lossy(
+                    &encode(&ControlMessage::Error {
+                        code: "duplicate_enroll".into(),
+                        message: "Enrollment code already pending for another connection".into(),
+                    })
+                    .unwrap_or_default(),
+                )
+                .into_owned()
+                .into(),
+            ))
+            .await;
         return;
     }
     let enrollment_id = Uuid::new_v4();
     let expires_at = Utc::now() + Duration::minutes(ENROLL_TTL_MINUTES);
-    let _ = sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO enrollments(id, code_hash, device_name, status, expires_at) \
          VALUES($1,$2,$3,'pending',$4)",
     )
@@ -4529,6 +4835,71 @@ async fn enroll_loop(socket: WebSocket, state: AppState, code: String, device_na
     .bind(expires_at)
     .execute(&state.db)
     .await;
+    if let Err(error) = insert {
+        let is_unique_violation = error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .map(|code| code == "23505")
+            .unwrap_or(false);
+        if !is_unique_violation {
+            // Not a code conflict (e.g. the database itself is down): this is a
+            // transient server-side failure, not a burned code. Report it
+            // distinctly so a DB outage does not masquerade as an
+            // enrollment-code leak; the agent clears its code and the outer
+            // loop backs off and retries.
+            tracing::warn!(%error, "enrollment insert failed; database unavailable");
+            let _ = sink
+                .send(Message::Text(
+                    String::from_utf8_lossy(
+                        &encode(&ControlMessage::Error {
+                            code: "enroll_retry".into(),
+                            message: "Enrollment database error, try again".into(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                    .into_owned()
+                    .into(),
+                ))
+                .await;
+            return;
+        }
+        // Unique-constraint violation: the code is already owned by an earlier
+        // enrollment (approved/denied/expired) or raced with another pending
+        // one. Reject explicitly so the agent rotates to a fresh code rather
+        // than hanging until the old row expires.
+        tracing::warn!(%code_hash, %error, "enrollment insert rejected; code already present");
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM enrollments WHERE code_hash=$1")
+                .bind(&code_hash)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        let (error_code, message) = match status.as_deref() {
+            Some("pending") => (
+                "duplicate_enroll",
+                "Enrollment code already pending for another connection",
+            ),
+            _ => (
+                "enroll_code_used",
+                "Enrollment code already used or expired",
+            ),
+        };
+        let _ = sink
+            .send(Message::Text(
+                String::from_utf8_lossy(
+                    &encode(&ControlMessage::Error {
+                        code: error_code.into(),
+                        message: message.into(),
+                    })
+                    .unwrap_or_default(),
+                )
+                .into_owned()
+                .into(),
+            ))
+            .await;
+        return;
+    }
     let (tx, rx) = oneshot::channel::<EnrollmentDecision>();
     state.pending_enrollments.write().await.insert(
         enrollment_id,
@@ -4541,9 +4912,18 @@ async fn enroll_loop(socket: WebSocket, state: AppState, code: String, device_na
     tracing::info!(%enrollment_id, device_name, "agent waiting for enrollment approval");
     let ttl = (expires_at - Utc::now()).to_std().unwrap_or_default();
     let decision = tokio::select! {
-        // Socket closed before a decision; the pending row stays until expiry.
+        // Socket closed before a decision: the agent walked away. Delete the
+        // pending row outright so the same code can be reused immediately —
+        // the unique code_hash constraint stays occupied for as long as a row
+        // exists, regardless of its status. Approve/deny keep their rows for
+        // audit, but a socket close has no audit value and the agent
+        // re-initiates enrollment on its next attempt.
         _ = source.next() => {
             state.pending_enrollments.write().await.remove(&enrollment_id);
+            let _ = sqlx::query("DELETE FROM enrollments WHERE id=$1 AND status='pending'")
+                .bind(enrollment_id)
+                .execute(&state.db)
+                .await;
             return;
         }
         _ = tokio::time::sleep(ttl) => {
@@ -4609,8 +4989,17 @@ async fn data_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> imp
 /// Binds one data WebSocket to the device's current control session, replies
 /// with its channel id, then forwards binary frames until the socket drops.
 async fn data_channel_loop(socket: WebSocket, state: AppState) {
+    let Some(_guard) = WsConnectionGuard::acquire(&state.ws_connections, state.ws_connections_max)
+    else {
+        return;
+    };
     let (mut sink, mut source) = socket.split();
-    let Some(Ok(Message::Text(first))) = source.next().await else {
+    let Ok(Some(Ok(Message::Text(first)))) = tokio::time::timeout(
+        StdDuration::from_secs(WS_FIRST_MESSAGE_TIMEOUT_SECS),
+        source.next(),
+    )
+    .await
+    else {
         return;
     };
     let Ok(ControlMessage::DataBind { token }) = decode(first.as_bytes()) else {
@@ -4916,7 +5305,7 @@ async fn load_specs(db: &PgPool, device_id: Uuid) -> Vec<TunnelSpec> {
         local_host: r.4,
         local_port: r.5 as u16,
         enabled: r.6,
-        max_connections: r.7 as u16,
+        max_connections: r.7.clamp(1, 1000) as u16,
     })
     .collect()
 }
@@ -4944,21 +5333,22 @@ async fn start_listener(state: AppState, tunnel_id: Uuid) -> Result<(), String> 
         };
         let listener_state = state.clone();
         let (exit_tx, mut exit_rx) = oneshot::channel::<()>();
-        let generation = reserve_listener_entry(&state.listeners, tunnel_id, {
-            let listener_state = listener_state.clone();
-            move |tunnel_id, generation| {
-                tokio::spawn(async move {
-                    bridge_public_udp(listener_state.clone(), tunnel, socket).await;
-                    tracing::warn!(
-                        tunnel_id = %tunnel_id,
-                        "tunnel listener exited; removed from active listeners"
-                    );
-                    finish_listener(listener_state, tunnel_id, generation).await;
-                    let _ = exit_tx.send(());
-                })
-            }
-        })
-        .await;
+        let generation =
+            reserve_listener_entry(&state.listeners, &state.listener_generation, tunnel_id, {
+                let listener_state = listener_state.clone();
+                move |tunnel_id, generation| {
+                    tokio::spawn(async move {
+                        bridge_public_udp(listener_state.clone(), tunnel, socket).await;
+                        tracing::warn!(
+                            tunnel_id = %tunnel_id,
+                            "tunnel listener exited; removed from active listeners"
+                        );
+                        finish_listener(listener_state, tunnel_id, generation).await;
+                        let _ = exit_tx.send(());
+                    })
+                }
+            })
+            .await;
         if exit_rx.try_recv().is_ok() {
             remove_stale_listener_entry(&state, tunnel_id, generation).await;
         }
@@ -4975,33 +5365,34 @@ async fn start_listener(state: AppState, tunnel_id: Uuid) -> Result<(), String> 
     };
     let listener_state = state.clone();
     let (exit_tx, mut exit_rx) = oneshot::channel::<()>();
-    let generation = reserve_listener_entry(&state.listeners, tunnel_id, {
-        let listener_state = listener_state.clone();
-        move |tunnel_id, generation| {
-            tokio::spawn(async move {
-                let accept_error = loop {
-                    match listener.accept().await {
-                        Ok((socket, _)) => {
-                            let st = listener_state.clone();
-                            let t = tunnel.clone();
-                            tokio::spawn(async move {
-                                bridge_public_connection(st, t, socket).await;
-                            });
+    let generation =
+        reserve_listener_entry(&state.listeners, &state.listener_generation, tunnel_id, {
+            let listener_state = listener_state.clone();
+            move |tunnel_id, generation| {
+                tokio::spawn(async move {
+                    let accept_error = loop {
+                        match listener.accept().await {
+                            Ok((socket, _)) => {
+                                let st = listener_state.clone();
+                                let t = tunnel.clone();
+                                tokio::spawn(async move {
+                                    bridge_public_connection(st, t, socket).await;
+                                });
+                            }
+                            Err(error) => break error,
                         }
-                        Err(error) => break error,
-                    }
-                };
-                tracing::warn!(
-                    tunnel_id = %tunnel_id,
-                    %accept_error,
-                    "tunnel listener accept failed; removed from active listeners"
-                );
-                finish_listener(listener_state, tunnel_id, generation).await;
-                let _ = exit_tx.send(());
-            })
-        }
-    })
-    .await;
+                    };
+                    tracing::warn!(
+                        tunnel_id = %tunnel_id,
+                        %accept_error,
+                        "tunnel listener accept failed; removed from active listeners"
+                    );
+                    finish_listener(listener_state, tunnel_id, generation).await;
+                    let _ = exit_tx.send(());
+                })
+            }
+        })
+        .await;
     if exit_rx.try_recv().is_ok() {
         remove_stale_listener_entry(&state, tunnel_id, generation).await;
     }
@@ -5009,28 +5400,32 @@ async fn start_listener(state: AppState, tunnel_id: Uuid) -> Result<(), String> 
 }
 
 /// Atomically checks that no listener is registered for `tunnel_id`, allocates
-/// the next generation, spawns the listener task, and installs its handle.
-/// Concurrent `start_listener` calls serialize on the write lock here, so two
-/// tasks can never race past the `contains_key` check and overwrite each
-/// other's handle with the same generation.
+/// a fresh unique generation from the monotonic counter, spawns the listener
+/// task, and installs its handle. Concurrent `start_listener` calls serialize
+/// on the write lock here, so two tasks can never race past the `contains_key`
+/// check and overwrite each other's handle. A caller that finds an entry
+/// already installed is a no-op: it returns its own (newer) generation, which
+/// differs from the installed entry's generation, so an exiting task using an
+/// older generation can never delete the new handle. Callers must not assume
+/// the returned value equals the generation of any currently installed entry.
 async fn reserve_listener_entry(
     listeners: &Arc<RwLock<HashMap<Uuid, ListenerEntry>>>,
+    generation_counter: &AtomicU64,
     tunnel_id: Uuid,
     spawn: impl FnOnce(Uuid, u64) -> tokio::task::JoinHandle<()>,
 ) -> u64 {
+    // Draw the generation before taking the lock so every call — including
+    // no-ops — returns a value distinct from any generation already handed
+    // out. `saturating_add(1)` turns the first `fetch_add` result (0) into 1.
+    let generation = generation_counter
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     let mut guard = listeners.write().await;
     if guard.contains_key(&tunnel_id) {
         // Another start_listener already installed its entry; treat this call
         // as a no-op instead of overwriting the running task.
-        return guard
-            .get(&tunnel_id)
-            .map(|entry| entry.generation)
-            .unwrap_or(1);
+        return generation;
     }
-    let generation = guard
-        .get(&tunnel_id)
-        .map(|entry| entry.generation.saturating_add(1))
-        .unwrap_or(1);
     let handle = spawn(tunnel_id, generation);
     guard.insert(
         tunnel_id,
@@ -5333,7 +5728,10 @@ async fn bridge_public_connection(
     inbound.abort();
 }
 
-/// Stops a tunnel listener and drops any UDP sessions bound to it.
+/// Stops a tunnel listener and drops the UDP sessions and TCP streams bound to
+/// it. Aborting the listener task does not terminate the independently spawned
+/// TCP bridge tasks, so each stream's entry is removed and the agent is sent a
+/// `StreamClose`; the bridge then exits on its next one-second liveness check.
 async fn remove_listener(state: &AppState, tunnel_id: Uuid) {
     if let Some(entry) = state.listeners.write().await.remove(&tunnel_id) {
         entry.task.abort();
@@ -5349,6 +5747,27 @@ async fn remove_listener(state: &AppState, tunnel_id: Uuid) {
         .collect();
     for (id, device_id) in stale {
         remove_udp_session(&state.plane, id).await;
+        send_control_with_timeout(
+            &state,
+            device_id,
+            &ControlMessage::StreamClose {
+                stream_id: id.to_string(),
+                reason: Some("tunnel_disabled".into()),
+            },
+        )
+        .await;
+    }
+    let stale: Vec<(u128, Uuid)> = state
+        .plane
+        .streams
+        .read()
+        .await
+        .iter()
+        .filter(|(_, stream)| stream.tunnel_id == tunnel_id)
+        .map(|(id, stream)| (*id, stream.device_id))
+        .collect();
+    for (id, device_id) in stale {
+        remove_stream_entry(&state.plane, id).await;
         send_control_with_timeout(
             &state,
             device_id,

@@ -1,0 +1,31 @@
+# 敏感密钥：deploy/.env 与任意层级的 .env 都不进构建上下文
+deploy/.env
+.env
+**/.env
+
+# Rust 构建缓存（本地巨大）
+target/
+**/target/
+
+# 客户端打包目录（每个版本一个目录，已 gitignore）
+release/
+**/release/
+
+# 前端依赖与构建产物
+node_modules/
+**/node_modules/
+apps/admin/dist/
+apps/admin/build/
+apps/admin/tsconfig.tsbuildinfo
+
+# 桌面客户端（Tauri，构建服务端/管理端镜像不需要）
+apps/client/
+
+# 本地构建产物与工具状态
+.build/
+.codex-tmp/
+.reasonix/
+deploy/backups/
+
+# 版本控制元数据
+.git/

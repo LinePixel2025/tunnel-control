@@ -63,7 +63,5 @@ services:
 volumes:
   postgres-data:
     name: ${POSTGRES_VOLUME_NAME:-tunnel-control_tunnel-control-postgres-data}
-    external: true
   redis-data:
     name: ${REDIS_VOLUME_NAME:-tunnel-control_tunnel-control-redis-data}
-    external: true

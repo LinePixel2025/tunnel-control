@@ -18,7 +18,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::{Mutex, Notify, RwLock, mpsc},
+    sync::{Mutex, Notify, RwLock, mpsc, watch},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing_subscriber::prelude::*;
@@ -39,6 +39,10 @@ const ENROLL_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
 /// Preset server offered on first start in the client console.
 const OFFICIAL_SERVER_URL: &str = "ws://123.207.8.77:18080/control";
+
+/// Bounded window for the agent loop to exit gracefully after the SCM sends a
+/// Stop (Windows service mode) before the service reports SERVICE_STOPPED.
+const SERVICE_STOP_DRAIN_SECS: u64 = 10;
 
 /// Runtime hook for the tracing filter so `SettingsSync` can change the log
 /// level without restarting the process. The concrete reload handle is hidden
@@ -778,7 +782,12 @@ fn main() {
     }
     if arguments.iter().any(|argument| argument == "--agent") {
         setup_logging(true);
-        run_agent_forever();
+        // Console workers have no SCM Stop; keep a never-flipped watch channel
+        // alive for the process lifetime. A live sender makes `run`'s
+        // `changed()` branch keep waiting instead of erroring and spinning.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _ = Box::leak(Box::new(shutdown_tx));
+        run_agent_forever(shutdown_rx);
         return;
     }
     run_console();
@@ -855,21 +864,125 @@ fn write_console_pid(pid: u32) -> io::Result<()> {
 fn ps_stdout_contains_bytes(stdout: &[u8], needle: &str) -> bool {
     String::from_utf8_lossy(stdout)
         .replace('\0', "")
-        .contains(needle)
+        .to_lowercase()
+        .contains(&needle.to_lowercase())
+}
+
+/// Runs a PowerShell command, preferring Windows PowerShell 5.1 and falling
+/// back to PowerShell 7 (`pwsh`) when the legacy host is unavailable.
+fn run_powershell(args: &[&str]) -> Option<std::process::Output> {
+    Command::new("powershell")
+        .args(args)
+        .output()
+        .ok()
+        .or_else(|| Command::new("pwsh").args(args).output().ok())
+}
+
+/// Returns the process name the worker is spawned under. Deriving it from
+/// the current executable keeps detection correct regardless of the file
+/// name the user launches (`tunnel-agent.exe`, the `Tunnel-Agent-Setup-V4.2`
+/// setup package, or a renamed console copy).
+fn worker_process_name() -> String {
+    env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "tunnel-agent".into())
 }
 
 fn process_is_running(pid: u32) -> bool {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).ProcessName"),
-        ])
-        .output();
-    output
+    let expected = worker_process_name();
+    let Some(output) = run_powershell(&[
+        "-NoProfile",
+        "-Command",
+        &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).ProcessName"),
+    ]) else {
+        return false;
+    };
+    ps_stdout_contains_bytes(&output.stdout, &expected)
+}
+
+/// True when a process command line was started as the Windows service
+/// (`--service`), the only way `tunnel-agent.exe --service` runs. Console
+/// workers always launch with `--agent` and never carry this flag, so the
+/// check separates the two even though both share the same exe and process
+/// name. A token counts only when it is exactly `--service`
+/// (case-insensitive), so `--service-mode` or a path that merely contains
+/// `--service` is not a false positive.
+///
+/// An empty command line yields no matching token and is therefore NOT a
+/// service process; `running_worker_pids` relies on the `Win32_Service` PID
+/// exclusion to keep a SYSTEM-owned service (whose CommandLine WMI may not
+/// expose) out of the worker list.
+///
+/// This is the unit-tested spec of the `--service` token filter applied inside
+/// `running_worker_pids`'s PowerShell enumeration. It has no Rust call site,
+/// so it is compiled only for tests.
+#[cfg(test)]
+fn is_service_command_line(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("--service"))
+}
+
+/// Enumerates every live agent worker process, including zombies no longer
+/// tracked in `agent.pid` (for example workers started by an older console
+/// build under a different process name). Matches by executable path and by
+/// known console/worker names, case-insensitively, and excludes the current
+/// console process itself.
+///
+/// The Windows service runs the exact same exe (`tunnel-agent.exe --service`)
+/// under the same process name, so a name/path match alone cannot tell it
+/// apart from a console worker. Candidates are therefore excluded twice:
+/// the service's ProcessId taken from `Win32_Service` is dropped
+/// deterministically (WMI may return an empty CommandLine for a SYSTEM-owned
+/// service, so the command-line check alone is not enough), and any candidate
+/// whose command line carries a `--service` token is dropped as well (see
+/// `is_service_command_line`). If the `Win32_Service` query fails for lack of
+/// permission, that step silently degrades to the command-line filter only.
+#[cfg(windows)]
+fn running_worker_pids() -> Vec<u32> {
+    // `current_name` is interpolated into a PowerShell single-quoted string,
+    // so a `'` in the exe name must be doubled or the whole script fails to
+    // parse (same escaping as `$exe` below).
+    let current_name = worker_process_name().replace('\'', "''").to_lowercase();
+    let current_pid = std::process::id();
+    let exe = env::current_exe()
         .ok()
-        .map(|output| ps_stdout_contains_bytes(&output.stdout, "tunnel-agent"))
-        .unwrap_or(false)
+        .map(|path| path.to_string_lossy().replace('\'', "''"))
+        .unwrap_or_default();
+    let script = format!(
+        "$names=@('tunnel-agent','tunnel-agent-setup-v4.2','tunnel-client','{current_name}'); \
+         $exe='{exe}'; \
+         $servicePid=@(Get-CimInstance Win32_Service -Filter 'Name=''TunnelAgent''' -ErrorAction SilentlyContinue | \
+           Where-Object {{ $_.ProcessId -gt 0 }} | Select-Object -ExpandProperty ProcessId); \
+         (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | \
+           Where-Object {{ $_.ProcessId -ne {current_pid} -and \
+             ($exe -and $_.ExecutablePath -eq $exe -or \
+               $names -contains [System.IO.Path]::GetFileNameWithoutExtension($_.Name).ToLowerInvariant()) -and \
+             $servicePid -notcontains $_.ProcessId -and \
+             -not ($_.CommandLine -and (($_.CommandLine.ToLowerInvariant() -split '\\s+') -contains '--service')) }} | \
+           Select-Object -ExpandProperty ProcessId) -join ','"
+    );
+    let Some(output) = run_powershell(&["-NoProfile", "-Command", &script]) else {
+        return Vec::new();
+    };
+    parse_pid_list(&String::from_utf8_lossy(&output.stdout).replace('\0', ""))
+}
+
+/// Parses a comma-separated PID list such as the one emitted by
+/// `running_worker_pids`, ignoring empty and malformed entries.
+fn parse_pid_list(text: &str) -> Vec<u32> {
+    text.split(',')
+        .filter_map(|part| part.trim().parse::<u32>().ok())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn running_worker_pids() -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(not(windows))]
@@ -878,32 +991,61 @@ fn process_is_running(_pid: u32) -> bool {
 }
 
 fn stop_process(pid: u32) {
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("Stop-Process -Id {pid} -Force"),
-        ])
-        .status();
+    let _ = run_powershell(&[
+        "-NoProfile",
+        "-Command",
+        &format!("Stop-Process -Id {pid} -Force"),
+    ]);
 }
 
 fn service_is_running() -> bool {
     #[cfg(windows)]
     {
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-Service TunnelAgent -ErrorAction SilentlyContinue).Status -eq 'Running'",
-            ])
-            .output();
-        return output
-            .ok()
-            .map(|output| ps_stdout_contains_bytes(&output.stdout, "True"))
-            .unwrap_or(false);
+        let Some(output) = run_powershell(&[
+            "-NoProfile",
+            "-Command",
+            "(Get-Service TunnelAgent -ErrorAction SilentlyContinue).Status -eq 'Running'",
+        ]) else {
+            return false;
+        };
+        return ps_stdout_contains_bytes(&output.stdout, "True");
     }
     #[cfg(not(windows))]
     false
+}
+
+/// Waits until the Windows service `service` has fully stopped (status
+/// `Stopped`) or no longer exists, up to a 30-second deadline. `sc.exe stop`
+/// returns while the service is still STOP_PENDING, and the SCM refuses to
+/// delete a service in that state, so polling beats a fixed sleep. `sc.exe
+/// stop` also succeeds on a stopped service, and `Get-Service` reports a
+/// missing service as $null (suppressed via -ErrorAction SilentlyContinue),
+/// so a first install returns here immediately. Returns true when the service
+/// is gone or stopped, false if the deadline elapsed while it kept stopping.
+#[cfg(windows)]
+fn wait_for_service_stopped(service: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let Some(output) = run_powershell(&[
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$s=Get-Service {service} -ErrorAction SilentlyContinue; \
+                 if($s -and $s.Status -ne 'Stopped'){{'Running'}}else{{'Stopped'}}"
+            ),
+        ]) else {
+            // No PowerShell available; return optimistically and let the copy
+            // surface a sharing violation if the service is genuinely running.
+            return true;
+        };
+        if !ps_stdout_contains_bytes(&output.stdout, "Running") {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// First-run server selection: the operator picks the preset LineWeb server
@@ -969,6 +1111,17 @@ fn start_agent_process() -> Option<u32> {
             return None;
         }
     }
+    let extra = running_worker_pids();
+    if let Some(&pid) = extra.first() {
+        println!("Agent is already running (PID {pid}).");
+        if extra.len() > 1 {
+            println!(
+                "WARNING: {} agent processes are running; use `stop` or Task Manager to clean up the extras.",
+                extra.len()
+            );
+        }
+        return None;
+    }
     if service_is_running() {
         println!("WARNING: the TunnelAgent Windows service is running.");
         println!("Console mode and service mode would fight over the same device session.");
@@ -1001,12 +1154,27 @@ fn start_agent_process() -> Option<u32> {
     std::thread::sleep(Duration::from_millis(400));
     if !process_is_running(pid) {
         println!("WARNING: agent exited right after start (PID {pid}).");
-        println!(
-            "Check the worker logs: {}",
-            console_state_dir().join("console.err.log").display()
-        );
+        let err_log = console_state_dir().join("console.err.log");
+        println!("Check the worker logs: {}", err_log.display());
+        match fs::read_to_string(&err_log) {
+            Ok(content) if !content.trim().is_empty() => {
+                let tail: Vec<&str> = content.lines().rev().take(40).collect();
+                println!("--- {} (tail) ---", err_log.display());
+                println!(
+                    "{}",
+                    tail.iter().rev().copied().collect::<Vec<_>>().join("\n")
+                );
+                println!("-------------------");
+            }
+            _ => println!(
+                "console.err.log is empty; the worker exited without an error message \
+                 (check the Windows event log and antivirus quarantine)."
+            ),
+        }
+        println!("Agent process is not running.");
+    } else {
+        println!("Agent started (PID {pid}).");
     }
-    println!("Agent started (PID {pid}).");
     if let Some(code) = enrollment_code {
         println!("==============================================");
         println!("设备尚未注册，注册码：{code}");
@@ -1023,23 +1191,36 @@ fn start_agent_process() -> Option<u32> {
 }
 
 fn console_stop() {
-    match read_console_pid() {
-        Some(pid) if process_is_running(pid) => {
-            stop_process(pid);
-            let _ = fs::remove_file(console_pid_file());
-            println!("Agent stopped.");
-        }
-        _ => {
-            let _ = fs::remove_file(console_pid_file());
-            println!("Agent is not running.");
-        }
+    let pids = running_worker_pids();
+    if pids.is_empty() {
+        let _ = fs::remove_file(console_pid_file());
+        println!("Agent is not running.");
+        return;
+    }
+    for pid in &pids {
+        stop_process(*pid);
+    }
+    let _ = fs::remove_file(console_pid_file());
+    if pids.len() == 1 {
+        println!("Agent stopped (PID {}).", pids[0]);
+    } else {
+        let list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Agent stopped (PIDs {list}).");
     }
 }
 
 fn console_status() {
-    match read_console_pid() {
-        Some(pid) if process_is_running(pid) => println!("Agent process: RUNNING (PID {pid})"),
-        _ => println!("Agent process: stopped"),
+    let service_running = service_is_running();
+    match running_worker_pids().first() {
+        Some(pid) => println!("Agent process: RUNNING (PID {pid})"),
+        // No console worker, but the service is up: call it out as the
+        // service rather than a stopped agent, since they share one exe.
+        None if service_running => println!("Agent process: agent (service) 在运行中"),
+        None => println!("Agent process: stopped"),
     }
     let credentials = load_credentials();
     match credentials.get("SERVER_URL") {
@@ -1052,7 +1233,7 @@ fn console_status() {
     }
     println!(
         "Service      : {}",
-        if service_is_running() {
+        if service_running {
             "running (TunnelAgent)"
         } else {
             "not running"
@@ -1091,14 +1272,16 @@ fn console_settings() {
 /// through its named pipe, then prints each channel's up/down/total bytes.
 #[cfg(windows)]
 fn console_traffic() {
-    let Some(pid) = read_console_pid() else {
+    // `running_worker_pids()` excludes service-mode processes (their command
+    // line contains `--service`), so this fallback can only resolve to a
+    // console worker's named pipe, never the service process.
+    let Some(pid) = read_console_pid()
+        .filter(|pid| process_is_running(*pid))
+        .or_else(|| running_worker_pids().first().copied())
+    else {
         println!("代理未运行,无法获取实时流量。");
         return;
     };
-    if !process_is_running(pid) {
-        println!("代理未运行,无法获取实时流量。");
-        return;
-    }
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1371,7 +1554,20 @@ fn create_file_writer() -> Option<tracing_appender::non_blocking::NonBlocking> {
         return None;
     }
     clean_old_logs(&dir);
-    let appender = tracing_appender::rolling::daily(&dir, "agent.log");
+    // Use the builder API so an unusable log file (read-only, locked, or
+    // permission-denied) degrades to console-only logging instead of
+    // panicking in the rolling appender constructor.
+    let appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("agent.log")
+        .build(&dir)
+    {
+        Ok(appender) => appender,
+        Err(error) => {
+            eprintln!("agent log file unavailable ({error}); logging to console only");
+            return None;
+        }
+    };
     let (writer, guard) = tracing_appender::non_blocking(appender);
     Box::leak(Box::new(guard));
     Some(writer)
@@ -1402,10 +1598,16 @@ fn clean_old_logs(dir: &Path) {
 #[cfg(windows)]
 fn service_main(_arguments: Vec<OsString>) {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    // The watch channel carries the shutdown signal into the agent loop. The
+    // event handler flips it on Stop; `run` observes it inside its select and
+    // exits through the normal cleanup path (aborting tasks, sending
+    // teardown) instead of being killed when the process exits.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
                 let _ = stop_tx.send(());
+                let _ = shutdown_tx.send(true);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -1431,16 +1633,64 @@ fn service_main(_arguments: Vec<OsString>) {
     if status_handle.set_service_status(running.clone()).is_err() {
         return;
     }
-    std::thread::spawn(run_agent_forever);
-    let _ = stop_rx.recv();
-    let stopped = ServiceStatus {
-        current_state: ServiceState::Stopped,
-        ..running
-    };
-    let _ = status_handle.set_service_status(stopped);
+    // The worker thread owns copies of the handle and status so it can report
+    // the final state itself; the main thread keeps its own copies so it can
+    // report Stopped if the worker ever fails to exit within the drain window.
+    let worker_handle = status_handle;
+    let worker_running = running.clone();
+    let worker = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_agent_forever(shutdown_rx)
+        }));
+        let final_status = ServiceStatus {
+            current_state: ServiceState::Stopped,
+            // A panicked loop reports a non-zero exit code so the SCM treats
+            // the stop as a failure and runs the configured recovery actions.
+            exit_code: ServiceExitCode::Win32(if result.is_err() { 1 } else { 0 }),
+            ..worker_running
+        };
+        let _ = worker_handle.set_service_status(final_status);
+    });
+    // Wait for the SCM's Stop, but keep watching the worker so a panic (which
+    // reports the failed status and ends the thread) does not leave this
+    // thread blocked forever and the process wedged.
+    while !worker.is_finished() {
+        match stop_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if worker.is_finished() {
+        // The worker already reported its final status; nothing more to do.
+        return;
+    }
+    // Stop requested: the shutdown flag is already set by the event handler.
+    // Give the agent loop a bounded window to exit gracefully (cleanup runs
+    // while the control socket is still up) before the process exits.
+    let deadline = Instant::now() + Duration::from_secs(SERVICE_STOP_DRAIN_SECS);
+    while !worker.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if worker.is_finished() {
+        let _ = worker.join();
+    } else {
+        // The worker could not exit gracefully in time (pathological hang).
+        // Report Stopped from here so the service does not look like it
+        // crashed out of the Running state, which would make the SCM undo the
+        // user's Stop via its failure recovery actions.
+        tracing::error!(
+            "agent worker did not exit within {SERVICE_STOP_DRAIN_SECS}s; reporting stopped"
+        );
+        let stopped = ServiceStatus {
+            current_state: ServiceState::Stopped,
+            ..running
+        };
+        let _ = status_handle.set_service_status(stopped);
+    }
 }
 
-fn run_agent_forever() {
+fn run_agent_forever(mut shutdown_rx: watch::Receiver<bool>) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1454,11 +1704,22 @@ fn run_agent_forever() {
         #[cfg(windows)]
         tokio::spawn(ipc_server(status.clone()));
         loop {
+            if *shutdown_rx.borrow() {
+                tracing::info!("shutdown requested; exiting agent loop");
+                break;
+            }
             // Re-read the config every session so enrollment and pushed
             // settings (persisted to the credentials file) take effect on the
             // next connect without a process restart.
             let config = AgentConfig::from_env();
-            let outcome = run(&config, &status).await;
+            let outcome = run(&config, &status, &mut shutdown_rx).await;
+            if *shutdown_rx.borrow() {
+                // Stop arrived while a session was open; `run` already walked
+                // its cleanup path (abort tasks, clear session state) before
+                // returning, so there is nothing to tear down here.
+                tracing::info!("shutdown requested; exiting agent loop");
+                break;
+            }
             match outcome {
                 // Enrollment approved or settings require a reconnect:
                 // connect again immediately with the fresh config.
@@ -1498,7 +1759,12 @@ fn run_agent_forever() {
             );
             attempt = attempt.saturating_add(1);
             tracing::info!(seconds = delay.as_secs_f64(), "retrying control connection");
-            tokio::time::sleep(delay).await;
+            // Stop cancels the backoff sleep so the service exits promptly
+            // even while the agent is disconnected and backing off.
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown_rx.changed() => {}
+            }
         }
     });
 }
@@ -1548,14 +1814,138 @@ fn agent_pipe_name() -> String {
     format!(r"\\.\pipe\TunnelControl-agent-{}", std::process::id())
 }
 
+/// Security descriptor that restricts the agent's IPC named pipe to the user
+/// the agent process is running as (SYSTEM for the service, the console user
+/// for console mode). Every other local user is denied at the kernel level, so
+/// their connections are rejected by `CreateNamedPipeW`/the pipe DACL instead
+/// of ever reaching the handler.
+#[cfg(windows)]
+struct IpcPipeSecurity {
+    /// Passed as `lpSecurityAttributes` to `CreateNamedPipeW`.
+    attributes: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    // Held alive so the pointers stored in `attributes` and the descriptor
+    // remain valid for as long as pipes are created from this struct.
+    _descriptor: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
+    // u64-typed so the buffer is guaranteed aligned for the `ACL` struct that
+    // `InitializeAcl`/`AddAccessAllowedAce` write into it.
+    _acl: Box<[u64; 64]>,
+}
+
+// Safety: every raw pointer this struct stores points into its own Box'd heap
+// buffers (`_descriptor`, `_acl`), which keep their addresses when the struct
+// moves between threads, and the struct is used by a single IPC task with no
+// concurrent access. `ipc_server` is spawned with `tokio::spawn`, so its
+// captured future must be `Send`.
+#[cfg(windows)]
+unsafe impl Send for IpcPipeSecurity {}
+
+/// Builds a DACL granting the agent's own user read/write access and nothing
+/// else, wrapped in a SECURITY_DESCRIPTOR + SECURITY_ATTRIBUTES. Returns None
+/// when the descriptor cannot be built so the caller can refuse to serve IPC
+/// rather than silently fall back to the default (permissive) descriptor.
+#[cfg(windows)]
+fn build_ipc_pipe_security() -> Option<IpcPipeSecurity> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE},
+        Security::{
+            ACL, ACL_REVISION, AddAccessAllowedAce, GetTokenInformation, InitializeAcl,
+            InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+            SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    unsafe {
+        // 1. Resolve the SID of the user this process runs as.
+        let mut token: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut size = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        let mut token_info = vec![0_u8; size as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            token_info.as_mut_ptr() as *mut core::ffi::c_void,
+            token_info.len() as u32,
+            &mut size,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        // TOKEN_USER's Sid points into `token_info`; it stays alive until the
+        // ACE below copies the SID into the ACL. `read_unaligned` keeps the
+        // struct read safe even though the byte-vec buffer is only u8-aligned.
+        let token_user = std::ptr::read_unaligned(token_info.as_ptr() as *const TOKEN_USER);
+        let sid = token_user.User.Sid;
+
+        // 2. Build a DACL with a single access-allowed ACE for that SID. The
+        // buffer is 512 bytes (`[u64; 64]`).
+        let mut acl = Box::new([0_u64; 64]);
+        if InitializeAcl(
+            acl.as_mut_ptr() as *mut ACL,
+            std::mem::size_of_val(&*acl) as u32,
+            ACL_REVISION,
+        ) == 0
+        {
+            return None;
+        }
+        if AddAccessAllowedAce(
+            acl.as_mut_ptr() as *mut ACL,
+            ACL_REVISION,
+            (GENERIC_READ | GENERIC_WRITE) as u32,
+            sid,
+        ) == 0
+        {
+            return None;
+        }
+
+        // 3. Attach the DACL to a fresh security descriptor. The descriptor
+        // revision is `SECURITY_DESCRIPTOR_REVISION`, which windows-sys does
+        // not expose as a constant; its value is 1.
+        let mut descriptor = Box::new(std::mem::zeroed::<SECURITY_DESCRIPTOR>());
+        let descriptor_ptr = &mut *descriptor as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void;
+        if InitializeSecurityDescriptor(descriptor_ptr, 1) == 0 {
+            return None;
+        }
+        if SetSecurityDescriptorDacl(descriptor_ptr, 1, acl.as_ptr() as *const ACL, 0) == 0 {
+            return None;
+        }
+
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor_ptr,
+            bInheritHandle: 0,
+        };
+        Some(IpcPipeSecurity {
+            attributes,
+            _descriptor: descriptor,
+            _acl: acl,
+        })
+    }
+}
+
 /// Serves one-shot `snapshot` requests from the client console. Each accepted
 /// connection is handled in its own task and closed after the response, so
 /// the console always reads counters as of the moment its command runs.
 #[cfg(windows)]
 async fn ipc_server(status: AgentStatus) {
+    // The pipe is only ever used for console <-> agent queries. If access
+    // cannot be restricted to this agent's own user, refuse to serve IPC
+    // rather than open the snapshot up to every local user.
+    let Some(security) = build_ipc_pipe_security() else {
+        tracing::error!("could not restrict IPC pipe access; IPC disabled");
+        return;
+    };
     let path = agent_pipe_name();
     loop {
-        let server = match ServerOptions::new().create(&path) {
+        let server = match unsafe {
+            ServerOptions::new().create_with_security_attributes_raw(
+                &path,
+                &security.attributes as *const _ as *mut core::ffi::c_void,
+            )
+        } {
             Ok(server) => server,
             Err(error) => {
                 tracing::warn!(%error, "IPC pipe create failed; retrying");
@@ -1755,7 +2145,16 @@ fn install_service(server: Option<&str>) -> Result<(), Box<dyn std::error::Error
         let install_root = PathBuf::from(env::var("ProgramFiles")?).join("TunnelControl");
         fs::create_dir_all(&install_root)?;
         let agent_path = install_root.join("tunnel-agent.exe");
-        fs::copy(env::current_exe()?, &agent_path)?;
+        let service = "TunnelAgent";
+        // Stop any running service before touching the exe: Windows refuses to
+        // overwrite an image file the service has mapped (sharing violation).
+        // `sc.exe stop` returns before the service leaves STOP_PENDING, so wait
+        // for it to actually stop before deleting. On a first install no
+        // service exists yet; both commands fail silently and the wait returns
+        // immediately.
+        let _ = Command::new("sc.exe").args(["stop", service]).status();
+        let _ = wait_for_service_stopped(service);
+        let _ = Command::new("sc.exe").args(["delete", service]).status();
         // Preserve a legacy TUNNEL_TOKEN if one exists; otherwise the agent
         // starts in device-code enrollment mode.
         let legacy = load_file_config();
@@ -1767,9 +2166,34 @@ fn install_service(server: Option<&str>) -> Result<(), Box<dyn std::error::Error
             install_root.join("agent.env"),
             format!("TUNNEL_SERVER_URL={server_url}\n{legacy_token}"),
         )?;
-        let service = "TunnelAgent";
-        let _ = Command::new("sc.exe").args(["stop", service]).status();
-        let _ = Command::new("sc.exe").args(["delete", service]).status();
+        // The SCM marks the service Stopped slightly before the process
+        // actually exits and releases the mapped exe image, so even after
+        // `wait_for_service_stopped` a single copy can still hit a sharing
+        // violation in that window. Retry at 200ms intervals (~1s total)
+        // before giving up; the overwrite is idempotent, so a partially
+        // written file is simply rewritten on the next attempt.
+        let current_exe = env::current_exe()?;
+        let mut copy_error = None;
+        for attempt in 0..6u32 {
+            match fs::copy(&current_exe, &agent_path) {
+                Ok(_) => {
+                    copy_error = None;
+                    break;
+                }
+                Err(error) => {
+                    copy_error = Some(error);
+                    if attempt < 5 {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+        if let Some(error) = copy_error {
+            return Err(format!(
+                "Could not update tunnel-agent.exe (is the service still stopping?): {error}"
+            )
+            .into());
+        }
         let binary_path = format!("\"{}\" --service", agent_path.display());
         let status = Command::new("sc.exe")
             .args([
@@ -1784,6 +2208,19 @@ fn install_service(server: Option<&str>) -> Result<(), Box<dyn std::error::Error
             ])
             .status()?;
         if !status.success() {
+            // A create failure after a silently-ignored delete is usually a
+            // leftover service entry (error 1073), not a privilege problem;
+            // tell the user apart so the fix is not misleading.
+            let leftover = run_powershell(&[
+                "-NoProfile",
+                "-Command",
+                "(Get-Service TunnelAgent -ErrorAction SilentlyContinue) -ne $null",
+            ])
+            .map(|output| ps_stdout_contains_bytes(&output.stdout, "True"))
+            .unwrap_or(false);
+            if leftover {
+                return Err("Could not create the Windows service: an old service entry may not have been fully deleted. Wait a moment and try again.".into());
+            }
             return Err(
                 "Could not create the Windows service. Run this installer as Administrator.".into(),
             );
@@ -1844,21 +2281,23 @@ fn reset_local_data() -> Result<(), Box<dyn std::error::Error>> {
             .args(["stop", "TunnelAgent"])
             .status();
         std::thread::sleep(Duration::from_secs(1));
-        // Stop other agent instances (one-click script mode) but never this
-        // reset process itself.
-        let own_pid = std::process::id();
-        let script = format!(
-            "Get-Process tunnel-agent -ErrorAction SilentlyContinue | \
-             Where-Object {{ $_.Id -ne {own_pid} }} | Stop-Process -Force"
-        );
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .status();
+        // Stop console workers (one-click script mode), whatever the exe was
+        // renamed to. `running_worker_pids` excludes this process itself and
+        // the service (already `sc stop`ped above) by PID and command line.
+        for pid in running_worker_pids() {
+            stop_process(pid);
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
     // One-click script mode state: credentials, logs, pid file, console logs.
+    // A worker that was still holding a handle can make this fail; surface it
+    // as a warning so the user knows the reset was not fully clean instead of
+    // silently ignoring the error (a partial cleanup still counts as success).
     if let Some(local) = env::var_os("LOCALAPPDATA") {
-        let _ = fs::remove_dir_all(PathBuf::from(local).join("TunnelControl"));
+        let dir = PathBuf::from(local).join("TunnelControl");
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("Warning: could not remove console state under {dir:?}: {error}");
+        }
     }
     // Service-mode credentials (PROGRAMDATA by default, or the override env).
     let credentials = credentials_path();
@@ -1908,9 +2347,10 @@ enum RunOutcome {
 async fn run(
     config: &AgentConfig,
     status: &AgentStatus,
+    stop: &mut watch::Receiver<bool>,
 ) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     if config.token.is_empty() {
-        run_enroll(config).await?;
+        run_enroll(config, stop).await?;
         return Ok(RunOutcome::ReconnectNow);
     }
     let (socket, _) = connect_async(&config.server).await?;
@@ -2259,6 +2699,14 @@ async fn run(
                 reconnect = true;
                 break;
             }
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    // SCM Stop: break out so the cleanup below runs while the
+                    // control socket is still open (sends teardown), then the
+                    // caller exits without reconnecting.
+                    break;
+                }
+            }
         }
         let now = Instant::now();
         pending
@@ -2324,7 +2772,10 @@ async fn run(
 /// for the administrator, and waits for the server to issue a token. On
 /// approval the token is persisted and the caller reconnects through the
 /// normal `Register` path.
-async fn run_enroll(config: &AgentConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_enroll(
+    config: &AgentConfig,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (socket, _) = connect_async(&config.server).await?;
     enable_tcp_keepalive(&socket);
     tracing::info!(server = %config.server, "connecting for device enrollment");
@@ -2356,7 +2807,25 @@ async fn run_enroll(config: &AgentConfig) -> Result<(), Box<dyn std::error::Erro
     sink.send(Message::Text(String::from_utf8(encode(&enroll)?)?.into()))
         .await?;
     loop {
-        let Some(Ok(message)) = source.next().await else {
+        let message = tokio::select! {
+            message = source.next() => message,
+            // An SCM Stop during enrollment must abort the wait so the service
+            // exits cleanly instead of staying in Running and being restarted.
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    return Err("shutdown requested during enrollment".into());
+                }
+                continue;
+            }
+        };
+        let Some(Ok(message)) = message else {
+            // The server closed the socket before a decision; clear the local
+            // code so the next attempt generates a fresh one. Reusing the old
+            // code would collide with the server's enrollment row and hang
+            // until that row expires.
+            let mut updates = HashMap::new();
+            updates.insert("ENROLL_CODE".to_string(), String::new());
+            let _ = save_credentials(&updates);
             return Err("enrollment socket closed before approval".into());
         };
         if let Message::Text(text) = message {
@@ -2523,12 +2992,13 @@ async fn data_channel_task(
                 // heartbeat keeps the channel alive in both directions: the
                 // server echoes it back over the same socket.
                 let heartbeat_tx = tx.clone();
-                let heartbeat_secs = config.heartbeat_secs;
+                let heartbeat_status = status.clone();
                 let keepalive = tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_secs));
-                    ticker.tick().await; // skip the immediate first tick
                     loop {
-                        ticker.tick().await;
+                        // Read the interval fresh each tick so a `SettingsSync`
+                        // applies without waiting for a full reconnect.
+                        let heartbeat_secs = heartbeat_status.settings.read().await.heartbeat_secs;
+                        tokio::time::sleep(Duration::from_secs(heartbeat_secs)).await;
                         let Ok(payload) = encode(&ControlMessage::Heartbeat {
                             version: PROTOCOL_VERSION,
                             latency_ms: 0,
@@ -2971,6 +3441,55 @@ mod tests {
         assert!(ps_stdout_contains_bytes(utf16le, "tunnel-agent"));
         assert!(ps_stdout_contains_bytes(b"True\r\n", "True"));
         assert!(!ps_stdout_contains_bytes(b"", "tunnel-agent"));
+    }
+
+    #[test]
+    fn ps_output_matching_accepts_setup_and_renamed_console_exes() {
+        // The setup package ships as Tunnel-Agent-Setup-V4.2.exe and the
+        // console may be renamed (tunnel-client.exe); both spawn workers
+        // whose ProcessName does not equal the lowercase "tunnel-agent".
+        assert!(ps_stdout_contains_bytes(
+            b"Tunnel-Agent-Setup-V4.2\r\n",
+            "tunnel-agent"
+        ));
+        assert!(ps_stdout_contains_bytes(
+            b"tunnel-client\r\n",
+            "tunnel-client"
+        ));
+        assert!(ps_stdout_contains_bytes(
+            b"TUNNEL-AGENT\r\n",
+            "tunnel-agent"
+        ));
+    }
+
+    #[test]
+    fn pid_list_parsing_ignores_empty_and_garbage_entries() {
+        assert_eq!(parse_pid_list("6204,13560\n\r\n"), vec![6204, 13560]);
+        assert_eq!(parse_pid_list(""), Vec::<u32>::new());
+        assert_eq!(parse_pid_list("abc, 7,,"), vec![7]);
+    }
+
+    #[test]
+    fn service_mode_command_line_is_not_a_worker() {
+        // The service (`tunnel-agent.exe --service`) must be excluded from
+        // the worker list even though its process name is identical, so
+        // `stop` never force-kills a process the SCM would restart.
+        assert!(is_service_command_line(
+            r#""C:\Program Files\TunnelAgent\tunnel-agent.exe" --service"#
+        ));
+        // Case-insensitive match.
+        assert!(is_service_command_line("--SERVICE"));
+        // Console workers and unrelated processes are never excluded.
+        assert!(!is_service_command_line("tunnel-agent.exe --agent"));
+        assert!(!is_service_command_line(r"C:\Windows\explorer.exe"));
+        // An empty command line yields no `--service` token.
+        assert!(!is_service_command_line(""));
+        // Token-exact matching: a path containing `service` or a flag that
+        // merely starts with `--service` is not the service mode.
+        assert!(!is_service_command_line(
+            r"C:\tools\myservice\bin\agent.exe"
+        ));
+        assert!(!is_service_command_line("tunnel-agent.exe --service-mode"));
     }
 
     #[tokio::test]

@@ -215,7 +215,7 @@ function App() {
   const createTunnel = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
-      await request<Tunnel>("/tunnels", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.get("name"), kind: form.get("kind"), public_port: Number(form.get("public_port")), local_host: form.get("local_host"), local_port: Number(form.get("local_port")), device_id: form.get("device_id"), max_connections: Number(form.get("max_connections")) }) });
+      await request<Tunnel>("/tunnels", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.get("name"), kind: form.get("kind"), public_port: Number(form.get("public_port")), local_host: form.get("local_host"), local_port: Number(form.get("local_port")), device_id: form.get("device_id"), max_connections: Number(form.get("max_connections")) || 100 }) });
       setShowForm(false); refresh();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法创建隧道"); }
   };
@@ -223,7 +223,7 @@ function App() {
     if (!editingTunnel) return;
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
-      await request<Tunnel>(`/tunnels/${editingTunnel.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.get("name"), kind: form.get("kind"), public_port: Number(form.get("public_port")), local_host: form.get("local_host"), local_port: Number(form.get("local_port")), device_id: form.get("device_id"), max_connections: Number(form.get("max_connections")), enabled: editingTunnel.enabled }) });
+      await request<Tunnel>(`/tunnels/${editingTunnel.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.get("name"), kind: form.get("kind"), public_port: Number(form.get("public_port")), local_host: form.get("local_host"), local_port: Number(form.get("local_port")), device_id: form.get("device_id"), max_connections: Number(form.get("max_connections")) || 100, enabled: editingTunnel.enabled }) });
       setEditingTunnel(null); refresh();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法更新隧道"); }
   };

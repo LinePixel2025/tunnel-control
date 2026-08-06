@@ -2,7 +2,7 @@
 
 面向团队的 Windows 到 Linux 公网服务器内网穿透。管理面板独立使用 HTTPS 端口；管理员分配 TCP/HTTP/UDP 公网端口，Windows 后台代理通过控制通道注册并持续发送心跳，数据流量在独立的 K 条数据通道上多路复用。
 
-当前发布版本：V4.2（客户端安装包 `release\V4.2\Tunnel-Agent-Setup-V4.2.exe`）。
+当前发布版本：V4.3（客户端安装包 `release\V4.3\Tunnel-Agent-Setup-V4.3.exe`）。
 
 ## 项目结构
 
